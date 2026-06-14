@@ -212,7 +212,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     entries = entries,
                     states = photos.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
                     loading = false,
-                    message = "${photos.size} images loaded",
+                    message = "已加载 ${photos.size} 张图片 / ${photos.size} images loaded",
                 )
             }
         }
@@ -256,7 +256,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 DebugExporter(context, cache).export(photo, entry)
             }
             if (result == null) {
-                _uiState.update { it.copy(message = "No READY cache for this image yet") }
+                _uiState.update { it.copy(message = "当前图片还没有可导出的 VR 缓存 / No READY cache yet") }
             } else {
                 val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", result)
                 val intent = Intent(Intent.ACTION_SEND).apply {
@@ -264,8 +264,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     putExtra(Intent.EXTRA_STREAM, uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                context.startActivity(Intent.createChooser(intent, "Export debug package"))
-                _uiState.update { it.copy(message = "Debug package created: ${result.name}") }
+                context.startActivity(Intent.createChooser(intent, "导出调试包 / Export debug package"))
+                _uiState.update { it.copy(message = "调试包已创建 / Debug package created: ${result.name}") }
             }
         }
     }
@@ -650,11 +650,11 @@ private fun PermissionScreen(onGrant: () -> Unit) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("Parallel VR Gallery", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Text("平行眼 VR 图库", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(12.dp))
-        Text("Allow image access to browse your gallery and build local parallel-eye VR cache.")
+        Text("授权读取图片后，可以浏览系统相册，并在本地生成平行眼 SBS VR 缓存。\nAllow image access to browse your gallery and build local parallel-eye VR cache.")
         Spacer(Modifier.height(20.dp))
-        Button(onClick = onGrant) { Text("Grant image access") }
+        Button(onClick = onGrant) { Text("授权图片访问 / Grant access") }
     }
 }
 
@@ -669,8 +669,8 @@ private fun GalleryScreen(
         topBar = {
             Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Parallel VR Gallery", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    OutlinedButton(onClick = onRefresh) { Text("Refresh") }
+                    Text("平行眼 VR 图库", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    OutlinedButton(onClick = onRefresh) { Text("刷新 / Refresh") }
                 }
                 Spacer(Modifier.height(10.dp))
                 WindowSelector(state.prefetchWindow, onWindowChanged)
@@ -769,7 +769,7 @@ private fun ViewerScreen(
             modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            OutlinedButton(onClick = onClose) { Text("Back") }
+            OutlinedButton(onClick = onClose) { Text("返回 / Back") }
             Spacer(Modifier.width(8.dp))
             Text(
                 text = state.photos.getOrNull(pagerState.currentPage)?.displayName.orEmpty(),
@@ -780,7 +780,7 @@ private fun ViewerScreen(
             )
             Button(onClick = { onVr(pagerState.currentPage) }) { Text("VR") }
             Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = { onExportDebug(pagerState.currentPage) }) { Text("Debug") }
+            OutlinedButton(onClick = { onExportDebug(pagerState.currentPage) }) { Text("调试 / Debug") }
         }
         Column(
             modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
@@ -789,7 +789,7 @@ private fun ViewerScreen(
             val current = state.photos.getOrNull(pagerState.currentPage)
             if (current != null) {
                 Text(
-                    text = "State: ${state.states[current.cacheKey] ?: VrState.NORMAL}   ${pagerState.currentPage + 1}/${state.photos.size}",
+                    text = "状态 / State: ${state.states[current.cacheKey] ?: VrState.NORMAL}   ${pagerState.currentPage + 1}/${state.photos.size}",
                     color = androidx.compose.ui.graphics.Color.White,
                     style = MaterialTheme.typography.bodySmall,
                 )
@@ -813,9 +813,9 @@ private fun StatusOverlay(state: VrState, onRetry: () -> Unit) {
             Spacer(Modifier.height(12.dp))
             Text(state.name, color = androidx.compose.ui.graphics.Color.White)
         } else if (state == VrState.FAILED) {
-            Text("Generation failed", color = androidx.compose.ui.graphics.Color.White)
+            Text("生成失败 / Generation failed", color = androidx.compose.ui.graphics.Color.White)
             Spacer(Modifier.height(12.dp))
-            Button(onClick = onRetry) { Text("Retry") }
+            Button(onClick = onRetry) { Text("重试 / Retry") }
         }
     }
 }
