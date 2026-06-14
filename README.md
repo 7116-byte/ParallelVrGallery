@@ -19,6 +19,8 @@ Local Android gallery for generating and caching parallel-eye SBS VR images from
   - `params.json`
   - `job.log`
 - 主界面提供设置入口，可调整预加载张数、深度强度、平滑、填充和输出尺寸 / Main screen has a settings page for prefetch count, depth scale, blur, fill, and output size.
+- 主界面提供生成管理入口，图片缓存可按版本删除，视频入口已预留 / Main screen has a generated manager; image caches can be deleted by version, and the video entry is reserved.
+- 已生成 VR 图片会作为主界面缩略图显示 / Generated VR images are used as main-gallery thumbnails.
 - 覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载 / Updating over an existing install keeps the downloaded model; uninstalling usually removes it.
 
 ## 构建 / Build
@@ -54,6 +56,10 @@ https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1
 模型文件单独放在 `model-assets-v1` Release 中，普通 APK Release 不再重复上传模型，因此后续发版只需要上传约 24MB 的 APK。
 
 The model file is hosted once in the `model-assets-v1` release. Regular app releases no longer upload the model again, so later releases only upload an APK around 24MB.
+
+目前真正的加速方式就是避免重复上传大模型；如果还嫌 GitHub Release 慢，可以后续增加镜像下载源，例如 Cloudflare R2、阿里云 OSS 或 jsDelivr，但 APK 仍以 GitHub Release 为主。
+
+The main speedup is avoiding repeated model uploads. If GitHub Release is still slow, future builds can add mirror sources such as Cloudflare R2, Alibaba OSS, or jsDelivr while keeping GitHub Release as the primary channel.
 
 ## 第三方项目 / Third-party credits
 

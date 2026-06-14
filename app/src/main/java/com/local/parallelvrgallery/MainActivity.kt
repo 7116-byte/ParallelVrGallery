@@ -142,6 +142,7 @@ enum class VrState {
 
 data class VrCacheEntry(
     val photoKey: String,
+    val version: String,
     val outputPath: String,
     val depthPath: String,
     val paramsPath: String,
@@ -164,6 +165,7 @@ data class VrGenerationParams(
 )
 
 data class AppSettings(
+    val modelId: String = "depth_anything_v2_small_tflite",
     val prefetchWindow: Int = 5,
     val depthScale: Float = 40f,
     val blurRadius: Int = 3,
@@ -173,6 +175,7 @@ data class AppSettings(
     val depthResolution: Int = 518,
 ) {
     fun toParams(): VrGenerationParams = VrGenerationParams(
+        depthModel = modelId,
         depthScale = depthScale,
         blurRadius = blurRadius,
         fillRadius = fillRadius,
@@ -180,6 +183,35 @@ data class AppSettings(
         maxLongEdge = maxLongEdge,
     )
 }
+
+data class ModelSpec(
+    val id: String,
+    val displayName: String,
+    val inputSize: Int,
+    val fileName: String,
+    val url: String,
+    val sha256: String,
+)
+
+private val AvailableModels = listOf(
+    ModelSpec(
+        id = "depth_anything_v2_small_tflite",
+        displayName = "Depth Anything V2 - Small",
+        inputSize = 518,
+        fileName = "depth_anything_v2.tflite",
+        url = "https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite",
+        sha256 = "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",
+    ),
+)
+
+private fun modelSpec(id: String): ModelSpec = AvailableModels.firstOrNull { it.id == id } ?: AvailableModels.first()
+
+data class CacheVersionSummary(
+    val version: String,
+    val kind: String,
+    val count: Int,
+    val bytes: Long,
+)
 
 data class VrJob(
     val photoItem: PhotoItem,
@@ -196,6 +228,7 @@ data class UiState(
     val photos: List<PhotoItem> = emptyList(),
     val selectedIndex: Int? = null,
     val settingsOpen: Boolean = false,
+    val manageOpen: Boolean = false,
     val vrMode: Boolean = false,
     val settings: AppSettings = AppSettings(),
     val states: Map<String, VrState> = emptyMap(),
@@ -207,6 +240,7 @@ data class UiState(
     val debugIndex: Int? = null,
     val modelProgress: Float? = null,
     val modelStatus: String = "模型未下载 / Model not downloaded",
+    val cacheVersions: List<CacheVersionSummary> = emptyList(),
 )
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
@@ -247,6 +281,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     states = photos.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
                     loading = false,
                     message = "已加载 ${photos.size} 张图片 / ${photos.size} images loaded",
+                    cacheVersions = cache.summaries(),
+                    modelStatus = modelManager.statusText(it.settings.modelId),
                 )
             }
         }
@@ -271,14 +307,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun updateSettings(settings: AppSettings) {
         settingsStore.save(settings)
-        _uiState.update { it.copy(settings = settings) }
+        _uiState.update { it.copy(settings = settings, modelStatus = modelManager.statusText(settings.modelId)) }
         _uiState.value.selectedIndex?.let { refreshWindow(it) }
     }
 
     fun onPagerIndexChanged(index: Int) {
         _uiState.update { it.copy(selectedIndex = index) }
         if (_uiState.value.vrMode) {
-            refreshWindow(index)
+            enqueueWindow(index, includeCurrent = true)
         }
     }
 
@@ -332,6 +368,30 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(debugIndex = null) }
     }
 
+    fun openManage() {
+        _uiState.update { it.copy(manageOpen = true, cacheVersions = cache.summaries()) }
+    }
+
+    fun closeManage() {
+        _uiState.update { it.copy(manageOpen = false) }
+    }
+
+    fun deleteCacheVersion(version: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            cache.deleteVersion(version)
+            val photos = _uiState.value.photos
+            val entries = photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey }
+            _uiState.update {
+                it.copy(
+                    entries = entries,
+                    states = photos.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
+                    cacheVersions = cache.summaries(),
+                    message = "已删除版本 / Deleted version: $version",
+                )
+            }
+        }
+    }
+
     private fun refreshWindow(index: Int) {
         enqueueWindow(index, includeCurrent = false)
     }
@@ -359,11 +419,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun enqueuePhoto(index: Int, priority: Int, force: Boolean) {
         val photo = _uiState.value.photos.getOrNull(index) ?: return
-        if (!force && cache.findEntry(photo) != null) {
+        val currentVersion = _uiState.value.settings.toParams().cacheVersion()
+        if (!force && cache.findEntry(photo, currentVersion) != null) {
             markState(photo.cacheKey, VrState.READY)
             return
         }
-        if (!force && _uiState.value.states[photo.cacheKey] in listOf(VrState.QUEUED, VrState.GENERATING, VrState.READY)) return
+        if (!force && _uiState.value.states[photo.cacheKey] in listOf(VrState.QUEUED, VrState.GENERATING)) return
         synchronized(pending) {
             pending.add(QueuedJob(photo, priority, sequence++))
         }
@@ -407,7 +468,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     markReady(next.photo.cacheKey, entry)
                     upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis())
                     addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
-                    _uiState.update { it.copy(modelProgress = null, modelStatus = modelManager.statusText()) }
+                    _uiState.update { it.copy(modelProgress = null, modelStatus = modelManager.statusText(it.settings.modelId), cacheVersions = cache.summaries()) }
                 }.onFailure { error ->
                     markState(next.photo.cacheKey, VrState.FAILED)
                     upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
@@ -467,6 +528,7 @@ private class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
     fun load(): AppSettings = AppSettings(
+        modelId = prefs.getString("modelId", "depth_anything_v2_small_tflite") ?: "depth_anything_v2_small_tflite",
         prefetchWindow = prefs.getInt("prefetchWindow", 5),
         depthScale = prefs.getFloat("depthScale", 40f),
         blurRadius = prefs.getInt("blurRadius", 3),
@@ -478,6 +540,7 @@ private class SettingsStore(context: Context) {
 
     fun save(settings: AppSettings) {
         prefs.edit()
+            .putString("modelId", settings.modelId)
             .putInt("prefetchWindow", settings.prefetchWindow)
             .putFloat("depthScale", settings.depthScale)
             .putInt("blurRadius", settings.blurRadius)
@@ -528,10 +591,57 @@ private class PhotoRepository(private val context: Context) {
 private class VrCacheManager(private val context: Context) {
     val root: File = File(context.getExternalFilesDir(null), "vr_cache").also { it.mkdirs() }
 
-    fun entryDir(photo: PhotoItem): File = File(root, photo.cacheKey)
+    fun entryDir(photo: PhotoItem, version: String): File {
+        return if (version == DEFAULT_VERSION) File(root, photo.cacheKey) else File(File(root, photo.cacheKey), version)
+    }
 
-    fun findEntry(photo: PhotoItem): VrCacheEntry? {
-        val dir = entryDir(photo)
+    fun findEntry(photo: PhotoItem, version: String? = null): VrCacheEntry? {
+        if (version != null) {
+            return readEntry(photo.cacheKey, version, entryDir(photo, version))
+        }
+        return latestEntry(photo.cacheKey)
+    }
+
+    fun latestEntry(photoKey: String): VrCacheEntry? {
+        val base = File(root, photoKey)
+        val candidates = mutableListOf<Pair<String, File>>()
+        candidates += DEFAULT_VERSION to base
+        base.listFiles()?.filter { it.isDirectory }?.forEach { candidates += it.name to it }
+        return candidates.mapNotNull { (version, dir) -> readEntry(photoKey, version, dir) }.maxByOrNull { it.createdAt }
+    }
+
+    fun summaries(): List<CacheVersionSummary> {
+        val map = linkedMapOf<String, Pair<Int, Long>>()
+        root.listFiles()?.filter { it.isDirectory }?.forEach { photoDir ->
+            readEntry(photoDir.name, DEFAULT_VERSION, photoDir)?.let { entry ->
+                val current = map[DEFAULT_VERSION] ?: (0 to 0L)
+                map[DEFAULT_VERSION] = current.first + 1 to current.second + File(entry.outputPath).length()
+            }
+            photoDir.listFiles()?.filter { it.isDirectory }?.forEach { versionDir ->
+                readEntry(photoDir.name, versionDir.name, versionDir)?.let { entry ->
+                    val current = map[versionDir.name] ?: (0 to 0L)
+                    map[versionDir.name] = current.first + 1 to current.second + File(entry.outputPath).length()
+                }
+            }
+        }
+        return map.map { (version, value) ->
+            CacheVersionSummary(version = version, kind = "图片 / Images", count = value.first, bytes = value.second)
+        }.sortedBy { it.version }
+    }
+
+    fun deleteVersion(version: String) {
+        root.listFiles()?.filter { it.isDirectory }?.forEach { photoDir ->
+            if (version == DEFAULT_VERSION) {
+                listOf("vr_sbs.jpg", "depth.png", "params.json", "job.log", "source_preview.jpg").forEach {
+                    File(photoDir, it).delete()
+                }
+            } else {
+                File(photoDir, version).deleteRecursively()
+            }
+        }
+    }
+
+    private fun readEntry(photoKey: String, version: String, dir: File): VrCacheEntry? {
         val vr = File(dir, "vr_sbs.jpg")
         val depth = File(dir, "depth.png")
         val params = File(dir, "params.json")
@@ -540,7 +650,8 @@ private class VrCacheManager(private val context: Context) {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(vr.absolutePath, bounds)
         return VrCacheEntry(
-            photoKey = photo.cacheKey,
+            photoKey = photoKey,
+            version = version,
             outputPath = vr.absolutePath,
             depthPath = depth.absolutePath,
             paramsPath = params.absolutePath,
@@ -550,29 +661,36 @@ private class VrCacheManager(private val context: Context) {
             createdAt = vr.lastModified(),
         )
     }
+
+    companion object {
+        const val DEFAULT_VERSION = "default"
+    }
 }
 
 private class ModelManager(private val context: Context) {
     private val modelsDir = File(context.getExternalFilesDir(null), "models").also { it.mkdirs() }
-    private val modelFile = File(modelsDir, MODEL_NAME)
 
-    fun statusText(): String {
-        return if (modelFile.exists() && modelFile.sha256().equals(MODEL_SHA256, ignoreCase = true)) {
+    fun statusText(modelId: String = AvailableModels.first().id): String {
+        val spec = modelSpec(modelId)
+        val modelFile = File(modelsDir, spec.fileName)
+        return if (modelFile.exists() && modelFile.sha256().equals(spec.sha256, ignoreCase = true)) {
             "模型已就绪 / Model ready"
         } else {
             "模型未下载 / Model not downloaded"
         }
     }
 
-    fun ensureModel(onProgress: (Float) -> Unit): File {
-        if (modelFile.exists() && modelFile.sha256().equals(MODEL_SHA256, ignoreCase = true)) {
+    fun ensureModel(modelId: String, onProgress: (Float) -> Unit): File {
+        val spec = modelSpec(modelId)
+        val modelFile = File(modelsDir, spec.fileName)
+        if (modelFile.exists() && modelFile.sha256().equals(spec.sha256, ignoreCase = true)) {
             onProgress(1f)
             return modelFile
         }
 
-        val tmp = File(modelsDir, "$MODEL_NAME.download")
+        val tmp = File(modelsDir, "${spec.fileName}.download")
         if (tmp.exists()) tmp.delete()
-        val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
+        val connection = (URL(spec.url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 15000
             readTimeout = 30000
             requestMethod = "GET"
@@ -596,7 +714,7 @@ private class ModelManager(private val context: Context) {
             }
         }
         val hash = tmp.sha256()
-        if (!hash.equals(MODEL_SHA256, ignoreCase = true)) {
+        if (!hash.equals(spec.sha256, ignoreCase = true)) {
             tmp.delete()
             error("Model SHA-256 mismatch: $hash")
         }
@@ -604,12 +722,6 @@ private class ModelManager(private val context: Context) {
         tmp.renameTo(modelFile)
         onProgress(1f)
         return modelFile
-    }
-
-    companion object {
-        private const val MODEL_NAME = "depth_anything_v2.tflite"
-        private const val MODEL_SHA256 = "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F"
-        private const val MODEL_URL = "https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite"
     }
 }
 
@@ -624,7 +736,8 @@ private class VrGenerator(
         onModelProgress: (Float) -> Unit,
         onProgress: (Float) -> Unit,
     ): VrCacheEntry {
-        val dir = cache.entryDir(photo).also { it.mkdirs() }
+        val version = params.cacheVersion()
+        val dir = cache.entryDir(photo, version).also { it.mkdirs() }
         val log = StringBuilder()
         val start = System.currentTimeMillis()
         fun mark(message: String) {
@@ -633,7 +746,7 @@ private class VrGenerator(
         }
 
         mark("start name=${photo.displayName} size=${photo.size} modified=${photo.modifiedTime}")
-        val modelFile = modelManager.ensureModel(onModelProgress)
+        val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress)
         mark("model ready path=${modelFile.absolutePath} sha256=${modelFile.sha256()}")
         onProgress(0.12f)
 
@@ -671,6 +784,7 @@ private class VrGenerator(
 
         return VrCacheEntry(
             photoKey = photo.cacheKey,
+            version = version,
             outputPath = vrPath.absolutePath,
             depthPath = depthPath.absolutePath,
             paramsPath = paramsPath.absolutePath,
@@ -801,7 +915,7 @@ private class DebugExporter(
         val safeName = photo.displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")
         val zip = File(exportDir, "${photo.cacheKey}_$safeName.zip")
         ZipOutputStream(FileOutputStream(zip)).use { out ->
-            val preview = File(cache.entryDir(photo), "source_preview.jpg")
+            val preview = File(cache.entryDir(photo, entry.version), "source_preview.jpg")
             decodeScaledBitmap(context, photo.uri, 1600).also { bitmap ->
                 FileOutputStream(preview).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }
             }
@@ -839,9 +953,16 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     val selected = state.selectedIndex
     BackHandler(enabled = debug != null) { viewModel.closeDebug() }
     BackHandler(enabled = debug == null && selected != null) { viewModel.closeViewer() }
+    BackHandler(enabled = debug == null && selected == null && state.manageOpen) { viewModel.closeManage() }
     BackHandler(enabled = debug == null && selected == null && state.settingsOpen) { viewModel.closeSettings() }
 
-    if (state.settingsOpen) {
+    if (state.manageOpen) {
+        ManageScreen(
+            state = state,
+            onBack = viewModel::closeManage,
+            onDeleteVersion = viewModel::deleteCacheVersion,
+        )
+    } else if (state.settingsOpen) {
         SettingsScreen(
             settings = state.settings,
             modelStatus = state.modelStatus,
@@ -871,6 +992,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
             onRefresh = viewModel::loadPhotos,
             onOpen = viewModel::openPhoto,
             onSettings = viewModel::openSettings,
+            onManage = viewModel::openManage,
         )
     }
 }
@@ -896,12 +1018,15 @@ private fun GalleryScreen(
     onRefresh: () -> Unit,
     onOpen: (Int) -> Unit,
     onSettings: () -> Unit,
+    onManage: () -> Unit,
 ) {
     Scaffold(
         topBar = {
             Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("平行眼 VR 图库", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    OutlinedButton(onClick = onManage) { Text("管理 / Manage") }
+                    Spacer(Modifier.width(8.dp))
                     OutlinedButton(onClick = onSettings) { Text("设置 / Settings") }
                     Spacer(Modifier.width(8.dp))
                     OutlinedButton(onClick = onRefresh) { Text("刷新 / Refresh") }
@@ -929,7 +1054,7 @@ private fun GalleryScreen(
             ) {
                 items(state.photos) { photo ->
                     val index = state.photos.indexOf(photo)
-                    PhotoTile(photo, state.states[photo.cacheKey] ?: VrState.NORMAL) { onOpen(index) }
+                    PhotoTile(photo, state.states[photo.cacheKey] ?: VrState.NORMAL, state.entries[photo.cacheKey]) { onOpen(index) }
                 }
             }
         }
@@ -937,7 +1062,7 @@ private fun GalleryScreen(
 }
 
 @Composable
-private fun PhotoTile(photo: PhotoItem, state: VrState, onClick: () -> Unit) {
+private fun PhotoTile(photo: PhotoItem, state: VrState, entry: VrCacheEntry?, onClick: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -945,13 +1070,60 @@ private fun PhotoTile(photo: PhotoItem, state: VrState, onClick: () -> Unit) {
             .background(androidx.compose.ui.graphics.Color(0xff16191c))
             .clickable(onClick = onClick),
     ) {
-        AsyncBitmapImage(photo.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+        val displayUri = entry?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri
+        AsyncBitmapImage(displayUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
         Text(
             text = state.name,
             color = androidx.compose.ui.graphics.Color.White,
             style = MaterialTheme.typography.labelSmall,
             modifier = Modifier.align(Alignment.BottomStart).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(5.dp),
         )
+    }
+}
+
+@Composable
+private fun ManageScreen(
+    state: UiState,
+    onBack: () -> Unit,
+    onDeleteVersion: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = onBack) { Text("返回 / Back") }
+            Spacer(Modifier.width(12.dp))
+            Text("生成管理 / Generated Manager", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(16.dp))
+        Text("图片 / Images", fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        if (state.cacheVersions.isEmpty()) {
+            Text("暂无已生成图片 / No generated images yet")
+        } else {
+            state.cacheVersions.forEach { summary ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("版本 / Version: ${summary.version}", fontWeight = FontWeight.Bold)
+                        Text("${summary.count} 张 / images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", style = MaterialTheme.typography.bodySmall)
+                    }
+                    OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
+                        Text("删除 / Delete")
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        Text("视频 / Videos", fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        Text("视频生成入口已预留，当前版本暂未实现。\nVideo generation entry is reserved; not implemented in this version.", style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -980,6 +1152,20 @@ private fun SettingsScreen(
         Text("覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载。\nUpdating over the existing app keeps the downloaded model; uninstalling usually removes it.", style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(16.dp))
 
+        Text("模型选择 / Model selection", fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        SingleChoiceSegmentedButtonRow {
+            AvailableModels.forEachIndexed { index, spec ->
+                SegmentedButton(
+                    selected = settings.modelId == spec.id,
+                    onClick = { onChange(settings.copy(modelId = spec.id, depthResolution = spec.inputSize)) },
+                    shape = SegmentedButtonDefaults.itemShape(index, AvailableModels.size),
+                ) { Text(spec.displayName) }
+            }
+        }
+        Text("目前只内置已验证模型；新增模型时会出现在这里。\nOnly the verified model is available now; additional models will appear here.", style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(16.dp))
+
         SettingInt("预加载张数 / Prefetch each side", settings.prefetchWindow, listOf(3, 5, 10)) {
             onChange(settings.copy(prefetchWindow = it))
         }
@@ -998,7 +1184,8 @@ private fun SettingsScreen(
 
         Spacer(Modifier.height(12.dp))
         Text("深度图分辨率 / Depth resolution", fontWeight = FontWeight.Bold)
-        Text("${settings.depthResolution} x ${settings.depthResolution}（当前 TFLite 模型固定输入；提高真正推理分辨率需要换模型或模型格式）\nFixed by the current TFLite model input; true higher depth inference resolution needs another model/export.", style = MaterialTheme.typography.bodySmall)
+        val spec = modelSpec(settings.modelId)
+        Text("${spec.inputSize} x ${spec.inputSize}（由当前模型固定；选择其他模型后这里会随模型变化）\nFixed by the selected model; choosing another model changes this value.", style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(12.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
@@ -1300,6 +1487,7 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: 
     return """
         {
           "photoKey": "${photo.cacheKey}",
+          "cacheVersion": "${cacheVersion()}",
           "displayName": "${photo.displayName.replace("\"", "\\\"")}",
           "sourceWidth": ${source.width},
           "sourceHeight": ${source.height},
@@ -1318,6 +1506,13 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: 
           "modelSource": "https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite"
         }
     """.trimIndent()
+}
+
+private fun VrGenerationParams.cacheVersion(): String {
+    val scale = depthScale.roundToInt()
+    val invert = if (invertDepth) "inv1" else "inv0"
+    return "${depthModel}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}"
+        .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 
 private fun File.sha256(): String {
