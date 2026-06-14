@@ -85,9 +85,12 @@ import org.tensorflow.lite.Interpreter
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -147,9 +150,12 @@ data class VrCacheEntry(
 data class VrGenerationParams(
     val depthModel: String = "depth_anything_v2.tflite",
     val outputMode: String = "SBS_PARALLEL",
-    val disparityStrength: Int = 34,
+    val depthScale: Float = 30f,
+    val blurRadius: Int = 15,
+    val fillRadius: Int = 10,
+    val invertDepth: Boolean = false,
     val maxLongEdge: Int = 6000,
-    val inpaintMode: String = "EDGE_CLAMP",
+    val inpaintMode: String = "FOREGROUND_FILL",
     val quality: Int = 94,
 )
 
@@ -175,13 +181,17 @@ data class UiState(
     val logs: List<String> = emptyList(),
     val loading: Boolean = false,
     val message: String? = null,
+    val debugIndex: Int? = null,
+    val modelProgress: Float? = null,
+    val modelStatus: String = "模型未下载 / Model not downloaded",
 )
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application
     private val repository = PhotoRepository(app)
     private val cache = VrCacheManager(app)
-    private val generator = VrGenerator(app, cache)
+    private val modelManager = ModelManager(app)
+    private val generator = VrGenerator(app, cache, modelManager)
     private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
     private var sequence = 0L
     private var worker: Job? = null
@@ -223,7 +233,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun closeViewer() {
-        _uiState.update { it.copy(selectedIndex = null, vrMode = false) }
+        stopVr()
+        _uiState.update { it.copy(selectedIndex = null, debugIndex = null) }
     }
 
     fun setPrefetchWindow(window: Int) {
@@ -239,8 +250,18 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun requestVr(index: Int) {
-        _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null) }
-        enqueueWindow(index, includeCurrent = true)
+        if (_uiState.value.vrMode) {
+            stopVr()
+        } else {
+            _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null) }
+            enqueueWindow(index, includeCurrent = true)
+        }
+    }
+
+    fun stopVr() {
+        synchronized(pending) { pending.clear() }
+        _uiState.update { it.copy(vrMode = false, modelProgress = null) }
+        addLog("vr stopped; generated caches kept")
     }
 
     fun retry(index: Int) {
@@ -270,12 +291,21 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun openDebug(index: Int) {
+        _uiState.update { it.copy(debugIndex = index) }
+    }
+
+    fun closeDebug() {
+        _uiState.update { it.copy(debugIndex = null) }
+    }
+
     private fun refreshWindow(index: Int) {
         enqueueWindow(index, includeCurrent = false)
     }
 
     private fun enqueueWindow(index: Int, includeCurrent: Boolean) {
         val photos = _uiState.value.photos
+        if (!_uiState.value.vrMode) return
         if (photos.isEmpty()) return
         val targets = mutableListOf<Pair<Int, Int>>()
         if (includeCurrent) targets += index to 0
@@ -312,12 +342,31 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (worker?.isActive == true) return
         worker = viewModelScope.launch(Dispatchers.IO) {
             while (true) {
+                if (!_uiState.value.vrMode) {
+                    synchronized(pending) { pending.clear() }
+                    break
+                }
                 val next = synchronized(pending) { pending.poll() } ?: break
                 activeKey = next.photo.cacheKey
                 markState(next.photo.cacheKey, VrState.GENERATING)
                 upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f)
                 val result = runCatching {
-                    generator.generate(next.photo, VrGenerationParams()) { progress ->
+                    generator.generate(
+                        next.photo,
+                        VrGenerationParams(),
+                        onModelProgress = { progress ->
+                            _uiState.update {
+                                it.copy(
+                                    modelProgress = progress,
+                                    modelStatus = if (progress < 1f) {
+                                        "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
+                                    } else {
+                                        "模型已就绪 / Model ready"
+                                    },
+                                )
+                            }
+                        },
+                    ) { progress ->
                         upsertJob(next.photo, next.priority, VrState.GENERATING, progress)
                     }
                 }
@@ -325,6 +374,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     markReady(next.photo.cacheKey, entry)
                     upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis())
                     addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
+                    _uiState.update { it.copy(modelProgress = null, modelStatus = modelManager.statusText()) }
                 }.onFailure { error ->
                     markState(next.photo.cacheKey, VrState.FAILED)
                     upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
@@ -444,11 +494,78 @@ private class VrCacheManager(private val context: Context) {
     }
 }
 
+private class ModelManager(private val context: Context) {
+    private val modelsDir = File(context.getExternalFilesDir(null), "models").also { it.mkdirs() }
+    private val modelFile = File(modelsDir, MODEL_NAME)
+
+    fun statusText(): String {
+        return if (modelFile.exists() && modelFile.sha256().equals(MODEL_SHA256, ignoreCase = true)) {
+            "模型已就绪 / Model ready"
+        } else {
+            "模型未下载 / Model not downloaded"
+        }
+    }
+
+    fun ensureModel(onProgress: (Float) -> Unit): File {
+        if (modelFile.exists() && modelFile.sha256().equals(MODEL_SHA256, ignoreCase = true)) {
+            onProgress(1f)
+            return modelFile
+        }
+
+        val tmp = File(modelsDir, "$MODEL_NAME.download")
+        if (tmp.exists()) tmp.delete()
+        val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15000
+            readTimeout = 30000
+            requestMethod = "GET"
+        }
+        connection.connect()
+        if (connection.responseCode !in 200..299) {
+            error("Model download failed: HTTP ${connection.responseCode}")
+        }
+        val total = connection.contentLengthLong.coerceAtLeast(1L)
+        var readTotal = 0L
+        connection.inputStream.use { input ->
+            FileOutputStream(tmp).use { output ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    output.write(buffer, 0, read)
+                    readTotal += read
+                    onProgress((readTotal.toFloat() / total.toFloat()).coerceIn(0f, 0.99f))
+                }
+            }
+        }
+        val hash = tmp.sha256()
+        if (!hash.equals(MODEL_SHA256, ignoreCase = true)) {
+            tmp.delete()
+            error("Model SHA-256 mismatch: $hash")
+        }
+        if (modelFile.exists()) modelFile.delete()
+        tmp.renameTo(modelFile)
+        onProgress(1f)
+        return modelFile
+    }
+
+    companion object {
+        private const val MODEL_NAME = "depth_anything_v2.tflite"
+        private const val MODEL_SHA256 = "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F"
+        private const val MODEL_URL = "https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite"
+    }
+}
+
 private class VrGenerator(
     private val context: Context,
     private val cache: VrCacheManager,
+    private val modelManager: ModelManager,
 ) {
-    fun generate(photo: PhotoItem, params: VrGenerationParams, onProgress: (Float) -> Unit): VrCacheEntry {
+    fun generate(
+        photo: PhotoItem,
+        params: VrGenerationParams,
+        onModelProgress: (Float) -> Unit,
+        onProgress: (Float) -> Unit,
+    ): VrCacheEntry {
         val dir = cache.entryDir(photo).also { it.mkdirs() }
         val log = StringBuilder()
         val start = System.currentTimeMillis()
@@ -458,6 +575,10 @@ private class VrGenerator(
         }
 
         mark("start name=${photo.displayName} size=${photo.size} modified=${photo.modifiedTime}")
+        val modelFile = modelManager.ensureModel(onModelProgress)
+        mark("model ready path=${modelFile.absolutePath} sha256=${modelFile.sha256()}")
+        onProgress(0.12f)
+
         val original = decodeScaledBitmap(context, photo.uri, params.maxLongEdge)
         mark("decoded ${original.width}x${original.height}")
         if (max(photo.width, photo.height) > params.maxLongEdge) {
@@ -466,7 +587,8 @@ private class VrGenerator(
         onProgress(0.25f)
 
         val depthStart = System.currentTimeMillis()
-        val depthSmall = runDepthModel(original)
+        val rawDepth = runDepthModel(original, modelFile)
+        val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
         mark("depth model ${System.currentTimeMillis() - depthStart}ms")
         onProgress(0.55f)
 
@@ -477,7 +599,7 @@ private class VrGenerator(
         onProgress(0.7f)
 
         val sbsStart = System.currentTimeMillis()
-        val vr = makeParallelSbs(original, depthSmall, params.disparityStrength)
+        val vr = makeParallelSbs(original, depthSmall, params.depthScale, params.fillRadius)
         mark("sbs ${System.currentTimeMillis() - sbsStart}ms output=${vr.width}x${vr.height}")
         val vrPath = File(dir, "vr_sbs.jpg")
         FileOutputStream(vrPath).use { vr.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
@@ -501,9 +623,9 @@ private class VrGenerator(
         )
     }
 
-    private fun runDepthModel(bitmap: Bitmap): FloatArray {
+    private fun runDepthModel(bitmap: Bitmap, modelFile: File): FloatArray {
         val inputSize = 518
-        val model = loadModelFile(context, "models/depth_anything_v2.tflite")
+        val model = loadModelFile(modelFile)
         val interpreter = Interpreter(model, Interpreter.Options().setNumThreads(4))
         val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
@@ -547,7 +669,34 @@ private class VrGenerator(
         return bitmap
     }
 
-    private fun makeParallelSbs(source: Bitmap, depth: FloatArray, strength: Int): Bitmap {
+    private fun smoothDepth(depth: FloatArray, radius: Int, invert: Boolean): FloatArray {
+        val size = 518
+        val r = radius.coerceAtLeast(1) / 2
+        val horizontal = FloatArray(depth.size)
+        val output = FloatArray(depth.size)
+        for (y in 0 until size) {
+            var sum = 0f
+            for (x in 0 until size) {
+                sum += depth[y * size + x]
+                if (x > r) sum -= depth[y * size + x - r - 1]
+                val count = min(x + r + 1, size) - max(0, x - r)
+                horizontal[y * size + x] = sum / count.toFloat()
+            }
+        }
+        for (x in 0 until size) {
+            var sum = 0f
+            for (y in 0 until size) {
+                sum += horizontal[y * size + x]
+                if (y > r) sum -= horizontal[(y - r - 1) * size + x]
+                val count = min(y + r + 1, size) - max(0, y - r)
+                val value = sum / count.toFloat()
+                output[y * size + x] = if (invert) 1f - value else value
+            }
+        }
+        return output
+    }
+
+    private fun makeParallelSbs(source: Bitmap, depth: FloatArray, depthScale: Float, fillRadius: Int): Bitmap {
         val w = source.width
         val h = source.height
         val left = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -556,16 +705,25 @@ private class VrGenerator(
         val leftPixels = IntArray(w * h)
         val rightPixels = IntArray(w * h)
         source.getPixels(srcPixels, 0, w, 0, 0, w, h)
-        for (y in 0 until h) {
-            val dy = (y * 517 / max(1, h - 1)).coerceIn(0, 517)
-            for (x in 0 until w) {
+        srcPixels.copyInto(leftPixels)
+        srcPixels.copyInto(rightPixels)
+
+        val maxShift = (w * (depthScale / 500f)).roundToInt().coerceIn(1, max(1, w / 5))
+        val fill = fillRadius.coerceIn(1, 32)
+
+        for (x in w - 1 downTo 0) {
+            for (y in 0 until h) {
                 val dx = (x * 517 / max(1, w - 1)).coerceIn(0, 517)
+                val dy = (y * 517 / max(1, h - 1)).coerceIn(0, 517)
                 val d = depth[dy * 518 + dx]
-                val shift = ((d - 0.5f) * strength).roundToInt()
-                val leftX = (x + shift).coerceIn(0, w - 1)
-                val rightX = (x - shift).coerceIn(0, w - 1)
-                leftPixels[y * w + x] = srcPixels[y * w + leftX]
-                rightPixels[y * w + x] = srcPixels[y * w + rightX]
+                val shift = (d.coerceIn(0f, 1f) * maxShift).roundToInt()
+                val color = srcPixels[y * w + x]
+                for (offset in 0..fill) {
+                    val leftX = (x + shift + offset).coerceIn(0, w - 1)
+                    val rightX = (x - shift - offset).coerceIn(0, w - 1)
+                    leftPixels[y * w + leftX] = color
+                    rightPixels[y * w + rightX] = color
+                }
             }
         }
         left.setPixels(leftPixels, 0, w, 0, 0, w, h)
@@ -621,8 +779,16 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
         return
     }
 
+    val debug = state.debugIndex
     val selected = state.selectedIndex
-    if (selected != null) {
+    if (debug != null) {
+        DebugScreen(
+            state = state,
+            index = debug,
+            onBack = viewModel::closeDebug,
+            onShare = { viewModel.exportDebug(context, debug) },
+        )
+    } else if (selected != null) {
         ViewerScreen(
             state = state,
             startIndex = selected,
@@ -631,7 +797,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
             onVr = viewModel::requestVr,
             onRetry = viewModel::retry,
             onWindowChanged = viewModel::setPrefetchWindow,
-            onExportDebug = { index -> viewModel.exportDebug(context, index) },
+            onOpenDebug = viewModel::openDebug,
         )
     } else {
         GalleryScreen(
@@ -730,7 +896,7 @@ private fun ViewerScreen(
     onVr: (Int) -> Unit,
     onRetry: (Int) -> Unit,
     onWindowChanged: (Int) -> Unit,
-    onExportDebug: (Int) -> Unit,
+    onOpenDebug: (Int) -> Unit,
 ) {
     val view = LocalView.current
     DisposableEffect(Unit) {
@@ -778,9 +944,11 @@ private fun ViewerScreen(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            Button(onClick = { onVr(pagerState.currentPage) }) { Text("VR") }
+            Button(onClick = { onVr(pagerState.currentPage) }) {
+                Text(if (state.vrMode) "关闭 VR / VR Off" else "开启 VR / VR On")
+            }
             Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = { onExportDebug(pagerState.currentPage) }) { Text("调试 / Debug") }
+            OutlinedButton(onClick = { onOpenDebug(pagerState.currentPage) }) { Text("调试 / Debug") }
         }
         Column(
             modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
@@ -793,6 +961,9 @@ private fun ViewerScreen(
                     color = androidx.compose.ui.graphics.Color.White,
                     style = MaterialTheme.typography.bodySmall,
                 )
+            }
+            state.modelProgress?.let {
+                Text(state.modelStatus, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.bodySmall)
             }
             state.logs.take(3).forEach {
                 Text(it, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 1)
@@ -816,6 +987,88 @@ private fun StatusOverlay(state: VrState, onRetry: () -> Unit) {
             Text("生成失败 / Generation failed", color = androidx.compose.ui.graphics.Color.White)
             Spacer(Modifier.height(12.dp))
             Button(onClick = onRetry) { Text("重试 / Retry") }
+        }
+    }
+}
+
+@Composable
+private fun DebugScreen(
+    state: UiState,
+    index: Int,
+    onBack: () -> Unit,
+    onShare: () -> Unit,
+) {
+    val photo = state.photos.getOrNull(index)
+    val entry = photo?.let { state.entries[it.cacheKey] }
+    val vrState = photo?.let { state.states[it.cacheKey] } ?: VrState.NORMAL
+    val job = photo?.let { p -> state.jobs.firstOrNull { it.photoItem.cacheKey == p.cacheKey } }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(androidx.compose.ui.graphics.Color(0xff111315))
+            .padding(12.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = onBack) { Text("返回 / Back") }
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = "调试 / Debug",
+                color = androidx.compose.ui.graphics.Color.White,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f),
+            )
+            Button(onClick = onShare, enabled = entry != null) { Text("分享调试包 / Share") }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "${photo?.displayName.orEmpty()}  状态 / State: $vrState",
+            color = androidx.compose.ui.graphics.Color.White,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            DebugImagePanel("原图 / Source", photo?.uri, Modifier.weight(1f))
+            DebugImagePanel("深度图 / Depth", entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f))
+            DebugImagePanel("VR SBS", entry?.let { Uri.fromFile(File(it.outputPath)) }, Modifier.weight(1f))
+        }
+        Spacer(Modifier.height(8.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(150.dp)
+                .background(androidx.compose.ui.graphics.Color(0xff202326))
+                .padding(8.dp),
+        ) {
+            Text("日志 / Logs", color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
+            Text("模型 / Model: ${state.modelStatus}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
+            job?.let {
+                Text("Job: ${it.state} progress=${(it.progress * 100f).roundToInt()}% error=${it.error.orEmpty()}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
+            }
+            state.logs.take(6).forEach {
+                Text(it, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(title, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelMedium)
+        Spacer(Modifier.height(4.dp))
+        if (uri == null) {
+            Box(
+                modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xff202326)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("暂无 / None", color = androidx.compose.ui.graphics.Color.White)
+            }
+        } else {
+            AsyncBitmapImage(uri, 2048, ContentScale.Fit, Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black))
         }
     }
 }
@@ -883,11 +1136,10 @@ private fun decodeScaledBitmap(context: Context, uri: Uri, maxLongEdge: Int): Bi
     }.copy(Bitmap.Config.ARGB_8888, false)
 }
 
-private fun loadModelFile(context: Context, assetPath: String): ByteBuffer {
-    val descriptor = context.assets.openFd(assetPath)
-    FileInputStream(descriptor.fileDescriptor).use { input ->
+private fun loadModelFile(file: File): ByteBuffer {
+    FileInputStream(file).use { input ->
         val channel = input.channel
-        return channel.map(FileChannel.MapMode.READ_ONLY, descriptor.startOffset, descriptor.declaredLength)
+        return channel.map(FileChannel.MapMode.READ_ONLY, 0, file.length())
     }
 }
 
@@ -902,12 +1154,30 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: 
           "outputHeight": ${output.height},
           "depthModel": "$depthModel",
           "outputMode": "$outputMode",
-          "disparityStrength": $disparityStrength,
+          "depthScale": $depthScale,
+          "blurRadius": $blurRadius,
+          "fillRadius": $fillRadius,
+          "invertDepth": $invertDepth,
           "maxLongEdge": $maxLongEdge,
           "inpaintMode": "$inpaintMode",
-          "quality": $quality
+          "quality": $quality,
+          "modelSha256": "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",
+          "modelSource": "https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite"
         }
     """.trimIndent()
+}
+
+private fun File.sha256(): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    inputStream().use { input ->
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val read = input.read(buffer)
+            if (read <= 0) break
+            digest.update(buffer, 0, read)
+        }
+    }
+    return digest.digest().joinToString("") { "%02X".format(it) }
 }
 
 private fun ZipOutputStream.addFile(name: String, file: File) {

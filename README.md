@@ -8,7 +8,8 @@ Local Android gallery for generating and caching parallel-eye SBS VR images from
 
 - 读取系统相册图片 / Reads system photos with `MediaStore`.
 - 使用 Compose 网格和全屏左右滑动浏览 / Browses photos in a Compose grid and full-screen pager.
-- 使用 Depth-Anything-V2 TFLite 模型生成本地平行眼 SBS 图 / Generates a local parallel-eye SBS image.
+- 首次生成前下载 Depth-Anything-V2 TFLite 模型 / Downloads the Depth-Anything-V2 TFLite model before first generation.
+- 使用平滑深度图、相对视差和前景填充生成平行眼 SBS 图 / Generates SBS images with smoothed depth, relative disparity, and foreground filling.
 - 当前图片前后缓存窗口可选 `3`、`5`、`10` / Configurable prefetch window.
 - 生成结果缓存在 App 私有外部目录 / Caches generated output under the app private external files directory.
 - 当前 READY 图片可导出调试包 / Exports a debug zip for the current READY image:
@@ -38,12 +39,12 @@ The current workspace originally had no Android SDK/Gradle on `PATH`, so the pro
 
 ## 模型资产 / Model asset
 
-Release APK 已经内置 `depth_anything_v2.tflite`。原始模型文件较大，不提交到 Git；如果要从源码构建，请把模型放到：
+Release APK 不再内置 `depth_anything_v2.tflite`，首次使用 VR 生成时会从 GitHub 模型资产 Release 下载并校验 SHA-256。原始模型文件较大，不提交到 Git；如果要离线调试，可手动把模型放到 App 外部私有目录。
 
-The release APK already bundles `depth_anything_v2.tflite`. The raw model is intentionally not committed to Git because it is a large binary; to build from source, place it at:
+The release APK no longer bundles `depth_anything_v2.tflite`. The app downloads it from the GitHub model asset release before first VR generation and verifies SHA-256. The raw model is intentionally not committed to Git.
 
 ```text
-app/src/main/assets/models/depth_anything_v2.tflite
+https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite
 ```
 
 ## 第三方项目 / Third-party credits

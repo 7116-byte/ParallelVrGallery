@@ -6,3 +6,4 @@ local.properties
 .idea/
 app/src/main/assets/models/*.tflite
 upload-apk.log
+release-notes-*.md

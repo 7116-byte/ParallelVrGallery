@@ -22,7 +22,7 @@ This is a new Android app. It does not copy source code or resources from the pr
 
 - 模型文件 / Model file: `depth_anything_v2.tflite`
 - 用途 / Purpose: 从普通图片估计深度图，再生成平行眼 SBS 图。
-- 注意 / Note: 原始模型文件较大，没有提交进 Git；Release APK 已经内置该模型。若从源码构建，需要自行把模型放到 `app/src/main/assets/models/depth_anything_v2.tflite`。
+- 注意 / Note: 原始模型文件较大，没有提交进 Git；v0.2 起 APK 不再内置该模型，首次生成前会从 GitHub Release 下载并校验。
 - 上游项目 / Upstream project: https://github.com/DepthAnything/Depth-Anything-V2
 
 ## Build Tools
