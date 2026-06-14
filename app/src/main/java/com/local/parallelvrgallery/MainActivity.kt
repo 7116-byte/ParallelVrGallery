@@ -180,6 +180,7 @@ data class VrGenerationParams(
     val fillRadius: Int = 10,
     val invertDepth: Boolean = false,
     val maxLongEdge: Int = 6000,
+    val modelThreads: Int = 4,
     val inpaintMode: String = "FOREGROUND_FILL",
     val quality: Int = 94,
 )
@@ -200,6 +201,8 @@ data class AppSettings(
     val invertDepth: Boolean = false,
     val maxLongEdge: Int = 6000,
     val depthResolution: Int = 518,
+    val generationWorkers: Int = 1,
+    val modelThreads: Int = 4,
 ) {
     fun toParams(): VrGenerationParams = VrGenerationParams(
         depthModel = modelId,
@@ -208,6 +211,7 @@ data class AppSettings(
         fillRadius = fillRadius,
         invertDepth = invertDepth,
         maxLongEdge = maxLongEdge,
+        modelThreads = modelThreads,
     )
 }
 
@@ -230,6 +234,8 @@ private val AvailableModels = listOf(
         sha256 = "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",
     ),
 )
+
+private const val GENERATED_VR_PREFIX = "PVG_VR_"
 
 private fun modelSpec(id: String): ModelSpec = AvailableModels.firstOrNull { it.id == id } ?: AvailableModels.first()
 
@@ -290,7 +296,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val settingsStore = SettingsStore(app)
     private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
     private var sequence = 0L
-    private var worker: Job? = null
+    private val workers = mutableListOf<Job>()
     private var activeKey: String? = null
 
     private val _uiState = MutableStateFlow(UiState(hasPermission = hasImagePermission(app), settings = settingsStore.load()))
@@ -336,9 +342,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryScrollIndex = firstVisibleIndex,
                 galleryScrollOffset = firstVisibleOffset,
                 galleryAnchorSlot = (index - firstVisibleIndex).coerceAtLeast(0),
-                vrMode = false,
+                vrMode = true,
+                message = null,
             )
         }
+        enqueueWindow(index, includeCurrent = true)
     }
 
     fun openGeneratedPhoto(index: Int, entry: VrCacheEntry? = null) {
@@ -349,6 +357,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryAnchorIndex = index,
                 galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
                 vrMode = true,
+                manageOpen = false,
                 entries = if (photo != null && entry != null) it.entries + (photo.cacheKey to entry) else it.entries,
                 message = null,
             )
@@ -386,6 +395,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             )
         }
         _uiState.value.selectedIndex?.let { refreshWindow(it) }
+        startWorker()
     }
 
     fun onPagerIndexChanged(index: Int) {
@@ -484,7 +494,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val photo = _uiState.value.photos.getOrNull(index) ?: return@forEach
                     val entry = cache.findEntry(photo) ?: return@forEach
                     runCatching {
-                        saveImageToGallery(context, File(entry.outputPath), "VR_${photo.displayName}")
+                        saveImageToGallery(context, File(entry.outputPath), "${GENERATED_VR_PREFIX}${photo.cacheKey}_${photo.displayName}")
                         saved++
                     }.onFailure { failed++ }
                 }
@@ -573,8 +583,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun startWorker() {
-        if (worker?.isActive == true) return
-        worker = viewModelScope.launch(Dispatchers.IO) {
+        workers.removeAll { !it.isActive }
+        val desired = _uiState.value.settings.generationWorkers.coerceIn(1, 3)
+        repeat((desired - workers.size).coerceAtLeast(0)) {
+            workers += viewModelScope.launch(Dispatchers.IO) {
+                workerLoop()
+            }
+        }
+    }
+
+    private suspend fun workerLoop() {
             while (true) {
                 if (!_uiState.value.vrMode) {
                     synchronized(pending) { pending.clear() }
@@ -624,7 +642,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 activeKey = null
                 delay(50)
             }
-        }
     }
 
     private fun expandAutoPrefetchIfNeeded(): Boolean {
@@ -727,6 +744,8 @@ private class SettingsStore(context: Context) {
             invertDepth = invertDepth,
             maxLongEdge = prefs.getInt("maxLongEdge", 6000),
             depthResolution = 518,
+            generationWorkers = prefs.getInt("generationWorkers", 1),
+            modelThreads = prefs.getInt("modelThreads", 4),
         )
     }
 
@@ -742,6 +761,8 @@ private class SettingsStore(context: Context) {
             .putBoolean("invertDepth", settings.invertDepth)
             .putBoolean("migratedInvertDefaultOffV5", true)
             .putInt("maxLongEdge", settings.maxLongEdge)
+            .putInt("generationWorkers", settings.generationWorkers)
+            .putInt("modelThreads", settings.modelThreads)
             .apply()
     }
 }
@@ -768,10 +789,12 @@ private class PhotoRepository(private val context: Context) {
             val modifiedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
+                val displayName = cursor.getString(nameCol) ?: "image-$id"
+                if (displayName.startsWith(GENERATED_VR_PREFIX) || displayName.startsWith("VR_")) continue
                 result += PhotoItem(
                     id = id,
                     uri = ContentUris.withAppendedId(collection, id),
-                    displayName = cursor.getString(nameCol) ?: "image-$id",
+                    displayName = displayName,
                     width = cursor.getInt(widthCol),
                     height = cursor.getInt(heightCol),
                     size = cursor.getLong(sizeCol),
@@ -964,7 +987,7 @@ private class VrGenerator(
         onProgress(0.25f)
 
         val depthStart = System.currentTimeMillis()
-        val rawDepth = runDepthModel(original, modelFile)
+        val rawDepth = runDepthModel(original, modelFile, params.modelThreads)
         val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
         mark("depth model ${System.currentTimeMillis() - depthStart}ms")
         onProgress(0.55f)
@@ -1001,10 +1024,10 @@ private class VrGenerator(
         )
     }
 
-    private fun runDepthModel(bitmap: Bitmap, modelFile: File): FloatArray {
+    private fun runDepthModel(bitmap: Bitmap, modelFile: File, modelThreads: Int): FloatArray {
         val inputSize = 518
         val model = loadModelFile(modelFile)
-        val interpreter = Interpreter(model, Interpreter.Options().setNumThreads(4))
+        val interpreter = Interpreter(model, Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8)))
         val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
         val pixels = IntArray(inputSize * inputSize)
@@ -1336,10 +1359,21 @@ private fun GalleryScreen(
                     .fillMaxSize()
                     .padding(padding)
                     .pointerInput(Unit) {
-                        detectTransformGestures { _, _, zoom, _ ->
-                            if (abs(zoom - 1f) > 0.01f) {
-                                lastPinchAt = System.currentTimeMillis()
-                                tileSize = (tileSize * zoom).coerceIn(72f, 220f)
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val pressed = event.changes.filter { it.pressed }
+                                if (pressed.size >= 2) {
+                                    val centroid = pressed.centroid()
+                                    val previousCentroid = pressed.previousCentroid()
+                                    val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
+                                    val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
+                                    if (abs(zoom - 1f) > 0.01f) {
+                                        lastPinchAt = System.currentTimeMillis()
+                                        tileSize = (tileSize * zoom).coerceIn(72f, 220f)
+                                        event.changes.forEach { it.consume() }
+                                    }
+                                }
                             }
                         }
                     },
@@ -1575,6 +1609,13 @@ private fun SettingsScreen(
         SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
             onChange(settings.copy(maxLongEdge = it))
         }
+        SettingInt(lang.t("生成 worker 数", "Generation workers"), settings.generationWorkers, listOf(1, 2, 3)) {
+            onChange(settings.copy(generationWorkers = it))
+        }
+        SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
+            onChange(settings.copy(modelThreads = it))
+        }
+        Text(lang.t("GPU 加速：当前版本暂不可用；先提供稳定的 CPU 多线程。", "GPU acceleration: unavailable in this version; stable CPU threading is provided first."), style = MaterialTheme.typography.bodySmall)
 
         Spacer(Modifier.height(12.dp))
         Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
@@ -1855,7 +1896,7 @@ private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onTap: () 
             translationY = offset.y
         }
 
-    Row(
+    Box(
         modifier = modifier
             .background(androidx.compose.ui.graphics.Color.Black)
             .pointerInput(uri) {
@@ -1863,10 +1904,10 @@ private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onTap: () 
                     while (true) {
                         val firstEvent = awaitPointerEvent()
                         if (firstEvent.changes.none { it.pressed }) continue
-                    var multiTouch = false
-                    var moved = false
-                    var firstPosition: Offset? = null
-                    var lastCentroid: Offset? = null
+                        var multiTouch = false
+                        var moved = false
+                        var firstPosition: Offset? = null
+                        var lastCentroid: Offset? = null
                         while (true) {
                             val event = awaitPointerEvent()
                             val pressed = event.changes.filter { it.pressed }
@@ -1897,13 +1938,15 @@ private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onTap: () 
                 }
             },
     ) {
-        Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
-            Image(left, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
+        Row(Modifier.fillMaxSize()) {
+            Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
+                Image(left, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
+            }
+            Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
+                Image(right, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
+            }
         }
-        Box(Modifier.width(2.dp).fillMaxSize().background(androidx.compose.ui.graphics.Color(0xff111315)))
-        Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
-            Image(right, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
-        }
+        Box(Modifier.align(Alignment.Center).width(1.dp).fillMaxSize().background(androidx.compose.ui.graphics.Color(0x99ffffff)))
     }
 }
 
@@ -2058,6 +2101,7 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: 
           "fillRadius": $fillRadius,
           "invertDepth": $invertDepth,
           "maxLongEdge": $maxLongEdge,
+          "modelThreads": $modelThreads,
           "inpaintMode": "$inpaintMode",
           "quality": $quality,
           "modelSha256": "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",

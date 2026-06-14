@@ -4,16 +4,19 @@
 
 Local Android gallery for generating and caching parallel-eye SBS VR images from normal photos.
 
-## v0.7 功能 / What v0.7 does
+## v0.8 功能 / What v0.8 does
 
 - 读取系统相册图片 / Reads system photos with `MediaStore`.
 - 使用 Compose 网格和全屏左右滑动浏览 / Browses photos in a Compose grid and full-screen pager.
+- 点开图片默认进入 VR 模式并开始生成当前图 / Opening a photo enters VR mode by default and starts generating the current image.
 - 主界面支持双指缩放缩略图网格，并会改变每行列数 / The main grid supports pinch zoom and changes column count.
+- 主界面缩放只响应双指，单指滑动和长按独立处理 / Grid zoom only responds to two fingers; one-finger scroll and long-press are handled separately.
 - 从图片页返回主界面时会记住点开时的行位置 / Returning from the viewer keeps the viewed image near the row where it was opened.
 - 主要界面切换带缩放淡入淡出动画 / Primary screens use scale and fade transitions.
 - 主界面长按进入多选模式，支持批量保存已生成 VR 图或批量尝试替换原图 / Long-press enters multi-select mode for batch saving generated VR images or attempting original replacement.
 - 自动预加载会跳过已生成缓存并向外补位，保持队列围绕当前图继续填充 / Auto prefetch skips existing cache and fills farther slots around the current image.
 - 设置页提供语言选择，默认中文 / The settings page includes language selection and defaults to Chinese.
+- 设置页提供生成 worker 数和模型 CPU 线程数；GPU 加速当前版本暂不可用 / Settings include generation worker count and model CPU thread count; GPU acceleration is not available in this version.
 - 首次生成前下载 Depth-Anything-V2 TFLite 模型 / Downloads the Depth-Anything-V2 TFLite model before first generation.
 - 使用平滑深度图、相对视差和前景填充生成平行眼 SBS 图 / Generates SBS images with smoothed depth, relative disparity, and foreground filling.
 - 当前图片前后缓存支持自动模式：先生成后1、前1到后3、前3，完成后若未切图自动扩到 `5`，再扩到 `10` / Auto prefetch starts at 3 each side, then expands to 5 and 10 if the user stays on the same image.
@@ -26,11 +29,12 @@ Local Android gallery for generating and caching parallel-eye SBS VR images from
   - `params.json`
   - `job.log`
 - 主界面提供设置入口，可调整语言、预加载、深度强度、平滑、填充、输出尺寸和深度反转 / Main screen has a settings page for language, prefetch, depth scale, blur, fill, output size, and depth inversion.
+- App 保存到系统图库的 VR 图片会带 `PVG_VR_` 标记，并从主图库列表中过滤 / VR images saved by the app are marked with `PVG_VR_` and filtered out of the main gallery.
 - 主界面提供生成管理入口，图片缓存可按版本删除，视频入口已预留 / Main screen has a generated manager; image caches can be deleted by version, and the video entry is reserved.
 - 生成管理页按图片/视频分页，图片页按版本显示缩略图区域，点击缩略图进入对应 VR 缓存 / Generated manager has image/video tabs; image versions show scrollable thumbnail areas that open the selected VR cache.
 - 已生成 VR 图片会作为主界面缩略图显示 / Generated VR images are used as main-gallery thumbnails.
 - VR 浏览页控件 3 秒后自动隐藏，只有单指点击会重新显示 / VR viewer controls auto-hide after 3 seconds and reappear only on single tap.
-- VR SBS 图支持同步双指缩放，中间固定分隔，左右半图互不遮挡 / VR SBS images support synchronized pinch zoom with a fixed divider and clipped left/right halves.
+- VR SBS 图贴合显示，中间覆盖一条细分隔线；同步双指缩放时左右半图互不遮挡 / VR SBS images are adjacent with a thin center overlay divider; synchronized pinch zoom keeps halves clipped.
 - 覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载 / Updating over an existing install keeps the downloaded model; uninstalling usually removes it.
 
 ## 构建 / Build
