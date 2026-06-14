@@ -1,0 +1,917 @@
+package com.local.parallelvrgallery
+
+import android.Manifest
+import android.app.Application
+import android.content.ContentUris
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.ImageDecoder
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.MediaStore
+import android.view.WindowInsets
+import android.view.WindowInsetsController
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.tensorflow.lite.Interpreter
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.PriorityQueue
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme {
+                Surface(Modifier.fillMaxSize()) {
+                    GalleryApp()
+                }
+            }
+        }
+    }
+}
+
+data class PhotoItem(
+    val id: Long,
+    val uri: Uri,
+    val displayName: String,
+    val width: Int,
+    val height: Int,
+    val size: Long,
+    val modifiedTime: Long,
+) {
+    val cacheKey: String
+        get() = "${id}_${size}_${modifiedTime}"
+}
+
+enum class VrState {
+    NORMAL,
+    QUEUED,
+    GENERATING,
+    READY,
+    FAILED,
+}
+
+data class VrCacheEntry(
+    val photoKey: String,
+    val outputPath: String,
+    val depthPath: String,
+    val paramsPath: String,
+    val logPath: String,
+    val width: Int,
+    val height: Int,
+    val createdAt: Long,
+)
+
+data class VrGenerationParams(
+    val depthModel: String = "depth_anything_v2.tflite",
+    val outputMode: String = "SBS_PARALLEL",
+    val disparityStrength: Int = 34,
+    val maxLongEdge: Int = 6000,
+    val inpaintMode: String = "EDGE_CLAMP",
+    val quality: Int = 94,
+)
+
+data class VrJob(
+    val photoItem: PhotoItem,
+    val priority: Int,
+    val state: VrState,
+    val progress: Float,
+    val startedAt: Long? = null,
+    val finishedAt: Long? = null,
+    val error: String? = null,
+)
+
+data class UiState(
+    val hasPermission: Boolean = false,
+    val photos: List<PhotoItem> = emptyList(),
+    val selectedIndex: Int? = null,
+    val vrMode: Boolean = false,
+    val prefetchWindow: Int = 5,
+    val states: Map<String, VrState> = emptyMap(),
+    val entries: Map<String, VrCacheEntry> = emptyMap(),
+    val jobs: List<VrJob> = emptyList(),
+    val logs: List<String> = emptyList(),
+    val loading: Boolean = false,
+    val message: String? = null,
+)
+
+class GalleryViewModel(application: Application) : AndroidViewModel(application) {
+    private val app = application
+    private val repository = PhotoRepository(app)
+    private val cache = VrCacheManager(app)
+    private val generator = VrGenerator(app, cache)
+    private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
+    private var sequence = 0L
+    private var worker: Job? = null
+    private var activeKey: String? = null
+
+    private val _uiState = MutableStateFlow(UiState(hasPermission = hasImagePermission(app)))
+    val uiState: StateFlow<UiState> = _uiState
+
+    init {
+        if (_uiState.value.hasPermission) {
+            loadPhotos()
+        }
+    }
+
+    fun onPermissionChanged(granted: Boolean) {
+        _uiState.update { it.copy(hasPermission = granted) }
+        if (granted) loadPhotos()
+    }
+
+    fun loadPhotos() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(loading = true, message = null) }
+            val photos = withContext(Dispatchers.IO) { repository.loadImages() }
+            val entries = withContext(Dispatchers.IO) { photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey } }
+            _uiState.update {
+                it.copy(
+                    photos = photos,
+                    entries = entries,
+                    states = photos.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
+                    loading = false,
+                    message = "${photos.size} images loaded",
+                )
+            }
+        }
+    }
+
+    fun openPhoto(index: Int) {
+        _uiState.update { it.copy(selectedIndex = index, vrMode = false) }
+    }
+
+    fun closeViewer() {
+        _uiState.update { it.copy(selectedIndex = null, vrMode = false) }
+    }
+
+    fun setPrefetchWindow(window: Int) {
+        _uiState.update { it.copy(prefetchWindow = window) }
+        _uiState.value.selectedIndex?.let { refreshWindow(it) }
+    }
+
+    fun onPagerIndexChanged(index: Int) {
+        _uiState.update { it.copy(selectedIndex = index) }
+        if (_uiState.value.vrMode) {
+            refreshWindow(index)
+        }
+    }
+
+    fun requestVr(index: Int) {
+        _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null) }
+        enqueueWindow(index, includeCurrent = true)
+    }
+
+    fun retry(index: Int) {
+        enqueuePhoto(index, priority = 0, force = true)
+        startWorker()
+    }
+
+    fun exportDebug(context: Context, index: Int) {
+        val photo = _uiState.value.photos.getOrNull(index) ?: return
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                val entry = cache.findEntry(photo) ?: return@withContext null
+                DebugExporter(context, cache).export(photo, entry)
+            }
+            if (result == null) {
+                _uiState.update { it.copy(message = "No READY cache for this image yet") }
+            } else {
+                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", result)
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "application/zip"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(Intent.createChooser(intent, "Export debug package"))
+                _uiState.update { it.copy(message = "Debug package created: ${result.name}") }
+            }
+        }
+    }
+
+    private fun refreshWindow(index: Int) {
+        enqueueWindow(index, includeCurrent = false)
+    }
+
+    private fun enqueueWindow(index: Int, includeCurrent: Boolean) {
+        val photos = _uiState.value.photos
+        if (photos.isEmpty()) return
+        val targets = mutableListOf<Pair<Int, Int>>()
+        if (includeCurrent) targets += index to 0
+        for (distance in 1.._uiState.value.prefetchWindow) {
+            val next = index + distance
+            val prev = index - distance
+            if (next in photos.indices) targets += next to distance * 2 - 1
+            if (prev in photos.indices) targets += prev to distance * 2
+        }
+
+        synchronized(pending) {
+            val keep = targets.map { photos[it.first].cacheKey }.toSet()
+            pending.removeAll { it.photo.cacheKey !in keep }
+        }
+        targets.forEach { (targetIndex, priority) -> enqueuePhoto(targetIndex, priority, force = false) }
+        startWorker()
+    }
+
+    private fun enqueuePhoto(index: Int, priority: Int, force: Boolean) {
+        val photo = _uiState.value.photos.getOrNull(index) ?: return
+        if (!force && cache.findEntry(photo) != null) {
+            markState(photo.cacheKey, VrState.READY)
+            return
+        }
+        if (!force && _uiState.value.states[photo.cacheKey] in listOf(VrState.QUEUED, VrState.GENERATING, VrState.READY)) return
+        synchronized(pending) {
+            pending.add(QueuedJob(photo, priority, sequence++))
+        }
+        markState(photo.cacheKey, VrState.QUEUED)
+        addLog("queued ${photo.displayName} p=$priority")
+    }
+
+    private fun startWorker() {
+        if (worker?.isActive == true) return
+        worker = viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                val next = synchronized(pending) { pending.poll() } ?: break
+                activeKey = next.photo.cacheKey
+                markState(next.photo.cacheKey, VrState.GENERATING)
+                upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f)
+                val result = runCatching {
+                    generator.generate(next.photo, VrGenerationParams()) { progress ->
+                        upsertJob(next.photo, next.priority, VrState.GENERATING, progress)
+                    }
+                }
+                result.onSuccess { entry ->
+                    markReady(next.photo.cacheKey, entry)
+                    upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis())
+                    addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
+                }.onFailure { error ->
+                    markState(next.photo.cacheKey, VrState.FAILED)
+                    upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
+                    addLog("failed ${next.photo.displayName}: ${error.message}")
+                }
+                activeKey = null
+                delay(50)
+            }
+        }
+    }
+
+    private fun markReady(key: String, entry: VrCacheEntry) {
+        _uiState.update {
+            it.copy(
+                states = it.states + (key to VrState.READY),
+                entries = it.entries + (key to entry),
+            )
+        }
+    }
+
+    private fun markState(key: String, state: VrState) {
+        _uiState.update { it.copy(states = it.states + (key to state)) }
+    }
+
+    private fun upsertJob(
+        photo: PhotoItem,
+        priority: Int,
+        state: VrState,
+        progress: Float,
+        finishedAt: Long? = null,
+        error: String? = null,
+    ) {
+        _uiState.update { current ->
+            val existing = current.jobs.filterNot { it.photoItem.cacheKey == photo.cacheKey }
+            val job = VrJob(
+                photoItem = photo,
+                priority = priority,
+                state = state,
+                progress = progress,
+                startedAt = System.currentTimeMillis(),
+                finishedAt = finishedAt,
+                error = error,
+            )
+            current.copy(jobs = (listOf(job) + existing).take(200))
+        }
+    }
+
+    private fun addLog(line: String) {
+        val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        _uiState.update { it.copy(logs = (listOf("$stamp $line") + it.logs).take(200)) }
+    }
+}
+
+private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long)
+
+private class PhotoRepository(private val context: Context) {
+    fun loadImages(): List<PhotoItem> {
+        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.WIDTH,
+            MediaStore.Images.Media.HEIGHT,
+            MediaStore.Images.Media.SIZE,
+            MediaStore.Images.Media.DATE_MODIFIED,
+        )
+        val sort = "${MediaStore.Images.Media.DATE_MODIFIED} DESC"
+        val result = mutableListOf<PhotoItem>()
+        context.contentResolver.query(collection, projection, null, null, sort)?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+            val widthCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
+            val heightCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
+            val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
+            val modifiedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
+            while (cursor.moveToNext()) {
+                val id = cursor.getLong(idCol)
+                result += PhotoItem(
+                    id = id,
+                    uri = ContentUris.withAppendedId(collection, id),
+                    displayName = cursor.getString(nameCol) ?: "image-$id",
+                    width = cursor.getInt(widthCol),
+                    height = cursor.getInt(heightCol),
+                    size = cursor.getLong(sizeCol),
+                    modifiedTime = cursor.getLong(modifiedCol),
+                )
+            }
+        }
+        return result
+    }
+}
+
+private class VrCacheManager(private val context: Context) {
+    val root: File = File(context.getExternalFilesDir(null), "vr_cache").also { it.mkdirs() }
+
+    fun entryDir(photo: PhotoItem): File = File(root, photo.cacheKey)
+
+    fun findEntry(photo: PhotoItem): VrCacheEntry? {
+        val dir = entryDir(photo)
+        val vr = File(dir, "vr_sbs.jpg")
+        val depth = File(dir, "depth.png")
+        val params = File(dir, "params.json")
+        val log = File(dir, "job.log")
+        if (!vr.exists() || !depth.exists() || !params.exists() || !log.exists()) return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(vr.absolutePath, bounds)
+        return VrCacheEntry(
+            photoKey = photo.cacheKey,
+            outputPath = vr.absolutePath,
+            depthPath = depth.absolutePath,
+            paramsPath = params.absolutePath,
+            logPath = log.absolutePath,
+            width = bounds.outWidth,
+            height = bounds.outHeight,
+            createdAt = vr.lastModified(),
+        )
+    }
+}
+
+private class VrGenerator(
+    private val context: Context,
+    private val cache: VrCacheManager,
+) {
+    fun generate(photo: PhotoItem, params: VrGenerationParams, onProgress: (Float) -> Unit): VrCacheEntry {
+        val dir = cache.entryDir(photo).also { it.mkdirs() }
+        val log = StringBuilder()
+        val start = System.currentTimeMillis()
+        fun mark(message: String) {
+            val elapsed = System.currentTimeMillis() - start
+            log.append(elapsed).append("ms ").append(message).append('\n')
+        }
+
+        mark("start name=${photo.displayName} size=${photo.size} modified=${photo.modifiedTime}")
+        val original = decodeScaledBitmap(context, photo.uri, params.maxLongEdge)
+        mark("decoded ${original.width}x${original.height}")
+        if (max(photo.width, photo.height) > params.maxLongEdge) {
+            mark("downsampled source because original long edge exceeded ${params.maxLongEdge}")
+        }
+        onProgress(0.25f)
+
+        val depthStart = System.currentTimeMillis()
+        val depthSmall = runDepthModel(original)
+        mark("depth model ${System.currentTimeMillis() - depthStart}ms")
+        onProgress(0.55f)
+
+        val depthBitmap = depthToBitmap(depthSmall)
+        val depthPath = File(dir, "depth.png")
+        FileOutputStream(depthPath).use { depthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        mark("depth saved ${depthBitmap.width}x${depthBitmap.height}")
+        onProgress(0.7f)
+
+        val sbsStart = System.currentTimeMillis()
+        val vr = makeParallelSbs(original, depthSmall, params.disparityStrength)
+        mark("sbs ${System.currentTimeMillis() - sbsStart}ms output=${vr.width}x${vr.height}")
+        val vrPath = File(dir, "vr_sbs.jpg")
+        FileOutputStream(vrPath).use { vr.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
+        onProgress(0.9f)
+
+        val paramsPath = File(dir, "params.json")
+        paramsPath.writeText(params.toJson(photo, original, vr), Charsets.UTF_8)
+        val logPath = File(dir, "job.log")
+        mark("done total=${System.currentTimeMillis() - start}ms")
+        logPath.writeText(log.toString(), Charsets.UTF_8)
+
+        return VrCacheEntry(
+            photoKey = photo.cacheKey,
+            outputPath = vrPath.absolutePath,
+            depthPath = depthPath.absolutePath,
+            paramsPath = paramsPath.absolutePath,
+            logPath = logPath.absolutePath,
+            width = vr.width,
+            height = vr.height,
+            createdAt = System.currentTimeMillis(),
+        )
+    }
+
+    private fun runDepthModel(bitmap: Bitmap): FloatArray {
+        val inputSize = 518
+        val model = loadModelFile(context, "models/depth_anything_v2.tflite")
+        val interpreter = Interpreter(model, Interpreter.Options().setNumThreads(4))
+        val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
+        val pixels = IntArray(inputSize * inputSize)
+        scaled.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+        for (pixel in pixels) {
+            input.putFloat(Color.red(pixel) / 255f)
+            input.putFloat(Color.green(pixel) / 255f)
+            input.putFloat(Color.blue(pixel) / 255f)
+        }
+        val output = Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(1) } } }
+        interpreter.run(input, output)
+        interpreter.close()
+        val flat = FloatArray(inputSize * inputSize)
+        var minValue = Float.MAX_VALUE
+        var maxValue = -Float.MAX_VALUE
+        for (y in 0 until inputSize) {
+            for (x in 0 until inputSize) {
+                val value = output[0][y][x][0]
+                flat[y * inputSize + x] = value
+                minValue = min(minValue, value)
+                maxValue = max(maxValue, value)
+            }
+        }
+        val range = max(0.0001f, maxValue - minValue)
+        for (i in flat.indices) {
+            flat[i] = (flat[i] - minValue) / range
+        }
+        return flat
+    }
+
+    private fun depthToBitmap(depth: FloatArray): Bitmap {
+        val size = 518
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(size * size)
+        for (i in depth.indices) {
+            val value = (depth[i].coerceIn(0f, 1f) * 255f).roundToInt()
+            pixels[i] = Color.rgb(value, value, value)
+        }
+        bitmap.setPixels(pixels, 0, size, 0, 0, size, size)
+        return bitmap
+    }
+
+    private fun makeParallelSbs(source: Bitmap, depth: FloatArray, strength: Int): Bitmap {
+        val w = source.width
+        val h = source.height
+        val left = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val right = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val srcPixels = IntArray(w * h)
+        val leftPixels = IntArray(w * h)
+        val rightPixels = IntArray(w * h)
+        source.getPixels(srcPixels, 0, w, 0, 0, w, h)
+        for (y in 0 until h) {
+            val dy = (y * 517 / max(1, h - 1)).coerceIn(0, 517)
+            for (x in 0 until w) {
+                val dx = (x * 517 / max(1, w - 1)).coerceIn(0, 517)
+                val d = depth[dy * 518 + dx]
+                val shift = ((d - 0.5f) * strength).roundToInt()
+                val leftX = (x + shift).coerceIn(0, w - 1)
+                val rightX = (x - shift).coerceIn(0, w - 1)
+                leftPixels[y * w + x] = srcPixels[y * w + leftX]
+                rightPixels[y * w + x] = srcPixels[y * w + rightX]
+            }
+        }
+        left.setPixels(leftPixels, 0, w, 0, 0, w, h)
+        right.setPixels(rightPixels, 0, w, 0, 0, w, h)
+        val out = Bitmap.createBitmap(w * 2, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawBitmap(left, 0f, 0f, null)
+        canvas.drawBitmap(right, w.toFloat(), 0f, null)
+        return out
+    }
+}
+
+private class DebugExporter(
+    private val context: Context,
+    private val cache: VrCacheManager,
+) {
+    fun export(photo: PhotoItem, entry: VrCacheEntry): File {
+        val exportDir = File(context.getExternalFilesDir(null), "debug_exports").also { it.mkdirs() }
+        val safeName = photo.displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+        val zip = File(exportDir, "${photo.cacheKey}_$safeName.zip")
+        ZipOutputStream(FileOutputStream(zip)).use { out ->
+            val preview = File(cache.entryDir(photo), "source_preview.jpg")
+            decodeScaledBitmap(context, photo.uri, 1600).also { bitmap ->
+                FileOutputStream(preview).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+            }
+            out.addFile("source_preview.jpg", preview)
+            out.addFile("depth.png", File(entry.depthPath))
+            out.addFile("vr_sbs.jpg", File(entry.outputPath))
+            out.addFile("params.json", File(entry.paramsPath))
+            out.addFile("job.log", File(entry.logPath))
+        }
+        return zip
+    }
+}
+
+@Composable
+fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
+    val state by viewModel.uiState.collectAsState()
+    val context = LocalContext.current
+    val permission = imagePermission()
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        viewModel.onPermissionChanged(granted)
+    }
+
+    LaunchedEffect(Unit) {
+        if (!state.hasPermission) {
+            launcher.launch(permission)
+        }
+    }
+
+    if (!state.hasPermission) {
+        PermissionScreen { launcher.launch(permission) }
+        return
+    }
+
+    val selected = state.selectedIndex
+    if (selected != null) {
+        ViewerScreen(
+            state = state,
+            startIndex = selected,
+            onClose = viewModel::closeViewer,
+            onIndexChanged = viewModel::onPagerIndexChanged,
+            onVr = viewModel::requestVr,
+            onRetry = viewModel::retry,
+            onWindowChanged = viewModel::setPrefetchWindow,
+            onExportDebug = { index -> viewModel.exportDebug(context, index) },
+        )
+    } else {
+        GalleryScreen(
+            state = state,
+            onRefresh = viewModel::loadPhotos,
+            onOpen = viewModel::openPhoto,
+            onWindowChanged = viewModel::setPrefetchWindow,
+        )
+    }
+}
+
+@Composable
+private fun PermissionScreen(onGrant: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("Parallel VR Gallery", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(12.dp))
+        Text("Allow image access to browse your gallery and build local parallel-eye VR cache.")
+        Spacer(Modifier.height(20.dp))
+        Button(onClick = onGrant) { Text("Grant image access") }
+    }
+}
+
+@Composable
+private fun GalleryScreen(
+    state: UiState,
+    onRefresh: () -> Unit,
+    onOpen: (Int) -> Unit,
+    onWindowChanged: (Int) -> Unit,
+) {
+    Scaffold(
+        topBar = {
+            Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Parallel VR Gallery", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    OutlinedButton(onClick = onRefresh) { Text("Refresh") }
+                }
+                Spacer(Modifier.height(10.dp))
+                WindowSelector(state.prefetchWindow, onWindowChanged)
+                state.message?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(it, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+    ) { padding ->
+        if (state.loading) {
+            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+        } else {
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(112.dp),
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(state.photos) { photo ->
+                    val index = state.photos.indexOf(photo)
+                    PhotoTile(photo, state.states[photo.cacheKey] ?: VrState.NORMAL) { onOpen(index) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PhotoTile(photo: PhotoItem, state: VrState, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(1f)
+            .background(androidx.compose.ui.graphics.Color(0xff16191c))
+            .clickable(onClick = onClick),
+    ) {
+        AsyncBitmapImage(photo.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+        Text(
+            text = state.name,
+            color = androidx.compose.ui.graphics.Color.White,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.align(Alignment.BottomStart).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(5.dp),
+        )
+    }
+}
+
+@Composable
+private fun ViewerScreen(
+    state: UiState,
+    startIndex: Int,
+    onClose: () -> Unit,
+    onIndexChanged: (Int) -> Unit,
+    onVr: (Int) -> Unit,
+    onRetry: (Int) -> Unit,
+    onWindowChanged: (Int) -> Unit,
+    onExportDebug: (Int) -> Unit,
+) {
+    val view = LocalView.current
+    DisposableEffect(Unit) {
+        val window = (view.context as? ComponentActivity)?.window
+        if (Build.VERSION.SDK_INT >= 30) {
+            window?.insetsController?.hide(WindowInsets.Type.systemBars())
+            window?.insetsController?.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+        onDispose {
+            if (Build.VERSION.SDK_INT >= 30) {
+                window?.insetsController?.show(WindowInsets.Type.systemBars())
+            }
+        }
+    }
+
+    val pagerState = rememberPagerState(initialPage = startIndex) { state.photos.size }
+    LaunchedEffect(pagerState.currentPage) {
+        onIndexChanged(pagerState.currentPage)
+    }
+
+    Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black)) {
+        HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
+            val photo = state.photos[page]
+            val entry = state.entries[photo.cacheKey]
+            val vrState = state.states[photo.cacheKey] ?: VrState.NORMAL
+            if (state.vrMode && entry != null) {
+                AsyncBitmapImage(Uri.fromFile(File(entry.outputPath)), 4096, ContentScale.Fit, Modifier.fillMaxSize())
+            } else {
+                AsyncBitmapImage(photo.uri, 4096, ContentScale.Fit, Modifier.fillMaxSize())
+                if (state.vrMode && vrState != VrState.READY) {
+                    StatusOverlay(vrState, onRetry = { onRetry(page) })
+                }
+            }
+        }
+        Row(
+            modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OutlinedButton(onClick = onClose) { Text("Back") }
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = state.photos.getOrNull(pagerState.currentPage)?.displayName.orEmpty(),
+                color = androidx.compose.ui.graphics.Color.White,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Button(onClick = { onVr(pagerState.currentPage) }) { Text("VR") }
+            Spacer(Modifier.width(8.dp))
+            OutlinedButton(onClick = { onExportDebug(pagerState.currentPage) }) { Text("Debug") }
+        }
+        Column(
+            modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
+        ) {
+            WindowSelector(state.prefetchWindow, onWindowChanged)
+            val current = state.photos.getOrNull(pagerState.currentPage)
+            if (current != null) {
+                Text(
+                    text = "State: ${state.states[current.cacheKey] ?: VrState.NORMAL}   ${pagerState.currentPage + 1}/${state.photos.size}",
+                    color = androidx.compose.ui.graphics.Color.White,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            state.logs.take(3).forEach {
+                Text(it, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusOverlay(state: VrState, onRetry: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0x66000000)),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        if (state == VrState.GENERATING || state == VrState.QUEUED) {
+            CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
+            Spacer(Modifier.height(12.dp))
+            Text(state.name, color = androidx.compose.ui.graphics.Color.White)
+        } else if (state == VrState.FAILED) {
+            Text("Generation failed", color = androidx.compose.ui.graphics.Color.White)
+            Spacer(Modifier.height(12.dp))
+            Button(onClick = onRetry) { Text("Retry") }
+        }
+    }
+}
+
+@Composable
+private fun WindowSelector(value: Int, onChange: (Int) -> Unit) {
+    val options = listOf(3, 5, 10)
+    SingleChoiceSegmentedButtonRow {
+        options.forEachIndexed { index, option ->
+            SegmentedButton(
+                selected = value == option,
+                onClick = { onChange(option) },
+                shape = SegmentedButtonDefaults.itemShape(index, options.size),
+            ) {
+                Text("$option")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AsyncBitmapImage(uri: Uri, maxSide: Int, contentScale: ContentScale, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    var bitmap by remember(uri, maxSide) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(uri, maxSide) {
+        bitmap = withContext(Dispatchers.IO) { runCatching { decodeScaledBitmap(context, uri, maxSide) }.getOrNull() }
+    }
+    if (bitmap == null) {
+        Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(Modifier.size(26.dp))
+        }
+    } else {
+        Image(bitmap!!.asImageBitmap(), contentDescription = null, modifier = modifier, contentScale = contentScale)
+    }
+}
+
+private fun hasImagePermission(context: Context): Boolean {
+    return ContextCompat.checkSelfPermission(context, imagePermission()) == PackageManager.PERMISSION_GRANTED
+}
+
+private fun imagePermission(): String {
+    return if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
+}
+
+private fun decodeScaledBitmap(context: Context, uri: Uri, maxLongEdge: Int): Bitmap {
+    if (Build.VERSION.SDK_INT >= 28) {
+        val source = ImageDecoder.createSource(context.contentResolver, uri)
+        return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+            val w = info.size.width
+            val h = info.size.height
+            val scale = min(1f, maxLongEdge.toFloat() / max(w, h).toFloat())
+            decoder.setTargetSize(max(1, (w * scale).roundToInt()), max(1, (h * scale).roundToInt()))
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            decoder.isMutableRequired = false
+        }.copy(Bitmap.Config.ARGB_8888, false)
+    }
+
+    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    context.contentResolver.openInputStream(uri).use { BitmapFactory.decodeStream(it, null, options) }
+    var sample = 1
+    while (max(options.outWidth / sample, options.outHeight / sample) > maxLongEdge) sample *= 2
+    val decode = BitmapFactory.Options().apply { inSampleSize = sample }
+    return context.contentResolver.openInputStream(uri).use { input ->
+        BitmapFactory.decodeStream(input, null, decode) ?: error("Unable to decode image")
+    }.copy(Bitmap.Config.ARGB_8888, false)
+}
+
+private fun loadModelFile(context: Context, assetPath: String): ByteBuffer {
+    val descriptor = context.assets.openFd(assetPath)
+    FileInputStream(descriptor.fileDescriptor).use { input ->
+        val channel = input.channel
+        return channel.map(FileChannel.MapMode.READ_ONLY, descriptor.startOffset, descriptor.declaredLength)
+    }
+}
+
+private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: Bitmap): String {
+    return """
+        {
+          "photoKey": "${photo.cacheKey}",
+          "displayName": "${photo.displayName.replace("\"", "\\\"")}",
+          "sourceWidth": ${source.width},
+          "sourceHeight": ${source.height},
+          "outputWidth": ${output.width},
+          "outputHeight": ${output.height},
+          "depthModel": "$depthModel",
+          "outputMode": "$outputMode",
+          "disparityStrength": $disparityStrength,
+          "maxLongEdge": $maxLongEdge,
+          "inpaintMode": "$inpaintMode",
+          "quality": $quality
+        }
+    """.trimIndent()
+}
+
+private fun ZipOutputStream.addFile(name: String, file: File) {
+    putNextEntry(ZipEntry(name))
+    file.inputStream().use { it.copyTo(this) }
+    closeEntry()
+}
