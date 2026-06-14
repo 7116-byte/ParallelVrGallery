@@ -22,6 +22,7 @@ import android.view.WindowInsetsController
 import androidx.activity.result.IntentSenderRequest
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -58,6 +59,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -106,6 +108,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -181,6 +184,7 @@ data class VrGenerationParams(
     val invertDepth: Boolean = false,
     val maxLongEdge: Int = 6000,
     val modelThreads: Int = 4,
+    val useGpu: Boolean = false,
     val inpaintMode: String = "FOREGROUND_FILL",
     val quality: Int = 94,
 )
@@ -203,6 +207,7 @@ data class AppSettings(
     val depthResolution: Int = 518,
     val generationWorkers: Int = 1,
     val modelThreads: Int = 4,
+    val useGpu: Boolean = false,
 ) {
     fun toParams(): VrGenerationParams = VrGenerationParams(
         depthModel = modelId,
@@ -212,6 +217,7 @@ data class AppSettings(
         invertDepth = invertDepth,
         maxLongEdge = maxLongEdge,
         modelThreads = modelThreads,
+        useGpu = useGpu,
     )
 }
 
@@ -283,6 +289,7 @@ data class UiState(
     val debugIndex: Int? = null,
     val modelProgress: Float? = null,
     val modelStatus: String = "模型未下载 / Model not downloaded",
+    val blockingMessage: String? = null,
     val cacheVersions: List<CacheVersionSummary> = emptyList(),
     val managedCacheItems: List<ManagedCacheItem> = emptyList(),
 )
@@ -486,6 +493,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun saveGeneratedCopies(context: Context, indexes: List<Int>) {
         val lang = _uiState.value.settings.language
+        _uiState.update { it.copy(blockingMessage = lang.t("保存中", "Saving")) }
         viewModelScope.launch {
             val message = withContext(Dispatchers.IO) {
                 var saved = 0
@@ -504,8 +512,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     else -> lang.t("已保存 $saved 张，失败 $failed 张", "Saved $saved images, failed $failed")
                 }
             }
-            _uiState.update { it.copy(message = message) }
-            loadPhotos()
+            _uiState.update { it.copy(blockingMessage = null, message = message) }
         }
     }
 
@@ -746,6 +753,7 @@ private class SettingsStore(context: Context) {
             depthResolution = 518,
             generationWorkers = prefs.getInt("generationWorkers", 1),
             modelThreads = prefs.getInt("modelThreads", 4),
+            useGpu = prefs.getBoolean("useGpu", false),
         )
     }
 
@@ -763,6 +771,7 @@ private class SettingsStore(context: Context) {
             .putInt("maxLongEdge", settings.maxLongEdge)
             .putInt("generationWorkers", settings.generationWorkers)
             .putInt("modelThreads", settings.modelThreads)
+            .putBoolean("useGpu", settings.useGpu)
             .apply()
     }
 }
@@ -987,7 +996,7 @@ private class VrGenerator(
         onProgress(0.25f)
 
         val depthStart = System.currentTimeMillis()
-        val rawDepth = runDepthModel(original, modelFile, params.modelThreads)
+        val rawDepth = runDepthModel(original, modelFile, params.modelThreads, params.useGpu)
         val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
         mark("depth model ${System.currentTimeMillis() - depthStart}ms")
         onProgress(0.55f)
@@ -1024,10 +1033,25 @@ private class VrGenerator(
         )
     }
 
-    private fun runDepthModel(bitmap: Bitmap, modelFile: File, modelThreads: Int): FloatArray {
+    private fun runDepthModel(bitmap: Bitmap, modelFile: File, modelThreads: Int, useGpu: Boolean): FloatArray {
         val inputSize = 518
         val model = loadModelFile(modelFile)
-        val interpreter = Interpreter(model, Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8)))
+        var gpuDelegate: GpuDelegate? = null
+        val options = Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8))
+        if (useGpu) {
+            runCatching {
+                gpuDelegate = GpuDelegate()
+                options.addDelegate(gpuDelegate)
+            }.onFailure {
+                gpuDelegate?.close()
+                gpuDelegate = null
+            }
+        }
+        val interpreter = runCatching { Interpreter(model, options) }.getOrElse {
+            gpuDelegate?.close()
+            gpuDelegate = null
+            Interpreter(model, Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8)))
+        }
         val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
         val pixels = IntArray(inputSize * inputSize)
@@ -1038,8 +1062,19 @@ private class VrGenerator(
             input.putFloat(Color.blue(pixel) / 255f)
         }
         val output = Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(1) } } }
-        interpreter.run(input, output)
+        runCatching {
+            interpreter.run(input, output)
+        }.onFailure { error ->
+            interpreter.close()
+            gpuDelegate?.close()
+            if (!useGpu) throw error
+            val cpuInterpreter = Interpreter(model, Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8)))
+            input.rewind()
+            cpuInterpreter.run(input, output)
+            cpuInterpreter.close()
+        }
         interpreter.close()
+        gpuDelegate?.close()
         val flat = FloatArray(inputSize * inputSize)
         var minValue = Float.MAX_VALUE
         var maxValue = -Float.MAX_VALUE
@@ -1195,6 +1230,21 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     if (!state.hasPermission) {
         PermissionScreen(state.settings.language) { launcher.launch(permission) }
         return
+    }
+
+    state.blockingMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = {},
+            confirmButton = {},
+            title = { Text(message) },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(28.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Text(state.settings.language.t("请稍等", "Please wait"))
+                }
+            },
+        )
     }
 
     val screen = when {
@@ -1615,7 +1665,14 @@ private fun SettingsScreen(
         SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
             onChange(settings.copy(modelThreads = it))
         }
-        Text(lang.t("GPU 加速：当前版本暂不可用；先提供稳定的 CPU 多线程。", "GPU acceleration: unavailable in this version; stable CPU threading is provided first."), style = MaterialTheme.typography.bodySmall)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = settings.useGpu,
+                onCheckedChange = { onChange(settings.copy(useGpu = it)) },
+            )
+            Text(lang.t("尝试 GPU 加速", "Try GPU acceleration"))
+        }
+        Text(lang.t("GPU 会尝试使用 TFLite GPU Delegate；不兼容时自动回退 CPU。", "GPU uses TFLite GPU Delegate when compatible and falls back to CPU if needed."), style = MaterialTheme.typography.bodySmall)
 
         Spacer(Modifier.height(12.dp))
         Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
@@ -1728,8 +1785,13 @@ private fun ViewerScreen(
             ) {
                 OutlinedButton(onClick = onClose) { Text(lang.t("返回", "Back")) }
                 Spacer(Modifier.width(8.dp))
+                val prefetchText = if (state.settings.autoPrefetch) {
+                    lang.t("自动预加载：前 ${state.activePrefetchWindow} / 后 ${state.activePrefetchWindow}", "Auto prefetch: prev ${state.activePrefetchWindow} / next ${state.activePrefetchWindow}")
+                } else {
+                    lang.t("预加载：前 ${state.settings.prefetchWindow} / 后 ${state.settings.prefetchWindow}", "Prefetch: prev ${state.settings.prefetchWindow} / next ${state.settings.prefetchWindow}")
+                }
                 Text(
-                    text = state.photos.getOrNull(pagerState.currentPage)?.displayName.orEmpty(),
+                    text = prefetchText,
                     color = androidx.compose.ui.graphics.Color.White,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -1831,7 +1893,7 @@ private fun DebugScreen(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(150.dp)
+                .height(210.dp)
                 .background(androidx.compose.ui.graphics.Color(0xff202326))
                 .padding(8.dp),
         ) {
@@ -1839,6 +1901,16 @@ private fun DebugScreen(
             Text("${lang.t("模型", "Model")}: ${lang.pickMixed(state.modelStatus)}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
             job?.let {
                 Text("Job: ${it.state} progress=${(it.progress * 100f).roundToInt()}% error=${it.error.orEmpty()}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
+            }
+            Text(lang.t("队列", "Queue"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+            state.jobs.take(5).forEach {
+                Text(
+                    "${it.state.label(lang)} ${(it.progress * 100f).roundToInt()}%  ${it.photoItem.displayName}",
+                    color = androidx.compose.ui.graphics.Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
             state.logs.take(6).forEach {
                 Text(it, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 1)
@@ -1887,13 +1959,16 @@ private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onTap: () 
     val halfWidth = (source.width / 2).coerceAtLeast(1)
     val left = remember(source) { Bitmap.createBitmap(source, 0, 0, halfWidth, source.height).asImageBitmap() }
     val right = remember(source) { Bitmap.createBitmap(source, halfWidth, 0, source.width - halfWidth, source.height).asImageBitmap() }
+    val animatedScale by animateFloatAsState(targetValue = scale, label = "sbsScale")
+    val animatedOffsetX by animateFloatAsState(targetValue = offset.x, label = "sbsOffsetX")
+    val animatedOffsetY by animateFloatAsState(targetValue = offset.y, label = "sbsOffsetY")
     val imageModifier = Modifier
         .fillMaxSize()
         .graphicsLayer {
-            scaleX = scale
-            scaleY = scale
-            translationX = offset.x
-            translationY = offset.y
+            scaleX = animatedScale
+            scaleY = animatedScale
+            translationX = animatedOffsetX
+            translationY = animatedOffsetY
         }
 
     Box(
@@ -2102,6 +2177,7 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: 
           "invertDepth": $invertDepth,
           "maxLongEdge": $maxLongEdge,
           "modelThreads": $modelThreads,
+          "useGpu": $useGpu,
           "inpaintMode": "$inpaintMode",
           "quality": $quality,
           "modelSha256": "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",
