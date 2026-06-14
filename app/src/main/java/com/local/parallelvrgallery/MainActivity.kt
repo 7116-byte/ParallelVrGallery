@@ -158,19 +158,26 @@ data class VrGenerationParams(
     val depthScale: Float = 40f,
     val blurRadius: Int = 3,
     val fillRadius: Int = 10,
-    val invertDepth: Boolean = true,
+    val invertDepth: Boolean = false,
     val maxLongEdge: Int = 6000,
     val inpaintMode: String = "FOREGROUND_FILL",
     val quality: Int = 94,
 )
 
+enum class AppLanguage {
+    ZH,
+    EN,
+}
+
 data class AppSettings(
+    val language: AppLanguage = AppLanguage.ZH,
     val modelId: String = "depth_anything_v2_small_tflite",
-    val prefetchWindow: Int = 5,
+    val autoPrefetch: Boolean = true,
+    val prefetchWindow: Int = 3,
     val depthScale: Float = 40f,
     val blurRadius: Int = 3,
     val fillRadius: Int = 10,
-    val invertDepth: Boolean = true,
+    val invertDepth: Boolean = false,
     val maxLongEdge: Int = 6000,
     val depthResolution: Int = 518,
 ) {
@@ -231,6 +238,7 @@ data class UiState(
     val manageOpen: Boolean = false,
     val vrMode: Boolean = false,
     val settings: AppSettings = AppSettings(),
+    val activePrefetchWindow: Int = 3,
     val states: Map<String, VrState> = emptyMap(),
     val entries: Map<String, VrCacheEntry> = emptyMap(),
     val jobs: List<VrJob> = emptyList(),
@@ -307,12 +315,18 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun updateSettings(settings: AppSettings) {
         settingsStore.save(settings)
-        _uiState.update { it.copy(settings = settings, modelStatus = modelManager.statusText(settings.modelId)) }
+        _uiState.update {
+            it.copy(
+                settings = settings,
+                activePrefetchWindow = if (settings.autoPrefetch) 3 else settings.prefetchWindow,
+                modelStatus = modelManager.statusText(settings.modelId),
+            )
+        }
         _uiState.value.selectedIndex?.let { refreshWindow(it) }
     }
 
     fun onPagerIndexChanged(index: Int) {
-        _uiState.update { it.copy(selectedIndex = index) }
+        _uiState.update { it.copy(selectedIndex = index, activePrefetchWindow = if (it.settings.autoPrefetch) 3 else it.settings.prefetchWindow) }
         if (_uiState.value.vrMode) {
             enqueueWindow(index, includeCurrent = true)
         }
@@ -322,7 +336,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (_uiState.value.vrMode) {
             stopVr()
         } else {
-            _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null) }
+            _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null, activePrefetchWindow = if (it.settings.autoPrefetch) 3 else it.settings.prefetchWindow) }
             enqueueWindow(index, includeCurrent = true)
         }
     }
@@ -402,7 +416,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (photos.isEmpty()) return
         val targets = mutableListOf<Pair<Int, Int>>()
         if (includeCurrent) targets += index to 0
-        for (distance in 1.._uiState.value.settings.prefetchWindow) {
+        for (distance in 1.._uiState.value.activePrefetchWindow) {
             val next = index + distance
             val prev = index - distance
             if (next in photos.indices) targets += next to distance * 2 - 1
@@ -440,7 +454,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     synchronized(pending) { pending.clear() }
                     break
                 }
-                val next = synchronized(pending) { pending.poll() } ?: break
+                val next = synchronized(pending) { pending.poll() }
+                if (next == null) {
+                    if (expandAutoPrefetchIfNeeded()) {
+                        delay(50)
+                        continue
+                    }
+                    break
+                }
                 activeKey = next.photo.cacheKey
                 markState(next.photo.cacheKey, VrState.GENERATING)
                 upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f)
@@ -478,6 +499,20 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 delay(50)
             }
         }
+    }
+
+    private fun expandAutoPrefetchIfNeeded(): Boolean {
+        if (!_uiState.value.vrMode || !_uiState.value.settings.autoPrefetch) return false
+        val selected = _uiState.value.selectedIndex ?: return false
+        val next = when (_uiState.value.activePrefetchWindow) {
+            3 -> 5
+            5 -> 10
+            else -> return false
+        }
+        _uiState.update { it.copy(activePrefetchWindow = next) }
+        addLog("auto prefetch expanded to $next")
+        enqueueWindow(selected, includeCurrent = false)
+        return synchronized(pending) { pending.isNotEmpty() }
     }
 
     private fun markReady(key: String, entry: VrCacheEntry) {
@@ -524,28 +559,54 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
 private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long)
 
+private fun AppLanguage.t(zh: String, en: String): String = if (this == AppLanguage.ZH) zh else en
+
+private fun AppLanguage.pickMixed(text: String): String {
+    val marker = " / "
+    if (!text.contains(marker)) return text
+    val parts = text.split(marker, limit = 2)
+    return if (this == AppLanguage.ZH) parts.first() else parts.getOrElse(1) { parts.first() }
+}
+
 private class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
-    fun load(): AppSettings = AppSettings(
-        modelId = prefs.getString("modelId", "depth_anything_v2_small_tflite") ?: "depth_anything_v2_small_tflite",
-        prefetchWindow = prefs.getInt("prefetchWindow", 5),
-        depthScale = prefs.getFloat("depthScale", 40f),
-        blurRadius = prefs.getInt("blurRadius", 3),
-        fillRadius = prefs.getInt("fillRadius", 10),
-        invertDepth = prefs.getBoolean("invertDepth", true),
-        maxLongEdge = prefs.getInt("maxLongEdge", 6000),
-        depthResolution = 518,
-    )
+    fun load(): AppSettings {
+        val migratedInvertDefault = prefs.getBoolean("migratedInvertDefaultOffV5", false)
+        val invertDepth = if (migratedInvertDefault) {
+            prefs.getBoolean("invertDepth", false)
+        } else {
+            prefs.edit()
+                .putBoolean("invertDepth", false)
+                .putBoolean("migratedInvertDefaultOffV5", true)
+                .apply()
+            false
+        }
+        return AppSettings(
+            language = runCatching { AppLanguage.valueOf(prefs.getString("language", AppLanguage.ZH.name) ?: AppLanguage.ZH.name) }.getOrDefault(AppLanguage.ZH),
+            modelId = prefs.getString("modelId", "depth_anything_v2_small_tflite") ?: "depth_anything_v2_small_tflite",
+            autoPrefetch = prefs.getBoolean("autoPrefetch", true),
+            prefetchWindow = prefs.getInt("prefetchWindow", 3),
+            depthScale = prefs.getFloat("depthScale", 40f),
+            blurRadius = prefs.getInt("blurRadius", 3),
+            fillRadius = prefs.getInt("fillRadius", 10),
+            invertDepth = invertDepth,
+            maxLongEdge = prefs.getInt("maxLongEdge", 6000),
+            depthResolution = 518,
+        )
+    }
 
     fun save(settings: AppSettings) {
         prefs.edit()
+            .putString("language", settings.language.name)
             .putString("modelId", settings.modelId)
+            .putBoolean("autoPrefetch", settings.autoPrefetch)
             .putInt("prefetchWindow", settings.prefetchWindow)
             .putFloat("depthScale", settings.depthScale)
             .putInt("blurRadius", settings.blurRadius)
             .putInt("fillRadius", settings.fillRadius)
             .putBoolean("invertDepth", settings.invertDepth)
+            .putBoolean("migratedInvertDefaultOffV5", true)
             .putInt("maxLongEdge", settings.maxLongEdge)
             .apply()
     }
@@ -843,6 +904,9 @@ private class VrGenerator(
 
     private fun smoothDepth(depth: FloatArray, radius: Int, invert: Boolean): FloatArray {
         val size = 518
+        if (radius <= 0) {
+            return if (invert) FloatArray(depth.size) { 1f - depth[it] } else depth.copyOf()
+        }
         val r = radius.coerceAtLeast(1) / 2
         val horizontal = FloatArray(depth.size)
         val output = FloatArray(depth.size)
@@ -945,7 +1009,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     }
 
     if (!state.hasPermission) {
-        PermissionScreen { launcher.launch(permission) }
+        PermissionScreen(state.settings.language) { launcher.launch(permission) }
         return
     }
 
@@ -998,17 +1062,17 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
 }
 
 @Composable
-private fun PermissionScreen(onGrant: () -> Unit) {
+private fun PermissionScreen(lang: AppLanguage, onGrant: () -> Unit) {
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("平行眼 VR 图库", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(12.dp))
-        Text("授权读取图片后，可以浏览系统相册，并在本地生成平行眼 SBS VR 缓存。\nAllow image access to browse your gallery and build local parallel-eye VR cache.")
+        Text(lang.t("授权读取图片后，可以浏览系统相册，并在本地生成平行眼 SBS VR 缓存。", "Allow image access to browse your gallery and build local parallel-eye VR cache."))
         Spacer(Modifier.height(20.dp))
-        Button(onClick = onGrant) { Text("授权图片访问 / Grant access") }
+        Button(onClick = onGrant) { Text(lang.t("授权图片访问", "Grant access")) }
     }
 }
 
@@ -1022,20 +1086,22 @@ private fun GalleryScreen(
 ) {
     Scaffold(
         topBar = {
+            val lang = state.settings.language
             Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("平行眼 VR 图库", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    OutlinedButton(onClick = onManage) { Text("管理 / Manage") }
+                    Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    OutlinedButton(onClick = onManage) { Text(lang.t("管理", "Manage")) }
                     Spacer(Modifier.width(8.dp))
-                    OutlinedButton(onClick = onSettings) { Text("设置 / Settings") }
+                    OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
                     Spacer(Modifier.width(8.dp))
-                    OutlinedButton(onClick = onRefresh) { Text("刷新 / Refresh") }
+                    OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
                 }
                 Spacer(Modifier.height(10.dp))
-                Text("预加载 / Prefetch: 前后各 ${state.settings.prefetchWindow} 张", style = MaterialTheme.typography.bodySmall)
+                val prefetch = if (state.settings.autoPrefetch) lang.t("自动：3→5→10", "Auto: 3→5→10") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
+                Text(lang.t("预加载：$prefetch", "Prefetch: $prefetch"), style = MaterialTheme.typography.bodySmall)
                 state.message?.let {
                     Spacer(Modifier.height(6.dp))
-                    Text(it, style = MaterialTheme.typography.bodySmall)
+                    Text(lang.pickMixed(it), style = MaterialTheme.typography.bodySmall)
                 }
             }
         },
@@ -1087,6 +1153,7 @@ private fun ManageScreen(
     onBack: () -> Unit,
     onDeleteVersion: (String) -> Unit,
 ) {
+    val lang = state.settings.language
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1095,15 +1162,15 @@ private fun ManageScreen(
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text("返回 / Back") }
+            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
             Spacer(Modifier.width(12.dp))
-            Text("生成管理 / Generated Manager", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(lang.t("生成管理", "Generated Manager"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(16.dp))
-        Text("图片 / Images", fontWeight = FontWeight.Bold)
+        Text(lang.t("图片", "Images"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
         if (state.cacheVersions.isEmpty()) {
-            Text("暂无已生成图片 / No generated images yet")
+            Text(lang.t("暂无已生成图片", "No generated images yet"))
         } else {
             state.cacheVersions.forEach { summary ->
                 Row(
@@ -1111,19 +1178,19 @@ private fun ManageScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("版本 / Version: ${summary.version}", fontWeight = FontWeight.Bold)
-                        Text("${summary.count} 张 / images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", style = MaterialTheme.typography.bodySmall)
+                        Text(lang.t("版本：${summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
+                        Text(lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
                     }
                     OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
-                        Text("删除 / Delete")
+                        Text(lang.t("删除", "Delete"))
                     }
                 }
             }
         }
         Spacer(Modifier.height(20.dp))
-        Text("视频 / Videos", fontWeight = FontWeight.Bold)
+        Text(lang.t("视频", "Videos"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
-        Text("视频生成入口已预留，当前版本暂未实现。\nVideo generation entry is reserved; not implemented in this version.", style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("视频生成入口已预留，当前版本暂未实现。", "Video generation entry is reserved; not implemented in this version."), style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -1134,6 +1201,7 @@ private fun SettingsScreen(
     onBack: () -> Unit,
     onChange: (AppSettings) -> Unit,
 ) {
+    val lang = settings.language
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1142,17 +1210,30 @@ private fun SettingsScreen(
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text("返回 / Back") }
+            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
             Spacer(Modifier.width(12.dp))
-            Text("设置 / Settings", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(lang.t("设置", "Settings"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(16.dp))
-        Text("模型 / Model", fontWeight = FontWeight.Bold)
-        Text(modelStatus, style = MaterialTheme.typography.bodySmall)
-        Text("覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载。\nUpdating over the existing app keeps the downloaded model; uninstalling usually removes it.", style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("语言", "Language"), fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        SingleChoiceSegmentedButtonRow {
+            listOf(AppLanguage.ZH to "中文", AppLanguage.EN to "English").forEachIndexed { index, option ->
+                SegmentedButton(
+                    selected = settings.language == option.first,
+                    onClick = { onChange(settings.copy(language = option.first)) },
+                    shape = SegmentedButtonDefaults.itemShape(index, 2),
+                ) { Text(option.second) }
+            }
+        }
         Spacer(Modifier.height(16.dp))
 
-        Text("模型选择 / Model selection", fontWeight = FontWeight.Bold)
+        Text(lang.t("模型", "Model"), fontWeight = FontWeight.Bold)
+        Text(lang.pickMixed(modelStatus), style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载。", "Updating over the existing app keeps the downloaded model; uninstalling usually removes it."), style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(16.dp))
+
+        Text(lang.t("模型选择", "Model selection"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow {
             AvailableModels.forEachIndexed { index, spec ->
@@ -1163,36 +1244,50 @@ private fun SettingsScreen(
                 ) { Text(spec.displayName) }
             }
         }
-        Text("目前只内置已验证模型；新增模型时会出现在这里。\nOnly the verified model is available now; additional models will appear here.", style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("目前只内置已验证模型；新增模型时会出现在这里。", "Only the verified model is available now; additional models will appear here."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(16.dp))
 
-        SettingInt("预加载张数 / Prefetch each side", settings.prefetchWindow, listOf(3, 5, 10)) {
-            onChange(settings.copy(prefetchWindow = it))
+        Text(lang.t("预加载", "Prefetch"), fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        SingleChoiceSegmentedButtonRow {
+            val options = listOf("auto", "3", "5", "10")
+            options.forEachIndexed { index, option ->
+                val selected = if (option == "auto") settings.autoPrefetch else !settings.autoPrefetch && settings.prefetchWindow == option.toInt()
+                SegmentedButton(
+                    selected = selected,
+                    onClick = {
+                        if (option == "auto") onChange(settings.copy(autoPrefetch = true, prefetchWindow = 3))
+                        else onChange(settings.copy(autoPrefetch = false, prefetchWindow = option.toInt()))
+                    },
+                    shape = SegmentedButtonDefaults.itemShape(index, options.size),
+                ) { Text(if (option == "auto") lang.t("自动", "Auto") else option) }
+            }
         }
-        SettingFloat("depth_scale / 深度强度", settings.depthScale, listOf(20f, 30f, 40f, 60f)) {
+        Spacer(Modifier.height(14.dp))
+        SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
             onChange(settings.copy(depthScale = it))
         }
-        SettingInt("blur_radius / 深度平滑", settings.blurRadius, listOf(1, 3, 9, 15)) {
+        SettingInt(lang.t("深度平滑", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
             onChange(settings.copy(blurRadius = it))
         }
-        SettingInt("fill_radius / 边缘填充", settings.fillRadius, listOf(5, 10, 15, 20)) {
+        SettingInt(lang.t("边缘填充", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
             onChange(settings.copy(fillRadius = it))
         }
-        SettingInt("输出最大长边 / Max output long edge", settings.maxLongEdge, listOf(2048, 4096, 6000)) {
+        SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
             onChange(settings.copy(maxLongEdge = it))
         }
 
         Spacer(Modifier.height(12.dp))
-        Text("深度图分辨率 / Depth resolution", fontWeight = FontWeight.Bold)
+        Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
         val spec = modelSpec(settings.modelId)
-        Text("${spec.inputSize} x ${spec.inputSize}（由当前模型固定；选择其他模型后这里会随模型变化）\nFixed by the selected model; choosing another model changes this value.", style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("${spec.inputSize} x ${spec.inputSize}（由当前模型固定；选择其他模型后这里会随模型变化）", "${spec.inputSize} x ${spec.inputSize}. Fixed by the selected model; choosing another model changes this value."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(12.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = settings.invertDepth,
                 onCheckedChange = { onChange(settings.copy(invertDepth = it)) },
             )
-            Text("反转深度 / Invert depth（匹配 ComfyUI 截图默认：true）")
+            Text(lang.t("反转深度", "Invert depth"))
         }
     }
 }
@@ -1239,6 +1334,7 @@ private fun ViewerScreen(
     onRetry: (Int) -> Unit,
     onOpenDebug: (Int) -> Unit,
 ) {
+    val lang = state.settings.language
     val view = LocalView.current
     DisposableEffect(Unit) {
         val window = (view.context as? ComponentActivity)?.window
@@ -1268,7 +1364,7 @@ private fun ViewerScreen(
             } else {
                 AsyncBitmapImage(photo.uri, 4096, ContentScale.Fit, Modifier.fillMaxSize())
                 if (state.vrMode && vrState != VrState.READY) {
-                    StatusOverlay(vrState, onRetry = { onRetry(page) })
+                    StatusOverlay(vrState, lang, onRetry = { onRetry(page) })
                 }
             }
         }
@@ -1276,7 +1372,7 @@ private fun ViewerScreen(
             modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            OutlinedButton(onClick = onClose) { Text("返回 / Back") }
+            OutlinedButton(onClick = onClose) { Text(lang.t("返回", "Back")) }
             Spacer(Modifier.width(8.dp))
             Text(
                 text = state.photos.getOrNull(pagerState.currentPage)?.displayName.orEmpty(),
@@ -1286,10 +1382,10 @@ private fun ViewerScreen(
                 modifier = Modifier.weight(1f),
             )
             Button(onClick = { onVr(pagerState.currentPage) }) {
-                Text(if (state.vrMode) "关闭 VR / VR Off" else "开启 VR / VR On")
+                Text(if (state.vrMode) lang.t("关闭 VR", "VR Off") else lang.t("开启 VR", "VR On"))
             }
             Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = { onOpenDebug(pagerState.currentPage) }) { Text("调试 / Debug") }
+            OutlinedButton(onClick = { onOpenDebug(pagerState.currentPage) }) { Text(lang.t("调试", "Debug")) }
         }
         Column(
             modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
@@ -1297,13 +1393,13 @@ private fun ViewerScreen(
             val current = state.photos.getOrNull(pagerState.currentPage)
             if (current != null) {
                 Text(
-                    text = "状态 / State: ${state.states[current.cacheKey] ?: VrState.NORMAL}   ${pagerState.currentPage + 1}/${state.photos.size}",
+                    text = "${lang.t("状态", "State")}: ${state.states[current.cacheKey] ?: VrState.NORMAL}   ${pagerState.currentPage + 1}/${state.photos.size}",
                     color = androidx.compose.ui.graphics.Color.White,
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
             state.modelProgress?.let {
-                Text(state.modelStatus, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.bodySmall)
+                Text(lang.pickMixed(state.modelStatus), color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.bodySmall)
             }
             state.logs.take(3).forEach {
                 Text(it, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 1)
@@ -1313,7 +1409,7 @@ private fun ViewerScreen(
 }
 
 @Composable
-private fun StatusOverlay(state: VrState, onRetry: () -> Unit) {
+private fun StatusOverlay(state: VrState, lang: AppLanguage, onRetry: () -> Unit) {
     Column(
         modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0x66000000)),
         verticalArrangement = Arrangement.Center,
@@ -1324,9 +1420,9 @@ private fun StatusOverlay(state: VrState, onRetry: () -> Unit) {
             Spacer(Modifier.height(12.dp))
             Text(state.name, color = androidx.compose.ui.graphics.Color.White)
         } else if (state == VrState.FAILED) {
-            Text("生成失败 / Generation failed", color = androidx.compose.ui.graphics.Color.White)
+            Text(lang.t("生成失败", "Generation failed"), color = androidx.compose.ui.graphics.Color.White)
             Spacer(Modifier.height(12.dp))
-            Button(onClick = onRetry) { Text("重试 / Retry") }
+            Button(onClick = onRetry) { Text(lang.t("重试", "Retry")) }
         }
     }
 }
@@ -1338,6 +1434,7 @@ private fun DebugScreen(
     onBack: () -> Unit,
     onShare: () -> Unit,
 ) {
+    val lang = state.settings.language
     val photo = state.photos.getOrNull(index)
     val entry = photo?.let { state.entries[it.cacheKey] }
     val vrState = photo?.let { state.states[it.cacheKey] } ?: VrState.NORMAL
@@ -1350,20 +1447,20 @@ private fun DebugScreen(
             .padding(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text("返回 / Back") }
+            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
             Spacer(Modifier.width(8.dp))
             Text(
-                text = "调试 / Debug",
+                text = lang.t("调试", "Debug"),
                 color = androidx.compose.ui.graphics.Color.White,
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.weight(1f),
             )
-            Button(onClick = onShare, enabled = entry != null) { Text("分享调试包 / Share") }
+            Button(onClick = onShare, enabled = entry != null) { Text(lang.t("分享调试包", "Share debug package")) }
         }
         Spacer(Modifier.height(8.dp))
         Text(
-            text = "${photo?.displayName.orEmpty()}  状态 / State: $vrState",
+            text = "${photo?.displayName.orEmpty()}  ${lang.t("状态", "State")}: $vrState",
             color = androidx.compose.ui.graphics.Color.White,
             style = MaterialTheme.typography.bodyMedium,
             maxLines = 1,
@@ -1371,9 +1468,9 @@ private fun DebugScreen(
         )
         Spacer(Modifier.height(8.dp))
         Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            DebugImagePanel("原图 / Source", photo?.uri, Modifier.weight(1f))
-            DebugImagePanel("深度图 / Depth", entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f))
-            DebugImagePanel("VR SBS", entry?.let { Uri.fromFile(File(it.outputPath)) }, Modifier.weight(1f))
+            DebugImagePanel(lang.t("原图", "Source"), photo?.uri, Modifier.weight(1f), lang)
+            DebugImagePanel(lang.t("深度图", "Depth"), entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f), lang)
+            DebugImagePanel("VR SBS", entry?.let { Uri.fromFile(File(it.outputPath)) }, Modifier.weight(1f), lang)
         }
         Spacer(Modifier.height(8.dp))
         Column(
@@ -1383,8 +1480,8 @@ private fun DebugScreen(
                 .background(androidx.compose.ui.graphics.Color(0xff202326))
                 .padding(8.dp),
         ) {
-            Text("日志 / Logs", color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
-            Text("模型 / Model: ${state.modelStatus}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
+            Text(lang.t("日志", "Logs"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
+            Text("${lang.t("模型", "Model")}: ${lang.pickMixed(state.modelStatus)}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
             job?.let {
                 Text("Job: ${it.state} progress=${(it.progress * 100f).roundToInt()}% error=${it.error.orEmpty()}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
             }
@@ -1396,7 +1493,7 @@ private fun DebugScreen(
 }
 
 @Composable
-private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modifier) {
+private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modifier, lang: AppLanguage = AppLanguage.ZH) {
     Column(modifier) {
         Text(title, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelMedium)
         Spacer(Modifier.height(4.dp))
@@ -1405,7 +1502,7 @@ private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modif
                 modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xff202326)),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("暂无 / None", color = androidx.compose.ui.graphics.Color.White)
+                Text(lang.t("暂无", "None"), color = androidx.compose.ui.graphics.Color.White)
             }
         } else {
             AsyncBitmapImage(uri, 2048, ContentScale.Fit, Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black))

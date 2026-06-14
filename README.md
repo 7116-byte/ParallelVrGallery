@@ -4,13 +4,15 @@
 
 Local Android gallery for generating and caching parallel-eye SBS VR images from normal photos.
 
-## v1 功能 / What v1 does
+## v0.5 功能 / What v0.5 does
 
 - 读取系统相册图片 / Reads system photos with `MediaStore`.
 - 使用 Compose 网格和全屏左右滑动浏览 / Browses photos in a Compose grid and full-screen pager.
+- 设置页提供语言选择，默认中文 / The settings page includes language selection and defaults to Chinese.
 - 首次生成前下载 Depth-Anything-V2 TFLite 模型 / Downloads the Depth-Anything-V2 TFLite model before first generation.
 - 使用平滑深度图、相对视差和前景填充生成平行眼 SBS 图 / Generates SBS images with smoothed depth, relative disparity, and foreground filling.
-- 当前图片前后缓存窗口可选 `3`、`5`、`10` / Configurable prefetch window.
+- 当前图片前后缓存支持自动模式：先生成后1、前1到后3、前3，完成后若未切图自动扩到 `5`，再扩到 `10` / Auto prefetch starts at 3 each side, then expands to 5 and 10 if the user stays on the same image.
+- 手动预加载窗口可选 `3`、`5`、`10`；队列顺序为后1、前1、后2、前2 / Manual prefetch supports `3`, `5`, and `10`; queue order is next1, previous1, next2, previous2.
 - 生成结果缓存在 App 私有外部目录 / Caches generated output under the app private external files directory.
 - 当前 READY 图片可导出调试包 / Exports a debug zip for the current READY image:
   - `source_preview.jpg`
@@ -18,7 +20,7 @@ Local Android gallery for generating and caching parallel-eye SBS VR images from
   - `vr_sbs.jpg`
   - `params.json`
   - `job.log`
-- 主界面提供设置入口，可调整预加载张数、深度强度、平滑、填充和输出尺寸 / Main screen has a settings page for prefetch count, depth scale, blur, fill, and output size.
+- 主界面提供设置入口，可调整语言、预加载、深度强度、平滑、填充、输出尺寸和深度反转 / Main screen has a settings page for language, prefetch, depth scale, blur, fill, output size, and depth inversion.
 - 主界面提供生成管理入口，图片缓存可按版本删除，视频入口已预留 / Main screen has a generated manager; image caches can be deleted by version, and the video entry is reserved.
 - 已生成 VR 图片会作为主界面缩略图显示 / Generated VR images are used as main-gallery thumbnails.
 - 覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载 / Updating over an existing install keeps the downloaded model; uninstalling usually removes it.
