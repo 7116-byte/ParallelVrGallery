@@ -1,6 +1,7 @@
 package com.local.parallelvrgallery
 
 import android.Manifest
+import android.app.Activity
 import android.app.Application
 import android.content.ContentUris
 import android.content.ContentValues
@@ -18,6 +19,7 @@ import android.os.Bundle
 import android.provider.MediaStore
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import androidx.activity.result.IntentSenderRequest
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.fadeIn
@@ -34,7 +36,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -56,7 +58,6 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -81,7 +82,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -237,6 +240,11 @@ data class CacheVersionSummary(
     val bytes: Long,
 )
 
+data class ManagedCacheItem(
+    val photoItem: PhotoItem,
+    val entry: VrCacheEntry,
+)
+
 data class VrJob(
     val photoItem: PhotoItem,
     val priority: Int,
@@ -252,6 +260,9 @@ data class UiState(
     val photos: List<PhotoItem> = emptyList(),
     val selectedIndex: Int? = null,
     val galleryAnchorIndex: Int = 0,
+    val galleryScrollIndex: Int = 0,
+    val galleryScrollOffset: Int = 0,
+    val galleryAnchorSlot: Int = 0,
     val settingsOpen: Boolean = false,
     val manageOpen: Boolean = false,
     val vrMode: Boolean = false,
@@ -267,6 +278,7 @@ data class UiState(
     val modelProgress: Float? = null,
     val modelStatus: String = "模型未下载 / Model not downloaded",
     val cacheVersions: List<CacheVersionSummary> = emptyList(),
+    val managedCacheItems: List<ManagedCacheItem> = emptyList(),
 )
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
@@ -300,6 +312,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update { it.copy(loading = true, message = null) }
             val photos = withContext(Dispatchers.IO) { repository.loadImages() }
             val entries = withContext(Dispatchers.IO) { photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey } }
+            val managedItems = withContext(Dispatchers.IO) { cache.allEntries(photos) }
             _uiState.update {
                 it.copy(
                     photos = photos,
@@ -308,19 +321,51 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     loading = false,
                     message = "已加载 ${photos.size} 张图片 / ${photos.size} images loaded",
                     cacheVersions = cache.summaries(),
+                    managedCacheItems = managedItems,
                     modelStatus = modelManager.statusText(it.settings.modelId),
                 )
             }
         }
     }
 
-    fun openPhoto(index: Int) {
-        _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, vrMode = false) }
+    fun openPhoto(index: Int, firstVisibleIndex: Int = index, firstVisibleOffset: Int = 0) {
+        _uiState.update {
+            it.copy(
+                selectedIndex = index,
+                galleryAnchorIndex = index,
+                galleryScrollIndex = firstVisibleIndex,
+                galleryScrollOffset = firstVisibleOffset,
+                galleryAnchorSlot = (index - firstVisibleIndex).coerceAtLeast(0),
+                vrMode = false,
+            )
+        }
+    }
+
+    fun openGeneratedPhoto(index: Int, entry: VrCacheEntry? = null) {
+        val photo = _uiState.value.photos.getOrNull(index)
+        _uiState.update {
+            it.copy(
+                selectedIndex = index,
+                galleryAnchorIndex = index,
+                galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
+                vrMode = true,
+                entries = if (photo != null && entry != null) it.entries + (photo.cacheKey to entry) else it.entries,
+                message = null,
+            )
+        }
     }
 
     fun closeViewer() {
         stopVr()
-        _uiState.update { it.copy(selectedIndex = null, debugIndex = null, galleryAnchorIndex = it.selectedIndex ?: it.galleryAnchorIndex) }
+        _uiState.update {
+            val currentIndex = it.selectedIndex ?: it.galleryAnchorIndex
+            it.copy(
+                selectedIndex = null,
+                debugIndex = null,
+                galleryAnchorIndex = currentIndex,
+                galleryScrollIndex = max(0, currentIndex - it.galleryAnchorSlot),
+            )
+        }
     }
 
     fun openSettings() {
@@ -418,6 +463,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     entries = entries,
                     states = photos.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
                     cacheVersions = cache.summaries(),
+                    managedCacheItems = cache.allEntries(photos),
                     message = "已删除版本 / Deleted version: $version",
                 )
             }
@@ -425,16 +471,27 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun saveGeneratedCopy(context: Context, index: Int) {
+        saveGeneratedCopies(context, listOf(index))
+    }
+
+    fun saveGeneratedCopies(context: Context, indexes: List<Int>) {
         val lang = _uiState.value.settings.language
-        val photo = _uiState.value.photos.getOrNull(index) ?: return
         viewModelScope.launch {
             val message = withContext(Dispatchers.IO) {
-                val entry = cache.findEntry(photo) ?: return@withContext lang.t("当前图片还没有已生成的 VR 图", "No generated VR image for this photo")
-                runCatching {
-                    saveImageToGallery(context, File(entry.outputPath), "VR_${photo.displayName}")
-                    lang.t("已保存到系统图库", "Saved to system gallery")
-                }.getOrElse { error ->
-                    lang.t("保存失败：${error.message}", "Save failed: ${error.message}")
+                var saved = 0
+                var failed = 0
+                indexes.distinct().forEach { index ->
+                    val photo = _uiState.value.photos.getOrNull(index) ?: return@forEach
+                    val entry = cache.findEntry(photo) ?: return@forEach
+                    runCatching {
+                        saveImageToGallery(context, File(entry.outputPath), "VR_${photo.displayName}")
+                        saved++
+                    }.onFailure { failed++ }
+                }
+                when {
+                    saved == 0 -> lang.t("没有可保存的已生成 VR 图", "No generated VR images to save")
+                    failed == 0 -> lang.t("已保存 $saved 张到系统图库", "Saved $saved images to system gallery")
+                    else -> lang.t("已保存 $saved 张，失败 $failed 张", "Saved $saved images, failed $failed")
                 }
             }
             _uiState.update { it.copy(message = message) }
@@ -443,16 +500,27 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun replaceOriginalWithGenerated(context: Context, index: Int) {
+        replaceOriginalsWithGenerated(context, listOf(index))
+    }
+
+    fun replaceOriginalsWithGenerated(context: Context, indexes: List<Int>) {
         val lang = _uiState.value.settings.language
-        val photo = _uiState.value.photos.getOrNull(index) ?: return
         viewModelScope.launch {
             val message = withContext(Dispatchers.IO) {
-                val entry = cache.findEntry(photo) ?: return@withContext lang.t("当前图片还没有已生成的 VR 图", "No generated VR image for this photo")
-                runCatching {
-                    replaceOriginalImage(context, photo, File(entry.outputPath))
-                    lang.t("已尝试替换原图并保留原时间", "Replaced original and kept its timestamp")
-                }.getOrElse { error ->
-                    lang.t("替换失败：系统可能不允许写入这张原图。${error.message}", "Replace failed: Android may not allow writing this original. ${error.message}")
+                var replaced = 0
+                var failed = 0
+                indexes.distinct().forEach { index ->
+                    val photo = _uiState.value.photos.getOrNull(index) ?: return@forEach
+                    val entry = cache.findEntry(photo) ?: return@forEach
+                    runCatching {
+                        replaceOriginalImage(context, photo, File(entry.outputPath))
+                        replaced++
+                    }.onFailure { failed++ }
+                }
+                when {
+                    replaced == 0 -> lang.t("替换失败：系统可能不允许写入这些原图", "Replace failed: Android may not allow writing these originals")
+                    failed == 0 -> lang.t("已替换 $replaced 张并尝试保留原时间", "Replaced $replaced images and tried to keep timestamps")
+                    else -> lang.t("已替换 $replaced 张，失败 $failed 张", "Replaced $replaced images, failed $failed")
                 }
             }
             _uiState.update { it.copy(message = message) }
@@ -468,13 +536,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val photos = _uiState.value.photos
         if (!_uiState.value.vrMode) return
         if (photos.isEmpty()) return
+        val currentVersion = _uiState.value.settings.toParams().cacheVersion()
+        val desiredCount = _uiState.value.activePrefetchWindow * 2 + if (includeCurrent) 1 else 0
         val targets = mutableListOf<Pair<Int, Int>>()
-        if (includeCurrent) targets += index to 0
-        for (distance in 1.._uiState.value.activePrefetchWindow) {
+        if (includeCurrent && cache.findEntry(photos[index], currentVersion) == null) targets += index to 0
+        var distance = 1
+        while (targets.size < desiredCount && distance < photos.size) {
             val next = index + distance
             val prev = index - distance
-            if (next in photos.indices) targets += next to distance * 2 - 1
-            if (prev in photos.indices) targets += prev to distance * 2
+            if (next in photos.indices && cache.findEntry(photos[next], currentVersion) == null) targets += next to distance * 2 - 1
+            if (targets.size < desiredCount && prev in photos.indices && cache.findEntry(photos[prev], currentVersion) == null) targets += prev to distance * 2
+            distance++
         }
 
         synchronized(pending) {
@@ -750,6 +822,17 @@ private class VrCacheManager(private val context: Context) {
         return map.map { (version, value) ->
             CacheVersionSummary(version = version, kind = "图片 / Images", count = value.first, bytes = value.second)
         }.sortedBy { it.version }
+    }
+
+    fun allEntries(photos: List<PhotoItem>): List<ManagedCacheItem> {
+        return photos.flatMap { photo ->
+            val entries = mutableListOf<VrCacheEntry>()
+            readEntry(photo.cacheKey, DEFAULT_VERSION, entryDir(photo, DEFAULT_VERSION))?.let { entries += it }
+            File(root, photo.cacheKey).listFiles()?.filter { it.isDirectory }?.forEach { versionDir ->
+                readEntry(photo.cacheKey, versionDir.name, versionDir)?.let { entries += it }
+            }
+            entries.map { ManagedCacheItem(photo, it) }
+        }.sortedByDescending { it.entry.createdAt }
     }
 
     fun deleteVersion(version: String) {
@@ -1069,8 +1152,15 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     val permission = imagePermission()
+    var pendingReplaceIndexes by remember { mutableStateOf<List<Int>>(emptyList()) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         viewModel.onPermissionChanged(granted)
+    }
+    val replaceLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK && pendingReplaceIndexes.isNotEmpty()) {
+            viewModel.replaceOriginalsWithGenerated(context, pendingReplaceIndexes)
+        }
+        pendingReplaceIndexes = emptyList()
     }
 
     LaunchedEffect(Unit) {
@@ -1108,6 +1198,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 state = state,
                 onBack = viewModel::closeManage,
                 onDeleteVersion = viewModel::deleteCacheVersion,
+                onOpenGenerated = viewModel::openGeneratedPhoto,
             )
             AppScreen.Settings -> SettingsScreen(
                 settings = state.settings,
@@ -1136,8 +1227,19 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onOpen = viewModel::openPhoto,
                 onSettings = viewModel::openSettings,
                 onManage = viewModel::openManage,
-                onSaveGenerated = { viewModel.saveGeneratedCopy(context, it) },
-                onReplaceOriginal = { viewModel.replaceOriginalWithGenerated(context, it) },
+                onSaveGenerated = { viewModel.saveGeneratedCopies(context, it) },
+                onReplaceOriginal = { indexes ->
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        val uris = indexes.mapNotNull { state.photos.getOrNull(it)?.uri }
+                        if (uris.isNotEmpty()) {
+                            pendingReplaceIndexes = indexes
+                            val request = MediaStore.createWriteRequest(context.contentResolver, uris)
+                            replaceLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
+                        }
+                    } else {
+                        viewModel.replaceOriginalsWithGenerated(context, indexes)
+                    }
+                },
             )
         }
     }
@@ -1163,72 +1265,54 @@ private fun PermissionScreen(lang: AppLanguage, onGrant: () -> Unit) {
 private fun GalleryScreen(
     state: UiState,
     onRefresh: () -> Unit,
-    onOpen: (Int) -> Unit,
+    onOpen: (Int, Int, Int) -> Unit,
     onSettings: () -> Unit,
     onManage: () -> Unit,
-    onSaveGenerated: (Int) -> Unit,
-    onReplaceOriginal: (Int) -> Unit,
+    onSaveGenerated: (List<Int>) -> Unit,
+    onReplaceOriginal: (List<Int>) -> Unit,
 ) {
     val lang = state.settings.language
     var tileSize by rememberSaveable { mutableStateOf(112f) }
-    var selectedActionIndex by remember { mutableStateOf<Int?>(null) }
-    val gridState = rememberLazyGridState(initialFirstVisibleItemIndex = state.galleryAnchorIndex.coerceAtLeast(0))
-    LaunchedEffect(state.galleryAnchorIndex, state.photos.size) {
-        if (state.galleryAnchorIndex in state.photos.indices) {
-            gridState.scrollToItem(state.galleryAnchorIndex)
-        }
+    var lastPinchAt by remember { mutableStateOf(0L) }
+    var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val selectedIndexes = remember(selectedKeys, state.photos) {
+        state.photos.mapIndexedNotNull { index, photo -> if (photo.cacheKey in selectedKeys) index else null }
     }
-
-    selectedActionIndex?.let { index ->
-        val photo = state.photos.getOrNull(index)
-        val isReady = photo?.let { state.states[it.cacheKey] == VrState.READY && state.entries.containsKey(it.cacheKey) } == true
-        AlertDialog(
-            onDismissRequest = { selectedActionIndex = null },
-            title = { Text(lang.t("处理图片", "Process image")) },
-            text = {
-                Text(
-                    if (isReady) {
-                        photo?.displayName.orEmpty()
-                    } else {
-                        lang.t("这张图还没有生成好的 VR 图，先开启 VR 生成后再保存或替换。", "This photo has no generated VR image yet. Generate VR before saving or replacing.")
-                    },
-                )
-            },
-            confirmButton = {
-                Button(
-                    enabled = isReady,
-                    onClick = {
-                        selectedActionIndex = null
-                        onSaveGenerated(index)
-                    },
-                ) { Text(lang.t("保存", "Save")) }
-            },
-            dismissButton = {
-                Row {
-                    OutlinedButton(onClick = { selectedActionIndex = null }) { Text(lang.t("取消", "Cancel")) }
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedButton(
-                        enabled = isReady,
-                        onClick = {
-                            selectedActionIndex = null
-                            onReplaceOriginal(index)
-                        },
-                    ) { Text(lang.t("替换", "Replace")) }
-                }
-            },
-        )
+    val gridState = rememberLazyGridState(
+        initialFirstVisibleItemIndex = state.galleryScrollIndex.coerceAtLeast(0),
+        initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
+    )
+    LaunchedEffect(state.galleryScrollIndex, state.galleryScrollOffset, state.photos.size) {
+        if (state.galleryScrollIndex in state.photos.indices) {
+            gridState.scrollToItem(state.galleryScrollIndex, state.galleryScrollOffset)
+        }
     }
 
     Scaffold(
         topBar = {
             Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    OutlinedButton(onClick = onManage) { Text(lang.t("管理", "Manage")) }
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
+                    if (selectedKeys.isEmpty()) {
+                        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = onManage) { Text(lang.t("管理", "Manage")) }
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
+                    } else {
+                        Text(lang.t("已选择 ${selectedKeys.size} 张", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
+                        Spacer(Modifier.width(8.dp))
+                        Button(onClick = {
+                            onSaveGenerated(selectedIndexes)
+                            selectedKeys = emptySet()
+                        }) { Text(lang.t("保存", "Save")) }
+                        Spacer(Modifier.width(8.dp))
+                        Button(onClick = {
+                            onReplaceOriginal(selectedIndexes)
+                            selectedKeys = emptySet()
+                        }) { Text(lang.t("替换", "Replace")) }
+                    }
                 }
                 Spacer(Modifier.height(10.dp))
                 val prefetch = if (state.settings.autoPrefetch) lang.t("自动：3→5→10", "Auto: 3→5→10") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
@@ -1254,6 +1338,7 @@ private fun GalleryScreen(
                     .pointerInput(Unit) {
                         detectTransformGestures { _, _, zoom, _ ->
                             if (abs(zoom - 1f) > 0.01f) {
+                                lastPinchAt = System.currentTimeMillis()
                                 tileSize = (tileSize * zoom).coerceIn(72f, 220f)
                             }
                         }
@@ -1269,8 +1354,19 @@ private fun GalleryScreen(
                         state = state.states[photo.cacheKey] ?: VrState.NORMAL,
                         entry = state.entries[photo.cacheKey],
                         lang = lang,
-                        onClick = { onOpen(index) },
-                        onLongClick = { selectedActionIndex = index },
+                        selected = photo.cacheKey in selectedKeys,
+                        onClick = {
+                            if (selectedKeys.isNotEmpty()) {
+                                selectedKeys = if (photo.cacheKey in selectedKeys) selectedKeys - photo.cacheKey else selectedKeys + photo.cacheKey
+                            } else {
+                                onOpen(index, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
+                            }
+                        },
+                        onLongClick = {
+                            if (System.currentTimeMillis() - lastPinchAt > 700L) {
+                                selectedKeys = selectedKeys + photo.cacheKey
+                            }
+                        },
                     )
                 }
             }
@@ -1285,6 +1381,7 @@ private fun PhotoTile(
     state: VrState,
     entry: VrCacheEntry?,
     lang: AppLanguage,
+    selected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
 ) {
@@ -1300,6 +1397,15 @@ private fun PhotoTile(
     ) {
         val displayUri = entry?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri
         AsyncBitmapImage(displayUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+        if (selected) {
+            Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0x6638d8b4)))
+            Text(
+                text = "✓",
+                color = androidx.compose.ui.graphics.Color.White,
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.align(Alignment.TopEnd).background(androidx.compose.ui.graphics.Color(0xcc111315)).padding(horizontal = 8.dp, vertical = 2.dp),
+            )
+        }
         Text(
             text = state.label(lang),
             color = androidx.compose.ui.graphics.Color.White,
@@ -1314,13 +1420,14 @@ private fun ManageScreen(
     state: UiState,
     onBack: () -> Unit,
     onDeleteVersion: (String) -> Unit,
+    onOpenGenerated: (Int, VrCacheEntry) -> Unit,
 ) {
     val lang = state.settings.language
+    var tab by remember { mutableStateOf("images") }
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
-            .verticalScroll(rememberScrollState())
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1329,30 +1436,60 @@ private fun ManageScreen(
             Text(lang.t("生成管理", "Generated Manager"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(16.dp))
-        Text(lang.t("图片", "Images"), fontWeight = FontWeight.Bold)
+        SingleChoiceSegmentedButtonRow {
+            listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")).forEachIndexed { index, option ->
+                SegmentedButton(
+                    selected = tab == option.first,
+                    onClick = { tab = option.first },
+                    shape = SegmentedButtonDefaults.itemShape(index, 2),
+                ) { Text(option.second) }
+            }
+        }
         Spacer(Modifier.height(8.dp))
-        if (state.cacheVersions.isEmpty()) {
-            Text(lang.t("暂无已生成图片", "No generated images yet"))
+        if (tab == "videos") {
+            Text(lang.t("视频生成入口已预留，当前版本暂未实现。", "Video generation entry is reserved; not implemented in this version."), style = MaterialTheme.typography.bodySmall)
         } else {
-            state.cacheVersions.forEach { summary ->
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(lang.t("版本：${summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
-                        Text(lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
-                    }
-                    OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
-                        Text(lang.t("删除", "Delete"))
+            if (state.cacheVersions.isEmpty()) {
+                Text(lang.t("暂无已生成图片", "No generated images yet"))
+            } else {
+                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                    state.cacheVersions.forEach { summary ->
+                        val items = state.managedCacheItems.filter { it.entry.version == summary.version }
+                        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(lang.t("版本：${summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
+                                    Text(lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
+                                }
+                                OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
+                                    Text(lang.t("删除", "Delete"))
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            LazyVerticalGrid(
+                                columns = GridCells.Adaptive(86.dp),
+                                modifier = Modifier.fillMaxWidth().height(260.dp).background(androidx.compose.ui.graphics.Color(0xffffffff)).padding(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                items(items, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
+                                    val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .aspectRatio(1f)
+                                            .background(androidx.compose.ui.graphics.Color(0xff16191c))
+                                            .clickable(enabled = index >= 0) { onOpenGenerated(index, item.entry) },
+                                    ) {
+                                        AsyncBitmapImage(Uri.fromFile(File(item.entry.outputPath)), 360, ContentScale.Crop, Modifier.fillMaxSize())
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        Spacer(Modifier.height(20.dp))
-        Text(lang.t("视频", "Videos"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(8.dp))
-        Text(lang.t("视频生成入口已预留，当前版本暂未实现。", "Video generation entry is reserved; not implemented in this version."), style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -1526,12 +1663,7 @@ private fun ViewerScreen(
     Box(
         Modifier
             .fillMaxSize()
-            .background(androidx.compose.ui.graphics.Color.Black)
-            .pointerInput(state.vrMode) {
-                detectTapGestures {
-                    controlsVisible = true
-                }
-            },
+            .background(androidx.compose.ui.graphics.Color.Black),
     ) {
         HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
             val photo = state.photos[page]
@@ -1693,7 +1825,7 @@ private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modif
 }
 
 @Composable
-private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onInteract: () -> Unit) {
+private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onTap: () -> Unit) {
     val context = LocalContext.current
     var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
     var scale by remember(uri) { mutableStateOf(1f) }
@@ -1727,21 +1859,76 @@ private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onInteract
         modifier = modifier
             .background(androidx.compose.ui.graphics.Color.Black)
             .pointerInput(uri) {
-                detectTransformGestures { _, pan, zoom, _ ->
-                    onInteract()
-                    val nextScale = (scale * zoom).coerceIn(1f, 8f)
-                    scale = nextScale
-                    offset = if (nextScale == 1f) Offset.Zero else offset + pan
+                awaitPointerEventScope {
+                    while (true) {
+                        val firstEvent = awaitPointerEvent()
+                        if (firstEvent.changes.none { it.pressed }) continue
+                    var multiTouch = false
+                    var moved = false
+                    var firstPosition: Offset? = null
+                    var lastCentroid: Offset? = null
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val pressed = event.changes.filter { it.pressed }
+                            if (firstPosition == null) firstPosition = pressed.firstOrNull()?.position
+                            if (pressed.isEmpty()) {
+                                if (!multiTouch && !moved) onTap()
+                                break
+                            }
+                            if (pressed.size >= 2) {
+                                multiTouch = true
+                                val centroid = pressed.centroid()
+                                val previousCentroid = lastCentroid ?: pressed.previousCentroid()
+                                val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
+                                val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
+                                val pan = lastCentroid?.let { centroid - it } ?: Offset.Zero
+                                val nextScale = (scale * zoom).coerceIn(1f, 8f)
+                                scale = nextScale
+                                offset = if (nextScale == 1f) Offset.Zero else offset + pan
+                                lastCentroid = centroid
+                                event.changes.forEach { it.consume() }
+                            } else {
+                                val start = firstPosition
+                                val current = pressed.first().position
+                                if (start != null && (current - start).getDistance() > 18f) moved = true
+                            }
+                        }
+                    }
                 }
             },
     ) {
-        Box(Modifier.weight(1f).fillMaxSize().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
+        Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
             Image(left, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
         }
-        Box(Modifier.weight(1f).fillMaxSize().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
+        Box(Modifier.width(2.dp).fillMaxSize().background(androidx.compose.ui.graphics.Color(0xff111315)))
+        Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
             Image(right, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
         }
     }
+}
+
+private fun List<PointerInputChange>.centroid(): Offset {
+    if (isEmpty()) return Offset.Zero
+    val x = sumOf { it.position.x.toDouble() }.toFloat() / size
+    val y = sumOf { it.position.y.toDouble() }.toFloat() / size
+    return Offset(x, y)
+}
+
+private fun List<PointerInputChange>.previousCentroid(): Offset {
+    if (isEmpty()) return Offset.Zero
+    val x = sumOf { it.previousPosition.x.toDouble() }.toFloat() / size
+    val y = sumOf { it.previousPosition.y.toDouble() }.toFloat() / size
+    return Offset(x, y)
+}
+
+private fun List<PointerInputChange>.span(center: Offset): Float {
+    if (isEmpty()) return 1f
+    return map { (it.position - center).getDistance() }.average().toFloat()
+}
+
+private fun List<PointerInputChange>.previousSpan(center: Offset): Float {
+    if (isEmpty()) return 1f
+    return map { (it.previousPosition - center).getDistance() }.average().toFloat()
 }
 
 @Composable

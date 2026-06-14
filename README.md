@@ -4,14 +4,15 @@
 
 Local Android gallery for generating and caching parallel-eye SBS VR images from normal photos.
 
-## v0.6 功能 / What v0.6 does
+## v0.7 功能 / What v0.7 does
 
 - 读取系统相册图片 / Reads system photos with `MediaStore`.
 - 使用 Compose 网格和全屏左右滑动浏览 / Browses photos in a Compose grid and full-screen pager.
 - 主界面支持双指缩放缩略图网格，并会改变每行列数 / The main grid supports pinch zoom and changes column count.
-- 从图片页返回主界面时会回到当前图片附近 / Returning from the viewer keeps the gallery near the viewed image.
+- 从图片页返回主界面时会记住点开时的行位置 / Returning from the viewer keeps the viewed image near the row where it was opened.
 - 主要界面切换带缩放淡入淡出动画 / Primary screens use scale and fade transitions.
-- 主界面可长按图片处理已生成 VR 图，支持保存副本或尝试替换原图 / Long-press a photo to save the generated VR copy or attempt replacing the original.
+- 主界面长按进入多选模式，支持批量保存已生成 VR 图或批量尝试替换原图 / Long-press enters multi-select mode for batch saving generated VR images or attempting original replacement.
+- 自动预加载会跳过已生成缓存并向外补位，保持队列围绕当前图继续填充 / Auto prefetch skips existing cache and fills farther slots around the current image.
 - 设置页提供语言选择，默认中文 / The settings page includes language selection and defaults to Chinese.
 - 首次生成前下载 Depth-Anything-V2 TFLite 模型 / Downloads the Depth-Anything-V2 TFLite model before first generation.
 - 使用平滑深度图、相对视差和前景填充生成平行眼 SBS 图 / Generates SBS images with smoothed depth, relative disparity, and foreground filling.
@@ -26,9 +27,10 @@ Local Android gallery for generating and caching parallel-eye SBS VR images from
   - `job.log`
 - 主界面提供设置入口，可调整语言、预加载、深度强度、平滑、填充、输出尺寸和深度反转 / Main screen has a settings page for language, prefetch, depth scale, blur, fill, output size, and depth inversion.
 - 主界面提供生成管理入口，图片缓存可按版本删除，视频入口已预留 / Main screen has a generated manager; image caches can be deleted by version, and the video entry is reserved.
+- 生成管理页按图片/视频分页，图片页按版本显示缩略图区域，点击缩略图进入对应 VR 缓存 / Generated manager has image/video tabs; image versions show scrollable thumbnail areas that open the selected VR cache.
 - 已生成 VR 图片会作为主界面缩略图显示 / Generated VR images are used as main-gallery thumbnails.
-- VR 浏览页控件 3 秒后自动隐藏，点击屏幕可重新显示 / VR viewer controls auto-hide after 3 seconds and reappear on tap.
-- VR SBS 图支持同步双指缩放，左右半图使用同一缩放坐标 / VR SBS images support synchronized pinch zoom across the left and right halves.
+- VR 浏览页控件 3 秒后自动隐藏，只有单指点击会重新显示 / VR viewer controls auto-hide after 3 seconds and reappear only on single tap.
+- VR SBS 图支持同步双指缩放，中间固定分隔，左右半图互不遮挡 / VR SBS images support synchronized pinch zoom with a fixed divider and clipped left/right halves.
 - 覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载 / Updating over an existing install keeps the downloaded model; uninstalling usually removes it.
 
 ## 构建 / Build
