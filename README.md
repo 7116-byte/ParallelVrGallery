@@ -4,7 +4,7 @@
 
 Local Android gallery for generating and caching parallel-eye SBS VR images from normal photos.
 
-## v0.9 功能 / What v0.9 does
+## v0.10 功能 / What v0.10 does
 
 - 读取系统相册图片 / Reads system photos with `MediaStore`.
 - 使用 Compose 网格和全屏左右滑动浏览 / Browses photos in a Compose grid and full-screen pager.
@@ -16,12 +16,15 @@ Local Android gallery for generating and caching parallel-eye SBS VR images from
 - 主界面长按进入多选模式，支持批量保存已生成 VR 图或批量尝试替换原图 / Long-press enters multi-select mode for batch saving generated VR images or attempting original replacement.
 - 保存生成图时只显示保存中弹窗，不重新扫描相册 / Saving generated images shows a lightweight saving dialog and does not rescan the gallery.
 - 自动预加载会跳过已生成缓存并向外补位，保持队列围绕当前图继续填充 / Auto prefetch skips existing cache and fills farther slots around the current image.
+- 当前图使用专用抢占 worker，后台预加载 worker 不会挡住当前图 / The current image uses a dedicated preemptive worker so background prefetch does not block it.
+- 用户滑动时，超过当前活跃窗口的 pending 任务进入 `PAUSED` 暂停池；重新进入 `2` 或窗口扩回 `4`/`8` 时自动恢复 / On swipe, pending tasks outside the active window move to a `PAUSED` pool and resume when they re-enter `2` or when the window expands back to `4`/`8`.
+- 返回主界面不会关闭 VR 队列，暂停池会继续按自动窗口扩展恢复 / Returning to the main grid no longer stops the VR queue; paused tasks continue resuming through auto expansion.
 - 设置页提供语言选择，默认中文 / The settings page includes language selection and defaults to Chinese.
-- 设置页提供生成 worker 数、模型 CPU 线程数和 TFLite GPU Delegate 尝试开关 / Settings include generation worker count, model CPU thread count, and a TFLite GPU Delegate toggle.
+- 设置页提供后台 worker 数、模型 CPU 线程数和 TFLite GPU Delegate 尝试开关；当前图专用 worker 固定独立，不受后台 worker 设置影响 / Settings include background worker count, model CPU thread count, and a TFLite GPU Delegate toggle; the current-image worker is fixed and separate from the background worker setting.
 - 首次生成前下载 Depth-Anything-V2 TFLite 模型 / Downloads the Depth-Anything-V2 TFLite model before first generation.
 - 使用平滑深度图、相对视差和前景填充生成平行眼 SBS 图 / Generates SBS images with smoothed depth, relative disparity, and foreground filling.
-- 当前图片前后缓存支持自动模式：先生成后1、前1到后3、前3，完成后若未切图自动扩到 `5`，再扩到 `10` / Auto prefetch starts at 3 each side, then expands to 5 and 10 if the user stays on the same image.
-- 手动预加载窗口可选 `3`、`5`、`10`；队列顺序为后1、前1、后2、前2 / Manual prefetch supports `3`, `5`, and `10`; queue order is next1, previous1, next2, previous2.
+- 当前图片前后缓存支持自动模式：先生成后1、前1到后2、前2，完成后若未切图自动扩到 `4`，再扩到 `8` / Auto prefetch starts at 2 each side, then expands to 4 and 8 if the user stays on the same image.
+- 手动预加载窗口可选 `2`、`4`、`8`；队列顺序为后1、前1、后2、前2 / Manual prefetch supports `2`, `4`, and `8`; queue order is next1, previous1, next2, previous2.
 - 生成结果缓存在 App 私有外部目录 / Caches generated output under the app private external files directory.
 - 当前 READY 图片可导出调试包 / Exports a debug zip for the current READY image:
   - `source_preview.jpg`

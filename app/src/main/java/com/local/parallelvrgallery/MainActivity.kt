@@ -157,6 +157,7 @@ data class PhotoItem(
 
 enum class VrState {
     NORMAL,
+    PAUSED,
     QUEUED,
     GENERATING,
     READY,
@@ -198,7 +199,7 @@ data class AppSettings(
     val language: AppLanguage = AppLanguage.ZH,
     val modelId: String = "depth_anything_v2_small_tflite",
     val autoPrefetch: Boolean = true,
-    val prefetchWindow: Int = 3,
+    val prefetchWindow: Int = 2,
     val depthScale: Float = 40f,
     val blurRadius: Int = 3,
     val fillRadius: Int = 10,
@@ -279,7 +280,7 @@ data class UiState(
     val manageOpen: Boolean = false,
     val vrMode: Boolean = false,
     val settings: AppSettings = AppSettings(),
-    val activePrefetchWindow: Int = 3,
+    val activePrefetchWindow: Int = 2,
     val states: Map<String, VrState> = emptyMap(),
     val entries: Map<String, VrCacheEntry> = emptyMap(),
     val jobs: List<VrJob> = emptyList(),
@@ -302,8 +303,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val generator = VrGenerator(app, cache, modelManager)
     private val settingsStore = SettingsStore(app)
     private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
+    private val currentPending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
+    private val paused = linkedMapOf<String, QueuedJob>()
     private var sequence = 0L
     private val workers = mutableListOf<Job>()
+    private var currentWorker: Job? = null
     private var activeKey: String? = null
 
     private val _uiState = MutableStateFlow(UiState(hasPermission = hasImagePermission(app), settings = settingsStore.load()))
@@ -372,7 +376,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun closeViewer() {
-        stopVr()
         _uiState.update {
             val currentIndex = it.selectedIndex ?: it.galleryAnchorIndex
             it.copy(
@@ -382,6 +385,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryScrollIndex = max(0, currentIndex - it.galleryAnchorSlot),
             )
         }
+        enqueueWindow(_uiState.value.galleryAnchorIndex, includeCurrent = false)
     }
 
     fun openSettings() {
@@ -397,7 +401,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update {
             it.copy(
                 settings = settings,
-                activePrefetchWindow = if (settings.autoPrefetch) 3 else settings.prefetchWindow,
+                activePrefetchWindow = if (settings.autoPrefetch) 2 else settings.prefetchWindow,
                 modelStatus = modelManager.statusText(settings.modelId),
             )
         }
@@ -406,7 +410,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun onPagerIndexChanged(index: Int) {
-        _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, activePrefetchWindow = if (it.settings.autoPrefetch) 3 else it.settings.prefetchWindow) }
+        _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow) }
         if (_uiState.value.vrMode) {
             enqueueWindow(index, includeCurrent = true)
         }
@@ -416,20 +420,22 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (_uiState.value.vrMode) {
             stopVr()
         } else {
-            _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null, activePrefetchWindow = if (it.settings.autoPrefetch) 3 else it.settings.prefetchWindow) }
+            _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow) }
             enqueueWindow(index, includeCurrent = true)
         }
     }
 
     fun stopVr() {
         synchronized(pending) { pending.clear() }
+        synchronized(currentPending) { currentPending.clear() }
+        synchronized(paused) { paused.clear() }
         _uiState.update { it.copy(vrMode = false, modelProgress = null) }
         addLog("vr stopped; generated caches kept")
     }
 
     fun retry(index: Int) {
-        enqueuePhoto(index, priority = 0, force = true)
-        startWorker()
+        enqueuePhoto(index, priority = 0, force = true, current = true)
+        startCurrentWorker()
     }
 
     fun exportDebug(context: Context, index: Int) {
@@ -554,9 +560,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (!_uiState.value.vrMode) return
         if (photos.isEmpty()) return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
-        val desiredCount = _uiState.value.activePrefetchWindow * 2 + if (includeCurrent) 1 else 0
+        val desiredCount = _uiState.value.activePrefetchWindow * 2
         val targets = mutableListOf<Pair<Int, Int>>()
-        if (includeCurrent && cache.findEntry(photos[index], currentVersion) == null) targets += index to 0
+        if (includeCurrent) {
+            enqueuePhoto(index, priority = 0, force = false, current = true)
+        }
         var distance = 1
         while (targets.size < desiredCount && distance < photos.size) {
             val next = index + distance
@@ -568,25 +576,42 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
         synchronized(pending) {
             val keep = targets.map { photos[it.first].cacheKey }.toSet()
-            pending.removeAll { it.photo.cacheKey !in keep }
+            val toPause = pending.filter { it.photo.cacheKey !in keep }
+            pending.removeAll(toPause.toSet())
+            toPause.forEach { job ->
+                paused[job.photo.cacheKey] = job
+                markState(job.photo.cacheKey, VrState.PAUSED)
+                upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
+            }
         }
-        targets.forEach { (targetIndex, priority) -> enqueuePhoto(targetIndex, priority, force = false) }
+        targets.forEach { (targetIndex, priority) -> enqueuePhoto(targetIndex, priority, force = false, current = false) }
         startWorker()
     }
 
-    private fun enqueuePhoto(index: Int, priority: Int, force: Boolean) {
+    private fun enqueuePhoto(index: Int, priority: Int, force: Boolean, current: Boolean = false) {
         val photo = _uiState.value.photos.getOrNull(index) ?: return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
         if (!force && cache.findEntry(photo, currentVersion) != null) {
             markState(photo.cacheKey, VrState.READY)
             return
         }
-        if (!force && _uiState.value.states[photo.cacheKey] in listOf(VrState.QUEUED, VrState.GENERATING)) return
-        synchronized(pending) {
-            pending.add(QueuedJob(photo, priority, sequence++))
+        val existingState = _uiState.value.states[photo.cacheKey]
+        if (!force && existingState == VrState.GENERATING) return
+        if (!force && !current && existingState == VrState.QUEUED) return
+        val job = QueuedJob(photo, priority, sequence++)
+        synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
+        synchronized(paused) { paused.remove(photo.cacheKey) }
+        if (current) {
+            synchronized(currentPending) {
+                currentPending.removeAll { it.photo.cacheKey == photo.cacheKey }
+                currentPending.add(job)
+            }
+            startCurrentWorker()
+        } else {
+            synchronized(pending) { pending.add(job) }
         }
         markState(photo.cacheKey, VrState.QUEUED)
-        addLog("queued ${photo.displayName} p=$priority")
+        addLog("${if (current) "current" else "queued"} ${photo.displayName} p=$priority")
     }
 
     private fun startWorker() {
@@ -595,6 +620,21 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         repeat((desired - workers.size).coerceAtLeast(0)) {
             workers += viewModelScope.launch(Dispatchers.IO) {
                 workerLoop()
+            }
+        }
+    }
+
+    private fun startCurrentWorker() {
+        if (currentWorker?.isActive == true) return
+        currentWorker = viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                if (!_uiState.value.vrMode) {
+                    synchronized(currentPending) { currentPending.clear() }
+                    break
+                }
+                val next = synchronized(currentPending) { currentPending.poll() } ?: break
+                processJob(next)
+                delay(25)
             }
         }
     }
@@ -613,50 +653,54 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     }
                     break
                 }
-                activeKey = next.photo.cacheKey
-                markState(next.photo.cacheKey, VrState.GENERATING)
-                upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f)
-                val result = runCatching {
-                    generator.generate(
-                        next.photo,
-                        _uiState.value.settings.toParams(),
-                        onModelProgress = { progress ->
-                            _uiState.update {
-                                it.copy(
-                                    modelProgress = progress,
-                                    modelStatus = if (progress < 1f) {
-                                        "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
-                                    } else {
-                                        "模型已就绪 / Model ready"
-                                    },
-                                )
-                            }
-                        },
-                    ) { progress ->
-                        upsertJob(next.photo, next.priority, VrState.GENERATING, progress)
-                    }
-                }
-                result.onSuccess { entry ->
-                    markReady(next.photo.cacheKey, entry)
-                    upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis())
-                    addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
-                    _uiState.update { it.copy(modelProgress = null, modelStatus = modelManager.statusText(it.settings.modelId), cacheVersions = cache.summaries()) }
-                }.onFailure { error ->
-                    markState(next.photo.cacheKey, VrState.FAILED)
-                    upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
-                    addLog("failed ${next.photo.displayName}: ${error.message}")
-                }
-                activeKey = null
+                processJob(next)
                 delay(50)
             }
     }
 
+    private fun processJob(next: QueuedJob) {
+        activeKey = next.photo.cacheKey
+        markState(next.photo.cacheKey, VrState.GENERATING)
+        upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f)
+        val result = runCatching {
+            generator.generate(
+                next.photo,
+                _uiState.value.settings.toParams(),
+                onModelProgress = { progress ->
+                    _uiState.update {
+                        it.copy(
+                            modelProgress = progress,
+                            modelStatus = if (progress < 1f) {
+                                "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
+                            } else {
+                                "模型已就绪 / Model ready"
+                            },
+                        )
+                    }
+                },
+            ) { progress ->
+                upsertJob(next.photo, next.priority, VrState.GENERATING, progress)
+            }
+        }
+        result.onSuccess { entry ->
+            markReady(next.photo.cacheKey, entry)
+            upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis())
+            addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
+            _uiState.update { it.copy(modelProgress = null, modelStatus = modelManager.statusText(it.settings.modelId), cacheVersions = cache.summaries()) }
+        }.onFailure { error ->
+            markState(next.photo.cacheKey, VrState.FAILED)
+            upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
+            addLog("failed ${next.photo.displayName}: ${error.message}")
+        }
+        activeKey = null
+    }
+
     private fun expandAutoPrefetchIfNeeded(): Boolean {
         if (!_uiState.value.vrMode || !_uiState.value.settings.autoPrefetch) return false
-        val selected = _uiState.value.selectedIndex ?: return false
+        val selected = _uiState.value.selectedIndex ?: _uiState.value.galleryAnchorIndex
         val next = when (_uiState.value.activePrefetchWindow) {
-            3 -> 5
-            5 -> 10
+            2 -> 4
+            4 -> 8
             else -> return false
         }
         _uiState.update { it.copy(activePrefetchWindow = next) }
@@ -720,6 +764,7 @@ private fun AppLanguage.pickMixed(text: String): String {
 
 private fun VrState.label(lang: AppLanguage): String = when (this) {
     VrState.NORMAL -> lang.t("原图", "Normal")
+    VrState.PAUSED -> lang.t("暂停", "Paused")
     VrState.QUEUED -> lang.t("排队", "Queued")
     VrState.GENERATING -> lang.t("生成中", "Generating")
     VrState.READY -> lang.t("已生成", "Ready")
@@ -744,7 +789,7 @@ private class SettingsStore(context: Context) {
             language = runCatching { AppLanguage.valueOf(prefs.getString("language", AppLanguage.ZH.name) ?: AppLanguage.ZH.name) }.getOrDefault(AppLanguage.ZH),
             modelId = prefs.getString("modelId", "depth_anything_v2_small_tflite") ?: "depth_anything_v2_small_tflite",
             autoPrefetch = prefs.getBoolean("autoPrefetch", true),
-            prefetchWindow = prefs.getInt("prefetchWindow", 3),
+            prefetchWindow = prefs.getInt("prefetchWindow", 2),
             depthScale = prefs.getFloat("depthScale", 40f),
             blurRadius = prefs.getInt("blurRadius", 3),
             fillRadius = prefs.getInt("fillRadius", 10),
@@ -1388,7 +1433,7 @@ private fun GalleryScreen(
                     }
                 }
                 Spacer(Modifier.height(10.dp))
-                val prefetch = if (state.settings.autoPrefetch) lang.t("自动：3→5→10", "Auto: 3→5→10") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
+                val prefetch = if (state.settings.autoPrefetch) lang.t("自动：2→4→8", "Auto: 2→4→8") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
                 Text(lang.t("预加载：$prefetch", "Prefetch: $prefetch"), style = MaterialTheme.typography.bodySmall)
                 state.message?.let {
                     Spacer(Modifier.height(6.dp))
@@ -1633,13 +1678,13 @@ private fun SettingsScreen(
         Text(lang.t("预加载", "Prefetch"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow {
-            val options = listOf("auto", "3", "5", "10")
+            val options = listOf("auto", "2", "4", "8")
             options.forEachIndexed { index, option ->
                 val selected = if (option == "auto") settings.autoPrefetch else !settings.autoPrefetch && settings.prefetchWindow == option.toInt()
                 SegmentedButton(
                     selected = selected,
                     onClick = {
-                        if (option == "auto") onChange(settings.copy(autoPrefetch = true, prefetchWindow = 3))
+                        if (option == "auto") onChange(settings.copy(autoPrefetch = true, prefetchWindow = 2))
                         else onChange(settings.copy(autoPrefetch = false, prefetchWindow = option.toInt()))
                     },
                     shape = SegmentedButtonDefaults.itemShape(index, options.size),
@@ -1659,7 +1704,7 @@ private fun SettingsScreen(
         SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
             onChange(settings.copy(maxLongEdge = it))
         }
-        SettingInt(lang.t("生成 worker 数", "Generation workers"), settings.generationWorkers, listOf(1, 2, 3)) {
+        SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) {
             onChange(settings.copy(generationWorkers = it))
         }
         SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
@@ -2051,7 +2096,7 @@ private fun List<PointerInputChange>.previousSpan(center: Offset): Float {
 
 @Composable
 private fun WindowSelector(value: Int, onChange: (Int) -> Unit) {
-    val options = listOf(3, 5, 10)
+    val options = listOf(2, 4, 8)
     SingleChoiceSegmentedButtonRow {
         options.forEachIndexed { index, option ->
             SegmentedButton(
