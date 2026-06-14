@@ -18,6 +18,8 @@ Local Android gallery for generating and caching parallel-eye SBS VR images from
   - `vr_sbs.jpg`
   - `params.json`
   - `job.log`
+- 主界面提供设置入口，可调整预加载张数、深度强度、平滑、填充和输出尺寸 / Main screen has a settings page for prefetch count, depth scale, blur, fill, and output size.
+- 覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载 / Updating over an existing install keeps the downloaded model; uninstalling usually removes it.
 
 ## 构建 / Build
 
@@ -46,6 +48,12 @@ The release APK no longer bundles `depth_anything_v2.tflite`. The app downloads 
 ```text
 https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite
 ```
+
+## 发布速度 / Release speed
+
+模型文件单独放在 `model-assets-v1` Release 中，普通 APK Release 不再重复上传模型，因此后续发版只需要上传约 24MB 的 APK。
+
+The model file is hosted once in the `model-assets-v1` release. Regular app releases no longer upload the model again, so later releases only upload an APK around 24MB.
 
 ## 第三方项目 / Third-party credits
 

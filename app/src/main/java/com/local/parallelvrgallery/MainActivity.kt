@@ -17,6 +17,7 @@ import android.os.Bundle
 import android.provider.MediaStore
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -41,7 +42,10 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -150,14 +154,32 @@ data class VrCacheEntry(
 data class VrGenerationParams(
     val depthModel: String = "depth_anything_v2.tflite",
     val outputMode: String = "SBS_PARALLEL",
-    val depthScale: Float = 30f,
-    val blurRadius: Int = 15,
+    val depthScale: Float = 40f,
+    val blurRadius: Int = 3,
     val fillRadius: Int = 10,
-    val invertDepth: Boolean = false,
+    val invertDepth: Boolean = true,
     val maxLongEdge: Int = 6000,
     val inpaintMode: String = "FOREGROUND_FILL",
     val quality: Int = 94,
 )
+
+data class AppSettings(
+    val prefetchWindow: Int = 5,
+    val depthScale: Float = 40f,
+    val blurRadius: Int = 3,
+    val fillRadius: Int = 10,
+    val invertDepth: Boolean = true,
+    val maxLongEdge: Int = 6000,
+    val depthResolution: Int = 518,
+) {
+    fun toParams(): VrGenerationParams = VrGenerationParams(
+        depthScale = depthScale,
+        blurRadius = blurRadius,
+        fillRadius = fillRadius,
+        invertDepth = invertDepth,
+        maxLongEdge = maxLongEdge,
+    )
+}
 
 data class VrJob(
     val photoItem: PhotoItem,
@@ -173,8 +195,9 @@ data class UiState(
     val hasPermission: Boolean = false,
     val photos: List<PhotoItem> = emptyList(),
     val selectedIndex: Int? = null,
+    val settingsOpen: Boolean = false,
     val vrMode: Boolean = false,
-    val prefetchWindow: Int = 5,
+    val settings: AppSettings = AppSettings(),
     val states: Map<String, VrState> = emptyMap(),
     val entries: Map<String, VrCacheEntry> = emptyMap(),
     val jobs: List<VrJob> = emptyList(),
@@ -192,12 +215,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val cache = VrCacheManager(app)
     private val modelManager = ModelManager(app)
     private val generator = VrGenerator(app, cache, modelManager)
+    private val settingsStore = SettingsStore(app)
     private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
     private var sequence = 0L
     private var worker: Job? = null
     private var activeKey: String? = null
 
-    private val _uiState = MutableStateFlow(UiState(hasPermission = hasImagePermission(app)))
+    private val _uiState = MutableStateFlow(UiState(hasPermission = hasImagePermission(app), settings = settingsStore.load()))
     val uiState: StateFlow<UiState> = _uiState
 
     init {
@@ -237,8 +261,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(selectedIndex = null, debugIndex = null) }
     }
 
-    fun setPrefetchWindow(window: Int) {
-        _uiState.update { it.copy(prefetchWindow = window) }
+    fun openSettings() {
+        _uiState.update { it.copy(settingsOpen = true) }
+    }
+
+    fun closeSettings() {
+        _uiState.update { it.copy(settingsOpen = false) }
+    }
+
+    fun updateSettings(settings: AppSettings) {
+        settingsStore.save(settings)
+        _uiState.update { it.copy(settings = settings) }
         _uiState.value.selectedIndex?.let { refreshWindow(it) }
     }
 
@@ -309,7 +342,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (photos.isEmpty()) return
         val targets = mutableListOf<Pair<Int, Int>>()
         if (includeCurrent) targets += index to 0
-        for (distance in 1.._uiState.value.prefetchWindow) {
+        for (distance in 1.._uiState.value.settings.prefetchWindow) {
             val next = index + distance
             val prev = index - distance
             if (next in photos.indices) targets += next to distance * 2 - 1
@@ -353,7 +386,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 val result = runCatching {
                     generator.generate(
                         next.photo,
-                        VrGenerationParams(),
+                        _uiState.value.settings.toParams(),
                         onModelProgress = { progress ->
                             _uiState.update {
                                 it.copy(
@@ -429,6 +462,31 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 }
 
 private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long)
+
+private class SettingsStore(context: Context) {
+    private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+
+    fun load(): AppSettings = AppSettings(
+        prefetchWindow = prefs.getInt("prefetchWindow", 5),
+        depthScale = prefs.getFloat("depthScale", 40f),
+        blurRadius = prefs.getInt("blurRadius", 3),
+        fillRadius = prefs.getInt("fillRadius", 10),
+        invertDepth = prefs.getBoolean("invertDepth", true),
+        maxLongEdge = prefs.getInt("maxLongEdge", 6000),
+        depthResolution = 518,
+    )
+
+    fun save(settings: AppSettings) {
+        prefs.edit()
+            .putInt("prefetchWindow", settings.prefetchWindow)
+            .putFloat("depthScale", settings.depthScale)
+            .putInt("blurRadius", settings.blurRadius)
+            .putInt("fillRadius", settings.fillRadius)
+            .putBoolean("invertDepth", settings.invertDepth)
+            .putInt("maxLongEdge", settings.maxLongEdge)
+            .apply()
+    }
+}
 
 private class PhotoRepository(private val context: Context) {
     fun loadImages(): List<PhotoItem> {
@@ -708,21 +766,19 @@ private class VrGenerator(
         srcPixels.copyInto(leftPixels)
         srcPixels.copyInto(rightPixels)
 
-        val maxShift = (w * (depthScale / 500f)).roundToInt().coerceIn(1, max(1, w / 5))
         val fill = fillRadius.coerceIn(1, 32)
+        val depthScaling = depthScale / w.toFloat()
 
         for (x in w - 1 downTo 0) {
             for (y in 0 until h) {
                 val dx = (x * 517 / max(1, w - 1)).coerceIn(0, 517)
                 val dy = (y * 517 / max(1, h - 1)).coerceIn(0, 517)
                 val d = depth[dy * 518 + dx]
-                val shift = (d.coerceIn(0f, 1f) * maxShift).roundToInt()
+                val shift = (d.coerceIn(0f, 1f) * 255f * depthScaling).toInt().coerceIn(0, w - 1)
                 val color = srcPixels[y * w + x]
-                for (offset in 0..fill) {
+                for (offset in 0 until fill) {
                     val leftX = (x + shift + offset).coerceIn(0, w - 1)
-                    val rightX = (x - shift - offset).coerceIn(0, w - 1)
                     leftPixels[y * w + leftX] = color
-                    rightPixels[y * w + rightX] = color
                 }
             }
         }
@@ -781,7 +837,18 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
 
     val debug = state.debugIndex
     val selected = state.selectedIndex
-    if (debug != null) {
+    BackHandler(enabled = debug != null) { viewModel.closeDebug() }
+    BackHandler(enabled = debug == null && selected != null) { viewModel.closeViewer() }
+    BackHandler(enabled = debug == null && selected == null && state.settingsOpen) { viewModel.closeSettings() }
+
+    if (state.settingsOpen) {
+        SettingsScreen(
+            settings = state.settings,
+            modelStatus = state.modelStatus,
+            onBack = viewModel::closeSettings,
+            onChange = viewModel::updateSettings,
+        )
+    } else if (debug != null) {
         DebugScreen(
             state = state,
             index = debug,
@@ -796,7 +863,6 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
             onIndexChanged = viewModel::onPagerIndexChanged,
             onVr = viewModel::requestVr,
             onRetry = viewModel::retry,
-            onWindowChanged = viewModel::setPrefetchWindow,
             onOpenDebug = viewModel::openDebug,
         )
     } else {
@@ -804,7 +870,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
             state = state,
             onRefresh = viewModel::loadPhotos,
             onOpen = viewModel::openPhoto,
-            onWindowChanged = viewModel::setPrefetchWindow,
+            onSettings = viewModel::openSettings,
         )
     }
 }
@@ -829,17 +895,19 @@ private fun GalleryScreen(
     state: UiState,
     onRefresh: () -> Unit,
     onOpen: (Int) -> Unit,
-    onWindowChanged: (Int) -> Unit,
+    onSettings: () -> Unit,
 ) {
     Scaffold(
         topBar = {
             Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("平行眼 VR 图库", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    OutlinedButton(onClick = onSettings) { Text("设置 / Settings") }
+                    Spacer(Modifier.width(8.dp))
                     OutlinedButton(onClick = onRefresh) { Text("刷新 / Refresh") }
                 }
                 Spacer(Modifier.height(10.dp))
-                WindowSelector(state.prefetchWindow, onWindowChanged)
+                Text("预加载 / Prefetch: 前后各 ${state.settings.prefetchWindow} 张", style = MaterialTheme.typography.bodySmall)
                 state.message?.let {
                     Spacer(Modifier.height(6.dp))
                     Text(it, style = MaterialTheme.typography.bodySmall)
@@ -888,6 +956,93 @@ private fun PhotoTile(photo: PhotoItem, state: VrState, onClick: () -> Unit) {
 }
 
 @Composable
+private fun SettingsScreen(
+    settings: AppSettings,
+    modelStatus: String,
+    onBack: () -> Unit,
+    onChange: (AppSettings) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = onBack) { Text("返回 / Back") }
+            Spacer(Modifier.width(12.dp))
+            Text("设置 / Settings", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(16.dp))
+        Text("模型 / Model", fontWeight = FontWeight.Bold)
+        Text(modelStatus, style = MaterialTheme.typography.bodySmall)
+        Text("覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载。\nUpdating over the existing app keeps the downloaded model; uninstalling usually removes it.", style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(16.dp))
+
+        SettingInt("预加载张数 / Prefetch each side", settings.prefetchWindow, listOf(3, 5, 10)) {
+            onChange(settings.copy(prefetchWindow = it))
+        }
+        SettingFloat("depth_scale / 深度强度", settings.depthScale, listOf(20f, 30f, 40f, 60f)) {
+            onChange(settings.copy(depthScale = it))
+        }
+        SettingInt("blur_radius / 深度平滑", settings.blurRadius, listOf(1, 3, 9, 15)) {
+            onChange(settings.copy(blurRadius = it))
+        }
+        SettingInt("fill_radius / 边缘填充", settings.fillRadius, listOf(5, 10, 15, 20)) {
+            onChange(settings.copy(fillRadius = it))
+        }
+        SettingInt("输出最大长边 / Max output long edge", settings.maxLongEdge, listOf(2048, 4096, 6000)) {
+            onChange(settings.copy(maxLongEdge = it))
+        }
+
+        Spacer(Modifier.height(12.dp))
+        Text("深度图分辨率 / Depth resolution", fontWeight = FontWeight.Bold)
+        Text("${settings.depthResolution} x ${settings.depthResolution}（当前 TFLite 模型固定输入；提高真正推理分辨率需要换模型或模型格式）\nFixed by the current TFLite model input; true higher depth inference resolution needs another model/export.", style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = settings.invertDepth,
+                onCheckedChange = { onChange(settings.copy(invertDepth = it)) },
+            )
+            Text("反转深度 / Invert depth（匹配 ComfyUI 截图默认：true）")
+        }
+    }
+}
+
+@Composable
+private fun SettingInt(title: String, value: Int, options: List<Int>, onChange: (Int) -> Unit) {
+    Text(title, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(6.dp))
+    SingleChoiceSegmentedButtonRow {
+        options.forEachIndexed { index, option ->
+            SegmentedButton(
+                selected = value == option,
+                onClick = { onChange(option) },
+                shape = SegmentedButtonDefaults.itemShape(index, options.size),
+            ) { Text(option.toString()) }
+        }
+    }
+    Spacer(Modifier.height(14.dp))
+}
+
+@Composable
+private fun SettingFloat(title: String, value: Float, options: List<Float>, onChange: (Float) -> Unit) {
+    Text(title, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(6.dp))
+    SingleChoiceSegmentedButtonRow {
+        options.forEachIndexed { index, option ->
+            SegmentedButton(
+                selected = abs(value - option) < 0.01f,
+                onClick = { onChange(option) },
+                shape = SegmentedButtonDefaults.itemShape(index, options.size),
+            ) { Text(option.roundToInt().toString()) }
+        }
+    }
+    Spacer(Modifier.height(14.dp))
+}
+
+@Composable
 private fun ViewerScreen(
     state: UiState,
     startIndex: Int,
@@ -895,7 +1050,6 @@ private fun ViewerScreen(
     onIndexChanged: (Int) -> Unit,
     onVr: (Int) -> Unit,
     onRetry: (Int) -> Unit,
-    onWindowChanged: (Int) -> Unit,
     onOpenDebug: (Int) -> Unit,
 ) {
     val view = LocalView.current
@@ -953,7 +1107,6 @@ private fun ViewerScreen(
         Column(
             modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
         ) {
-            WindowSelector(state.prefetchWindow, onWindowChanged)
             val current = state.photos.getOrNull(pagerState.currentPage)
             if (current != null) {
                 Text(
