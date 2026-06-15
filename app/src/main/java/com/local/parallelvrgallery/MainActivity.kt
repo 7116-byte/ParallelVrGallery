@@ -77,13 +77,13 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -386,6 +386,7 @@ data class UiState(
     val recentGenerations: List<LastGenerationInfo> = emptyList(),
     val updateStatus: String? = null,
     val updateUrl: String? = null,
+    val updateAvailable: Boolean = false,
 )
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
@@ -523,7 +524,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun checkForUpdates() {
         val lang = _uiState.value.settings.language
-        _uiState.update { it.copy(updateStatus = lang.t("正在检查更新...", "Checking for updates..."), updateUrl = null) }
+        _uiState.update { it.copy(updateStatus = lang.t("正在检查更新...", "Checking for updates..."), updateUrl = null, updateAvailable = false) }
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
@@ -539,17 +540,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.12"
+                    val current = "v1.13"
                     if (latest == current) {
-                        lang.t("已是最新版本：$current", "Already up to date: $current") to url
+                        Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
-                        lang.t("发现新版本：$latest，当前：$current", "New version: $latest, current: $current") to url
+                        Triple(lang.t("发现新版本：$latest，当前：$current", "New version: $latest, current: $current"), url, url != null)
                     }
                 }.getOrElse { error ->
-                    lang.t("检查更新失败：${error.message}", "Update check failed: ${error.message}") to null
+                    Triple(lang.t("检查更新失败：${error.message}", "Update check failed: ${error.message}"), null, false)
                 }
             }
-            _uiState.update { it.copy(updateStatus = result.first, updateUrl = result.second) }
+            _uiState.update { it.copy(updateStatus = result.first, updateUrl = result.second, updateAvailable = result.third) }
         }
     }
 
@@ -1126,9 +1127,26 @@ private fun imageLoadedLine(state: UiState, index: Int, lang: AppLanguage): Stri
 
 private fun imageQueueLine(state: UiState, index: Int, lang: AppLanguage): String {
     val queueStates = setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED)
-    val prev = imageSideCount(state, index, -1, queueStates)
-    val next = imageSideCount(state, index, 1, queueStates)
+    val prev = imageWindowCount(state, index, -1, queueStates)
+    val next = imageWindowCount(state, index, 1, queueStates)
     return lang.t("队列中：前$prev 后$next", "Queued: prev $prev next $next")
+}
+
+private fun imageWindowCount(state: UiState, index: Int, offsetStep: Int, states: Set<VrState>): Int {
+    var count = 0
+    var seenImages = 0
+    var cursor = index + offsetStep
+    val window = state.activePrefetchWindow.coerceAtMost(8)
+    while (cursor in state.photos.indices && seenImages < window) {
+        val item = state.photos[cursor]
+        if (item.kind == MediaKind.IMAGE) {
+            seenImages++
+            val itemState = state.states[item.cacheKey] ?: VrState.NORMAL
+            if (itemState in states) count++
+        }
+        cursor += offsetStep
+    }
+    return count
 }
 
 private fun imageRecentGenerationLines(state: UiState, lang: AppLanguage): List<String> {
@@ -2105,6 +2123,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 modelStatus = state.modelStatus,
                 updateStatus = state.updateStatus,
                 updateUrl = state.updateUrl,
+                updateAvailable = state.updateAvailable,
                 onBack = viewModel::closeSettings,
                 onChange = viewModel::updateSettings,
                 onCheckUpdate = viewModel::checkForUpdates,
@@ -2476,6 +2495,7 @@ private fun SettingsScreen(
     modelStatus: String,
     updateStatus: String?,
     updateUrl: String?,
+    updateAvailable: Boolean,
     onBack: () -> Unit,
     onChange: (AppSettings) -> Unit,
     onCheckUpdate: () -> Unit,
@@ -2519,7 +2539,7 @@ private fun SettingsScreen(
             Spacer(Modifier.height(6.dp))
             Text(it, style = MaterialTheme.typography.bodySmall)
         }
-        updateUrl?.let { url ->
+        if (updateAvailable) updateUrl?.let { url ->
             Spacer(Modifier.height(6.dp))
             Button(onClick = { onOpenUpdate(url) }) {
                 Text(lang.t("下载更新", "Download update"))
@@ -2984,10 +3004,10 @@ private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onTap: () 
             },
     ) {
         Row(Modifier.fillMaxSize()) {
-            Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
+            Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.CenterEnd) {
                 Image(left, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
             }
-            Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.Center) {
+            Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.CenterStart) {
                 Image(right, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
             }
         }
@@ -3253,11 +3273,25 @@ private fun VideoPlayer(
                     Text(positionText, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
                 }
                 Spacer(Modifier.height(6.dp))
-                LinearProgressIndicator(
-                    progress = { progress },
+                Slider(
+                    value = progress,
+                    onValueChange = { value ->
+                        val view = videoView
+                        val duration = (mediaPlayer?.duration ?: view?.duration ?: 0).coerceAtLeast(0)
+                        progress = value.coerceIn(0f, 1f)
+                        if (duration > 0) {
+                            val target = (duration * progress).roundToInt().coerceIn(0, duration)
+                            runCatching {
+                                if (Build.VERSION.SDK_INT >= 26 && mediaPlayer != null) {
+                                    mediaPlayer?.seekTo(target.toLong(), MediaPlayer.SEEK_CLOSEST)
+                                } else {
+                                    view?.seekTo(target)
+                                }
+                            }
+                            positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
+                        }
+                    },
                     modifier = Modifier.fillMaxWidth(),
-                    color = androidx.compose.ui.graphics.Color(0xff8f6df5),
-                    trackColor = androidx.compose.ui.graphics.Color(0x55ffffff),
                 )
             }
         }
