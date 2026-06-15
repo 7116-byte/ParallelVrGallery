@@ -326,6 +326,7 @@ data class LastGenerationInfo(
 
 data class UiState(
     val hasPermission: Boolean = false,
+    val hasVideoPermission: Boolean = false,
     val photos: List<PhotoItem> = emptyList(),
     val selectedIndex: Int? = null,
     val galleryAnchorIndex: Int = 0,
@@ -345,7 +346,7 @@ data class UiState(
     val message: String? = null,
     val debugIndex: Int? = null,
     val modelProgress: Float? = null,
-    val modelStatus: String = "妯″瀷鏈笅杞?/ Model not downloaded",
+    val modelStatus: String = "模型未下载 / Model not downloaded",
     val blockingMessage: String? = null,
     val cacheVersions: List<CacheVersionSummary> = emptyList(),
     val managedCacheItems: List<ManagedCacheItem> = emptyList(),
@@ -353,6 +354,7 @@ data class UiState(
     val videoEntries: Map<String, VideoCacheEntry> = emptyMap(),
     val videoJobs: List<VideoVrJob> = emptyList(),
     val lastGeneration: LastGenerationInfo? = null,
+    val recentGenerations: List<LastGenerationInfo> = emptyList(),
 )
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
@@ -375,7 +377,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private var currentWorker: Job? = null
     private var activeKey: String? = null
 
-    private val _uiState = MutableStateFlow(UiState(hasPermission = hasImagePermission(app), settings = settingsStore.load()))
+    private val _uiState = MutableStateFlow(
+        UiState(
+            hasPermission = hasImagePermission(app),
+            hasVideoPermission = hasVideoPermission(app),
+            settings = settingsStore.load(),
+        ),
+    )
     val uiState: StateFlow<UiState> = _uiState
 
     init {
@@ -384,9 +392,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun onPermissionChanged(granted: Boolean) {
-        _uiState.update { it.copy(hasPermission = granted) }
-        if (granted) loadPhotos()
+    fun onPermissionChanged(imageGranted: Boolean, videoGranted: Boolean) {
+        _uiState.update { it.copy(hasPermission = imageGranted, hasVideoPermission = videoGranted) }
+        if (imageGranted) loadPhotos()
     }
 
     fun loadPhotos() {
@@ -406,7 +414,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     videoStates = videoItems.associate { item -> item.cacheKey to if (videoEntries.containsKey(item.cacheKey)) VideoVrState.READY else VideoVrState.NORMAL },
                     videoEntries = videoEntries,
                     loading = false,
-                    message = "宸插姞杞?${photos.size} 寮犲浘鐗?/ ${photos.size} images loaded",
+                    message = "已加载 ${imageItems.size} 张图片、${videoItems.size} 个视频 / ${imageItems.size} images, ${videoItems.size} videos loaded",
                     cacheVersions = cache.summaries(),
                     managedCacheItems = managedItems,
                     modelStatus = modelManager.statusText(it.settings.modelId),
@@ -540,7 +548,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 DebugExporter(context, cache).export(photo, entry)
             }
             if (result == null) {
-                _uiState.update { it.copy(message = "褰撳墠鍥剧墖杩樻病鏈夊彲瀵煎嚭鐨?VR 缂撳瓨 / No READY cache yet") }
+                _uiState.update { it.copy(message = "当前图片还没有可导出的 VR 缓存 / No READY cache yet") }
             } else {
                 val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", result)
                 val intent = Intent(Intent.ACTION_SEND).apply {
@@ -548,8 +556,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     putExtra(Intent.EXTRA_STREAM, uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                context.startActivity(Intent.createChooser(intent, "瀵煎嚭璋冭瘯鍖?/ Export debug package"))
-                _uiState.update { it.copy(message = "璋冭瘯鍖呭凡鍒涘缓 / Debug package created: ${result.name}") }
+                context.startActivity(Intent.createChooser(intent, "导出调试包 / Export debug package"))
+                _uiState.update { it.copy(message = "调试包已创建 / Debug package created: ${result.name}") }
             }
         }
     }
@@ -581,7 +589,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     states = photos.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
                     cacheVersions = cache.summaries(),
                     managedCacheItems = cache.allEntries(photos),
-                    message = "宸插垹闄ょ増鏈?/ Deleted version: $version",
+                    message = "已删除版本 / Deleted version: $version",
                 )
             }
         }
@@ -608,7 +616,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 }
                 when {
                     saved == 0 -> lang.t("没有可保存的已生成 VR 图", "No generated VR images to save")
-                    failed == 0 -> lang.t("宸蹭繚瀛?$saved 寮犲埌绯荤粺鍥惧簱", "Saved $saved images to system gallery")
+                    failed == 0 -> lang.t("已保存 $saved 张到系统图库", "Saved $saved images to system gallery")
                     else -> lang.t("已保存 $saved 张，失败 $failed 张", "Saved $saved images, failed $failed")
                 }
             }
@@ -664,7 +672,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     }.onFailure { failed++ }
                 }
                 when {
-                    replaced == 0 -> lang.t("鏇挎崲澶辫触锛氱郴缁熷彲鑳戒笉鍏佽鍐欏叆杩欎簺鍘熷浘", "Replace failed: Android may not allow writing these originals")
+                    replaced == 0 -> lang.t("替换失败：系统可能不允许写入这些原图", "Replace failed: Android may not allow writing these originals")
                     failed == 0 -> lang.t("已替换 $replaced 张并尝试保留原时间", "Replaced $replaced images and tried to keep timestamps")
                     else -> lang.t("已替换 $replaced 张，失败 $failed 张", "Replaced $replaced images, failed $failed")
                 }
@@ -806,7 +814,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     _uiState.update {
                         it.copy(
                             modelProgress = progress,
-                            modelStatus = if (progress < 1f) "姝ｅ湪涓嬭浇妯″瀷 / Downloading model ${(progress * 100f).roundToInt()}%" else "妯″瀷宸插氨缁?/ Model ready",
+                            modelStatus = if (progress < 1f) "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%" else "模型已就绪 / Model ready",
                         )
                     }
                 },
@@ -867,9 +875,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         it.copy(
                             modelProgress = progress,
                             modelStatus = if (progress < 1f) {
-                                "姝ｅ湪涓嬭浇妯″瀷 / Downloading model ${(progress * 100f).roundToInt()}%"
+                                "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
                             } else {
-                                "妯″瀷宸插氨缁?/ Model ready"
+                                "模型已就绪 / Model ready"
                             },
                         )
                     }
@@ -884,7 +892,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
             val selected = _uiState.value.selectedIndex ?: _uiState.value.galleryAnchorIndex
             val doneIndex = _uiState.value.photos.indexOfFirst { it.cacheKey == next.photo.cacheKey }
-            _uiState.update { it.copy(modelProgress = null, modelStatus = modelManager.statusText(it.settings.modelId), cacheVersions = cache.summaries(), lastGeneration = LastGenerationInfo(doneIndex - selected, System.currentTimeMillis() - started)) }
+            val generationInfo = LastGenerationInfo(doneIndex - selected, System.currentTimeMillis() - started)
+            _uiState.update {
+                it.copy(
+                    modelProgress = null,
+                    modelStatus = modelManager.statusText(it.settings.modelId),
+                    cacheVersions = cache.summaries(),
+                    lastGeneration = generationInfo,
+                    recentGenerations = (listOf(generationInfo) + it.recentGenerations).take(3),
+                )
+            }
         }.onFailure { error ->
             markState(next.photo.cacheKey, VrState.FAILED)
             upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
@@ -990,12 +1007,12 @@ private fun AppLanguage.pickMixed(text: String): String {
 }
 
 private fun VrState.label(lang: AppLanguage): String = when (this) {
-    VrState.NORMAL -> lang.t("鍘熷浘", "Normal")
-    VrState.PAUSED -> lang.t("鏆傚仠", "Paused")
-    VrState.QUEUED -> lang.t("鎺掗槦", "Queued")
+    VrState.NORMAL -> lang.t("原图", "Normal")
+    VrState.PAUSED -> lang.t("暂停", "Paused")
+    VrState.QUEUED -> lang.t("队列中", "Queued")
     VrState.GENERATING -> lang.t("生成中", "Generating")
     VrState.READY -> lang.t("已生成", "Ready")
-    VrState.FAILED -> lang.t("澶辫触", "Failed")
+    VrState.FAILED -> lang.t("失败", "Failed")
 }
 
 private fun VideoVrState.label(lang: AppLanguage): String = when (this) {
@@ -1004,6 +1021,47 @@ private fun VideoVrState.label(lang: AppLanguage): String = when (this) {
     VideoVrState.GENERATING -> lang.t("生成中", "Generating")
     VideoVrState.READY -> lang.t("已生成", "Ready")
     VideoVrState.FAILED -> lang.t("失败", "Failed")
+}
+
+private fun imageSideCount(state: UiState, index: Int, offsetStep: Int, states: Set<VrState>): Int {
+    var count = 0
+    var cursor = index + offsetStep
+    while (cursor in state.photos.indices) {
+        val item = state.photos[cursor]
+        if (item.kind != MediaKind.IMAGE) {
+            cursor += offsetStep
+            continue
+        }
+        val itemState = state.states[item.cacheKey] ?: VrState.NORMAL
+        if (itemState !in states) break
+        count++
+        cursor += offsetStep
+    }
+    return count
+}
+
+private fun imageLoadedLine(state: UiState, index: Int, lang: AppLanguage): String {
+    val prev = imageSideCount(state, index, -1, setOf(VrState.READY))
+    val next = imageSideCount(state, index, 1, setOf(VrState.READY))
+    return lang.t("已加载：前$prev 后$next", "Loaded: prev $prev next $next")
+}
+
+private fun imageQueueLine(state: UiState, index: Int, lang: AppLanguage): String {
+    val queueStates = setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED)
+    val prev = imageSideCount(state, index, -1, queueStates)
+    val next = imageSideCount(state, index, 1, queueStates)
+    return lang.t("队列中：前$prev 后$next", "Queued: prev $prev next $next")
+}
+
+private fun imageRecentGenerationLines(state: UiState, lang: AppLanguage): List<String> {
+    return state.recentGenerations.take(3).map {
+        val side = when {
+            it.relativeIndex < 0 -> lang.t("前${abs(it.relativeIndex)}", "prev ${abs(it.relativeIndex)}")
+            it.relativeIndex > 0 -> lang.t("后${it.relativeIndex}", "next ${it.relativeIndex}")
+            else -> lang.t("当前", "current")
+        }
+        lang.t("${side}已生成（${it.elapsedMs}ms）", "$side ready (${it.elapsedMs}ms)")
+    }
 }
 
 private fun imagePrefetchSummary(state: UiState, index: Int, lang: AppLanguage): String {
@@ -1199,7 +1257,7 @@ private class VrCacheManager(private val context: Context) {
             }
         }
         return map.map { (version, value) ->
-            CacheVersionSummary(version = version, kind = "鍥剧墖 / Images", count = value.first, bytes = value.second)
+            CacheVersionSummary(version = version, kind = "图片 / Images", count = value.first, bytes = value.second)
         }.sortedBy { it.version }
     }
 
@@ -1298,9 +1356,9 @@ private class ModelManager(private val context: Context) {
         val spec = modelSpec(modelId)
         val modelFile = File(modelsDir, spec.fileName)
         return if (modelFile.exists() && modelFile.sha256().equals(spec.sha256, ignoreCase = true)) {
-            "妯″瀷宸插氨缁?/ Model ready"
+            "模型已就绪 / Model ready"
         } else {
-            "妯″瀷鏈笅杞?/ Model not downloaded"
+            "模型未下载 / Model not downloaded"
         }
     }
 
@@ -1818,7 +1876,10 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     val context = LocalContext.current
     var pendingReplaceIndexes by remember { mutableStateOf<List<Int>>(emptyList()) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
-        viewModel.onPermissionChanged(grants[imagePermission()] == true || hasImagePermission(context))
+        viewModel.onPermissionChanged(
+            imageGranted = grants[imagePermission()] == true || hasImagePermission(context),
+            videoGranted = grants[videoPermission()] == true || hasVideoPermission(context),
+        )
     }
     val replaceLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK && pendingReplaceIndexes.isNotEmpty()) {
@@ -1827,9 +1888,11 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
         pendingReplaceIndexes = emptyList()
     }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(state.hasPermission, state.hasVideoPermission) {
         if (!state.hasPermission) {
             launcher.launch(mediaPermissions())
+        } else if (!state.hasVideoPermission && Build.VERSION.SDK_INT >= 33) {
+            launcher.launch(arrayOf(Manifest.permission.READ_MEDIA_VIDEO))
         }
     }
 
@@ -1934,11 +1997,11 @@ private fun PermissionScreen(lang: AppLanguage, onGrant: () -> Unit) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(lang.t("骞宠鐪?VR 鍥惧簱", "Parallel VR Gallery"), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(12.dp))
         Text(lang.t("授权读取图片和视频后，可以浏览系统相册，并在本地生成平行眼 SBS VR 缓存。", "Allow image and video access to browse your gallery and build local parallel-eye VR cache."))
         Spacer(Modifier.height(20.dp))
-        Button(onClick = onGrant) { Text(lang.t("鎺堟潈鍥剧墖璁块棶", "Grant access")) }
+        Button(onClick = onGrant) { Text(lang.t("授权图片和视频访问", "Grant access")) }
     }
 }
 
@@ -1975,8 +2038,8 @@ private fun GalleryScreen(
             Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selectedKeys.isEmpty()) {
-                        Text(lang.t("骞宠鐪?VR 鍥惧簱", "Parallel VR Gallery"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        OutlinedButton(onClick = onManage) { Text(lang.t("绠＄悊", "Manage")) }
+                        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = onManage) { Text(lang.t("管理", "Manage")) }
                         Spacer(Modifier.width(8.dp))
                         OutlinedButton(onClick = onSettings) { Text(lang.t("璁剧疆", "Settings")) }
                         Spacer(Modifier.width(8.dp))
@@ -1988,7 +2051,7 @@ private fun GalleryScreen(
                         Button(onClick = {
                             onSaveGenerated(selectedIndexes)
                             selectedKeys = emptySet()
-                        }) { Text(lang.t("淇濆瓨", "Save")) }
+                        }) { Text(lang.t("保存", "Save")) }
                         Spacer(Modifier.width(8.dp))
                         Button(onClick = {
                             onReplaceOriginal(selectedIndexes)
@@ -1998,7 +2061,7 @@ private fun GalleryScreen(
                 }
                 Spacer(Modifier.height(10.dp))
                 val prefetch = if (state.settings.autoPrefetch) lang.t("自动：2 -> 4 -> 8", "Auto: 2 -> 4 -> 8") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
-                Text(lang.t("棰勫姞杞斤細$prefetch", "Prefetch: $prefetch"), style = MaterialTheme.typography.bodySmall)
+                Text(lang.t("预加载：$prefetch", "Prefetch: $prefetch"), style = MaterialTheme.typography.bodySmall)
                 state.message?.let {
                     Spacer(Modifier.height(6.dp))
                     Text(lang.pickMixed(it), style = MaterialTheme.typography.bodySmall)
@@ -2135,13 +2198,13 @@ private fun ManageScreen(
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("杩斿洖", "Back")) }
+            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
             Spacer(Modifier.width(12.dp))
-            Text(lang.t("鐢熸垚绠＄悊", "Generated Manager"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(lang.t("生成管理", "Generated Manager"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(16.dp))
         SingleChoiceSegmentedButtonRow {
-            listOf("images" to lang.t("鍥剧墖", "Images"), "videos" to lang.t("瑙嗛", "Videos")).forEachIndexed { index, option ->
+            listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")).forEachIndexed { index, option ->
                 SegmentedButton(
                     selected = tab == option.first,
                     onClick = { tab = option.first },
@@ -2206,8 +2269,8 @@ private fun ManageScreen(
                         Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
-                                    Text(lang.t("鐗堟湰锛?{summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
-                                    Text(lang.t("${summary.count} 寮? ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
+                                    Text(lang.t("版本：${summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
+                                    Text(lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
                                 }
                                 OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
                                     Text(lang.t("鍒犻櫎", "Delete"))
@@ -2257,7 +2320,7 @@ private fun SettingsScreen(
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("杩斿洖", "Back")) }
+            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
             Spacer(Modifier.width(12.dp))
             Text(lang.t("璁剧疆", "Settings"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
@@ -2265,7 +2328,7 @@ private fun SettingsScreen(
         Text(lang.t("璇█", "Language"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow {
-            listOf(AppLanguage.ZH to "涓枃", AppLanguage.EN to "English").forEachIndexed { index, option ->
+            listOf(AppLanguage.ZH to "中文", AppLanguage.EN to "English").forEachIndexed { index, option ->
                 SegmentedButton(
                     selected = settings.language == option.first,
                     onClick = { onChange(settings.copy(language = option.first)) },
@@ -2275,12 +2338,12 @@ private fun SettingsScreen(
         }
         Spacer(Modifier.height(16.dp))
 
-        Text(lang.t("妯″瀷", "Model"), fontWeight = FontWeight.Bold)
+        Text(lang.t("模型", "Model"), fontWeight = FontWeight.Bold)
         Text(lang.pickMixed(modelStatus), style = MaterialTheme.typography.bodySmall)
         Text(lang.t("覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载。", "Updating over the existing app keeps the downloaded model; uninstalling usually removes it."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(16.dp))
 
-        Text(lang.t("妯″瀷閫夋嫨", "Model selection"), fontWeight = FontWeight.Bold)
+        Text(lang.t("模型选择", "Model selection"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow {
             AvailableModels.forEachIndexed { index, spec ->
@@ -2311,13 +2374,13 @@ private fun SettingsScreen(
             }
         }
         Spacer(Modifier.height(14.dp))
-        SettingFloat(lang.t("娣卞害寮哄害", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
+        SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
             onChange(settings.copy(depthScale = it))
         }
-        SettingInt(lang.t("娣卞害骞虫粦", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
+        SettingInt(lang.t("深度平滑", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
             onChange(settings.copy(blurRadius = it))
         }
-        SettingInt(lang.t("杈圭紭濉厖", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
+        SettingInt(lang.t("边缘填充", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
             onChange(settings.copy(fillRadius = it))
         }
         SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
@@ -2326,7 +2389,7 @@ private fun SettingsScreen(
         SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) {
             onChange(settings.copy(generationWorkers = it))
         }
-        SettingInt(lang.t("妯″瀷 CPU 绾跨▼", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
+        SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
             onChange(settings.copy(modelThreads = it))
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2339,16 +2402,16 @@ private fun SettingsScreen(
         Text(lang.t("GPU 会尝试使用 TFLite GPU Delegate；不兼容时自动回退 CPU。", "GPU uses TFLite GPU Delegate when compatible and falls back to CPU if needed."), style = MaterialTheme.typography.bodySmall)
 
         Spacer(Modifier.height(12.dp))
-        Text(lang.t("娣卞害鍥惧垎杈ㄧ巼", "Depth resolution"), fontWeight = FontWeight.Bold)
+        Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
         val spec = modelSpec(settings.modelId)
-        Text(lang.t("${spec.inputSize} x ${spec.inputSize}锛堢敱褰撳墠妯″瀷鍥哄畾锛涢€夋嫨鍏朵粬妯″瀷鍚庤繖閲屼細闅忔ā鍨嬪彉鍖栵級", "${spec.inputSize} x ${spec.inputSize}. Fixed by the selected model; choosing another model changes this value."), style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("${spec.inputSize} x ${spec.inputSize}（由当前模型固定；选择其他模型后这里会随模型变化）", "${spec.inputSize} x ${spec.inputSize}. Fixed by the selected model; choosing another model changes this value."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(12.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = settings.invertDepth,
                 onCheckedChange = { onChange(settings.copy(invertDepth = it)) },
             )
-            Text(lang.t("鍙嶈浆娣卞害", "Invert depth"))
+            Text(lang.t("反转深度", "Invert depth"))
         }
     }
 }
@@ -2452,7 +2515,7 @@ private fun ViewerScreen(
                 modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                OutlinedButton(onClick = onClose) { Text(lang.t("杩斿洖", "Back")) }
+                OutlinedButton(onClick = onClose) { Text(lang.t("返回", "Back")) }
                 Spacer(Modifier.width(8.dp))
                 val currentItem = state.photos.getOrNull(pagerState.currentPage)
                 Text(
@@ -2474,7 +2537,7 @@ private fun ViewerScreen(
                     )
                 }
                 Spacer(Modifier.width(8.dp))
-                OutlinedButton(onClick = { onOpenDebug(pagerState.currentPage) }) { Text(lang.t("璋冭瘯", "Debug")) }
+                OutlinedButton(onClick = { onOpenDebug(pagerState.currentPage) }) { Text(lang.t("调试", "Debug")) }
             }
             Column(
                 modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
@@ -2491,17 +2554,33 @@ private fun ViewerScreen(
                         )
                     } else {
                         Text(
-                            text = imagePrefetchSummary(state, pagerState.currentPage, lang),
+                            text = imageLoadedLine(state, pagerState.currentPage, lang),
                             color = androidx.compose.ui.graphics.Color.White,
                             style = MaterialTheme.typography.bodySmall,
                         )
+                        Text(
+                            text = imageQueueLine(state, pagerState.currentPage, lang),
+                            color = androidx.compose.ui.graphics.Color.White,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        val recentLines = imageRecentGenerationLines(state, lang)
+                        repeat(3) { lineIndex ->
+                            Text(
+                                text = recentLines.getOrNull(lineIndex).orEmpty(),
+                                color = androidx.compose.ui.graphics.Color.White,
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                            )
+                        }
                     }
                 }
-                state.modelProgress?.let {
-                    Text(lang.pickMixed(state.modelStatus), color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.bodySmall)
-                }
-                state.logs.take(3).forEach {
-                    Text(it, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+                if (current?.kind == MediaKind.VIDEO) {
+                    state.modelProgress?.let {
+                        Text(lang.pickMixed(state.modelStatus), color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.bodySmall)
+                    }
+                    state.logs.take(3).forEach {
+                        Text(it, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+                    }
                 }
             }
         }
@@ -2520,7 +2599,7 @@ private fun StatusOverlay(state: VrState, lang: AppLanguage, onRetry: () -> Unit
             Spacer(Modifier.height(12.dp))
             Text(state.label(lang), color = androidx.compose.ui.graphics.Color.White)
         } else if (state == VrState.FAILED) {
-            Text(lang.t("鐢熸垚澶辫触", "Generation failed"), color = androidx.compose.ui.graphics.Color.White)
+            Text(lang.t("生成失败", "Generation failed"), color = androidx.compose.ui.graphics.Color.White)
             Spacer(Modifier.height(12.dp))
             Button(onClick = onRetry) { Text(lang.t("閲嶈瘯", "Retry")) }
         }
@@ -2550,10 +2629,10 @@ private fun DebugScreen(
             .padding(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("杩斿洖", "Back")) }
+            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
             Spacer(Modifier.width(8.dp))
             Text(
-                text = lang.t("璋冭瘯", "Debug"),
+                text = lang.t("调试", "Debug"),
                 color = androidx.compose.ui.graphics.Color.White,
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
@@ -2596,11 +2675,11 @@ private fun DebugScreen(
                 .padding(8.dp),
         ) {
             Text(lang.t("鏃ュ織", "Logs"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
-            Text("${lang.t("妯″瀷", "Model")}: ${lang.pickMixed(state.modelStatus)}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
+            Text("${lang.t("模型", "Model")}: ${lang.pickMixed(state.modelStatus)}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
             job?.let {
                 Text("Job: ${it.state} progress=${(it.progress * 100f).roundToInt()}% error=${it.error.orEmpty()}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
             }
-            Text(lang.t("闃熷垪", "Queue"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+            Text(lang.t("队列", "Queue"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
             state.jobs.take(5).forEach {
                 Text(
                     "${it.state.label(lang)} ${(it.progress * 100f).roundToInt()}%  ${it.photoItem.displayName}",
@@ -2627,7 +2706,7 @@ private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modif
                 modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xff202326)),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(lang.t("鏆傛棤", "None"), color = androidx.compose.ui.graphics.Color.White)
+                Text(lang.t("暂无", "None"), color = androidx.compose.ui.graphics.Color.White)
             }
         } else {
             AsyncBitmapImage(uri, 2048, ContentScale.Fit, Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black))
