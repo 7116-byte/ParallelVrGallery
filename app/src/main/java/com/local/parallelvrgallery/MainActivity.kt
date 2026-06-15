@@ -1,6 +1,8 @@
 ﻿package com.local.parallelvrgallery
 
 import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Activity
 import android.app.Application
 import android.content.ContentUris
@@ -75,6 +77,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -109,6 +112,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.app.NotificationCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -364,6 +368,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val repository = PhotoRepository(app)
     private val cache = VrCacheManager(app)
     private val videoCache = VideoVrCacheManager(app)
+    private val videoNotifier = VideoGenerationNotifier(app)
     private val modelManager = ModelManager(app)
     private val generator = VrGenerator(app, cache, modelManager)
     private val videoGenerator = VideoVrGenerator(app, videoCache, generator)
@@ -505,7 +510,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                 }.mapCatching { body ->
                     val latest = Regex("\"tag_name\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1) ?: "unknown"
-                    val current = "v0.11.2"
+                    val current = "v0.11.3"
                     if (latest == current) {
                         lang.t("已是最新版本：$current", "Already up to date: $current")
                     } else {
@@ -836,6 +841,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private fun processVideoJob(next: VideoQueuedJob) {
         _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.GENERATING)) }
         upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f)
+        videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
         val started = System.currentTimeMillis()
         val result = runCatching {
             videoGenerator.generate(
@@ -851,6 +857,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 },
             ) { progress, frame, total, fps ->
                 upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps)
+                videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
             }
         }
         result.onSuccess { entry ->
@@ -865,10 +872,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
             upsertVideoJob(next.item, VideoVrState.READY, 1f, finishedAt = System.currentTimeMillis())
+            videoNotifier.show(next.item, 1, 1, indeterminate = false, status = "已完成")
             addLog("video ready ${next.item.displayName} ${entry.width}x${entry.height} ${elapsed}ms")
         }.onFailure { error ->
             _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
             upsertVideoJob(next.item, VideoVrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
+            videoNotifier.failed(next.item, error.message ?: "生成失败")
             addLog("video failed ${next.item.displayName}: ${error.message}")
         }
     }
@@ -1377,6 +1386,57 @@ private class VideoVrCacheManager(private val context: Context) {
             fps = values["fps"]?.toIntOrNull() ?: 30,
             createdAt = output.lastModified(),
         )
+    }
+}
+
+private class VideoGenerationNotifier(private val context: Context) {
+    private val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+    init {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val channel = NotificationChannel(CHANNEL_ID, "视频 VR 生成", NotificationManager.IMPORTANCE_LOW)
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    fun show(item: GalleryItem, frame: Int, total: Int, indeterminate: Boolean, status: String) {
+        if (!canNotify()) return
+        val progress = if (total > 0) ((frame.toFloat() / total.toFloat()) * 100f).roundToInt().coerceIn(0, 100) else 0
+        val text = if (total > 0) "$status：$frame / $total（$progress%）" else status
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setContentTitle("视频 VR 生成")
+            .setContentText("${item.displayName}  $text")
+            .setStyle(NotificationCompat.BigTextStyle().bigText("${item.displayName}\n$text"))
+            .setOnlyAlertOnce(true)
+            .setOngoing(status != "已完成")
+            .setProgress(if (total > 0) total else 100, frame.coerceAtLeast(0), indeterminate)
+            .build()
+        manager.notify(notificationId(item), notification)
+    }
+
+    fun failed(item: GalleryItem, message: String) {
+        if (!canNotify()) return
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setContentTitle("视频 VR 生成失败")
+            .setContentText("${item.displayName}：$message")
+            .setStyle(NotificationCompat.BigTextStyle().bigText("${item.displayName}\n$message"))
+            .setOnlyAlertOnce(true)
+            .setOngoing(false)
+            .build()
+        manager.notify(notificationId(item), notification)
+    }
+
+    private fun canNotify(): Boolean {
+        return Build.VERSION.SDK_INT < 33 ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun notificationId(item: GalleryItem): Int = (item.cacheKey.hashCode() and 0x7fffffff).coerceAtLeast(1)
+
+    companion object {
+        private const val CHANNEL_ID = "video_vr_generation"
     }
 }
 
@@ -2247,9 +2307,14 @@ private fun ManageScreen(
         }
         Spacer(Modifier.height(8.dp))
         if (tab == "videos") {
-            val videos = state.photos.filter { it.kind == MediaKind.VIDEO }
+            val videos = state.photos.filter { item ->
+                item.kind == MediaKind.VIDEO &&
+                    ((state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) != VideoVrState.NORMAL ||
+                        state.videoEntries.containsKey(item.cacheKey) ||
+                        state.videoJobs.any { it.item.cacheKey == item.cacheKey })
+            }
             if (videos.isEmpty()) {
-                Text(lang.t("暂无视频", "No videos"))
+                Text(lang.t("暂无生成中或已生成的视频", "No generating or generated videos"))
             } else {
                 LazyVerticalGrid(
                     columns = GridCells.Adaptive(130.dp),
@@ -2540,6 +2605,7 @@ private fun ViewerScreen(
                 VideoPlayer(
                     uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
                     modifier = Modifier.fillMaxSize(),
+                    controlsVisible = controlsVisible,
                     onSingleTap = { controlsVisible = !controlsVisible },
                 )
             } else {
@@ -2938,13 +3004,35 @@ private fun AsyncMediaThumbnail(kind: MediaKind, uri: Uri, maxSide: Int, content
 }
 
 @Composable
-private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, onSingleTap: () -> Unit) {
+private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, controlsVisible: Boolean, onSingleTap: () -> Unit) {
     val context = LocalContext.current
     var videoView by remember { mutableStateOf<VideoView?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var lastTapAt by remember { mutableStateOf(0L) }
     var longPressRunnable by remember { mutableStateOf<Runnable?>(null) }
     var longPressActive by remember { mutableStateOf(false) }
+    var progress by remember(uri) { mutableStateOf(0f) }
+    var positionText by remember(uri) { mutableStateOf("00:00 / 00:00") }
+    var hint by remember(uri) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(uri, videoView) {
+        while (true) {
+            val view = videoView
+            val duration = view?.duration?.takeIf { it > 0 } ?: 0
+            val position = view?.currentPosition ?: 0
+            progress = if (duration > 0) (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else 0f
+            positionText = "${formatDuration(position)} / ${formatDuration(duration)}"
+            delay(350)
+        }
+    }
+
+    LaunchedEffect(hint) {
+        if (hint != null) {
+            delay(900)
+            hint = null
+        }
+    }
+
     Box(modifier.background(androidx.compose.ui.graphics.Color.Black)) {
         AndroidView(
             factory = {
@@ -2979,6 +3067,7 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, onSingleTap: ()
                             longPressActive = false
                             val runnable = Runnable {
                                 longPressActive = true
+                                hint = "2 倍速"
                                 runCatching {
                                     if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(2f) }
                                 }
@@ -2999,6 +3088,7 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, onSingleTap: ()
                                 runCatching {
                                     if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(1f) }
                                 }
+                                hint = "恢复正常速度"
                                 longPressActive = false
                                 continue
                             }
@@ -3006,6 +3096,7 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, onSingleTap: ()
                                 val now = System.currentTimeMillis()
                                 if (now - lastTapAt < 280L) {
                                     view?.seekTo((view.currentPosition + 5_000).coerceAtMost(view.duration.coerceAtLeast(0)))
+                                    hint = "快进 5 秒"
                                     lastTapAt = 0L
                                 } else {
                                     lastTapAt = now
@@ -3016,7 +3107,43 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, onSingleTap: ()
                     }
                 },
         )
+        hint?.let {
+            Text(
+                text = it,
+                color = androidx.compose.ui.graphics.Color.White,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(androidx.compose.ui.graphics.Color(0xaa000000))
+                    .padding(horizontal = 18.dp, vertical = 10.dp),
+            )
+        }
+        if (controlsVisible) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(androidx.compose.ui.graphics.Color(0x99000000))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = androidx.compose.ui.graphics.Color(0xff8f6df5),
+                    trackColor = androidx.compose.ui.graphics.Color(0x55ffffff),
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(positionText, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
+            }
+        }
     }
+}
+
+private fun formatDuration(ms: Int): String {
+    val totalSeconds = (ms / 1000).coerceAtLeast(0)
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%02d:%02d".format(Locale.US, minutes, seconds)
 }
 
 private fun hasImagePermission(context: Context): Boolean {
@@ -3037,7 +3164,7 @@ private fun videoPermission(): String {
 
 private fun mediaPermissions(): Array<String> {
     return if (Build.VERSION.SDK_INT >= 33) {
-        arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+        arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.POST_NOTIFICATIONS)
     } else {
         arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
     }
