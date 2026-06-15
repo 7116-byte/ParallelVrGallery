@@ -332,6 +332,7 @@ data class LastGenerationInfo(
 data class UiState(
     val hasPermission: Boolean = false,
     val hasVideoPermission: Boolean = false,
+    val hasNotificationPermission: Boolean = false,
     val photos: List<PhotoItem> = emptyList(),
     val selectedIndex: Int? = null,
     val galleryAnchorIndex: Int = 0,
@@ -361,6 +362,7 @@ data class UiState(
     val lastGeneration: LastGenerationInfo? = null,
     val recentGenerations: List<LastGenerationInfo> = emptyList(),
     val updateStatus: String? = null,
+    val updateUrl: String? = null,
 )
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
@@ -388,6 +390,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         UiState(
             hasPermission = hasImagePermission(app),
             hasVideoPermission = hasVideoPermission(app),
+            hasNotificationPermission = hasNotificationPermission(app),
             settings = settingsStore.load(),
         ),
     )
@@ -399,8 +402,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun onPermissionChanged(imageGranted: Boolean, videoGranted: Boolean) {
-        _uiState.update { it.copy(hasPermission = imageGranted, hasVideoPermission = videoGranted) }
+    fun onPermissionChanged(imageGranted: Boolean, videoGranted: Boolean, notificationGranted: Boolean) {
+        _uiState.update { it.copy(hasPermission = imageGranted, hasVideoPermission = videoGranted, hasNotificationPermission = notificationGranted) }
         if (imageGranted) loadPhotos()
     }
 
@@ -497,9 +500,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun checkForUpdates() {
         val lang = _uiState.value.settings.language
-        _uiState.update { it.copy(updateStatus = lang.t("正在检查更新...", "Checking for updates...")) }
+        _uiState.update { it.copy(updateStatus = lang.t("正在检查更新...", "Checking for updates..."), updateUrl = null) }
         viewModelScope.launch {
-            val status = withContext(Dispatchers.IO) {
+            val result = withContext(Dispatchers.IO) {
                 runCatching {
                     val connection = (URL("https://api.github.com/repos/7116-byte/ParallelVrGallery/releases/latest").openConnection() as HttpURLConnection).apply {
                         connectTimeout = 12000
@@ -510,17 +513,20 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                 }.mapCatching { body ->
                     val latest = Regex("\"tag_name\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1) ?: "unknown"
-                    val current = "v0.11.3"
+                    val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
+                    val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
+                    val url = downloadUrl ?: pageUrl
+                    val current = "v0.11.4"
                     if (latest == current) {
-                        lang.t("已是最新版本：$current", "Already up to date: $current")
+                        lang.t("已是最新版本：$current", "Already up to date: $current") to url
                     } else {
-                        lang.t("发现新版本：$latest，当前：$current", "New version: $latest, current: $current")
+                        lang.t("发现新版本：$latest，当前：$current", "New version: $latest, current: $current") to url
                     }
                 }.getOrElse { error ->
-                    lang.t("检查更新失败：${error.message}", "Update check failed: ${error.message}")
+                    lang.t("检查更新失败：${error.message}", "Update check failed: ${error.message}") to null
                 }
             }
-            _uiState.update { it.copy(updateStatus = status) }
+            _uiState.update { it.copy(updateStatus = result.first, updateUrl = result.second) }
         }
     }
 
@@ -1970,6 +1976,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
         viewModel.onPermissionChanged(
             imageGranted = grants[imagePermission()] == true || hasImagePermission(context),
             videoGranted = grants[videoPermission()] == true || hasVideoPermission(context),
+            notificationGranted = grants[notificationPermission()] == true || hasNotificationPermission(context),
         )
     }
     val replaceLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
@@ -1979,11 +1986,13 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
         pendingReplaceIndexes = emptyList()
     }
 
-    LaunchedEffect(state.hasPermission, state.hasVideoPermission) {
+    LaunchedEffect(state.hasPermission, state.hasVideoPermission, state.hasNotificationPermission) {
         if (!state.hasPermission) {
             launcher.launch(mediaPermissions())
         } else if (!state.hasVideoPermission && Build.VERSION.SDK_INT >= 33) {
             launcher.launch(arrayOf(Manifest.permission.READ_MEDIA_VIDEO))
+        } else if (!state.hasNotificationPermission && Build.VERSION.SDK_INT >= 33) {
+            launcher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
         }
     }
 
@@ -2040,9 +2049,13 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 settings = state.settings,
                 modelStatus = state.modelStatus,
                 updateStatus = state.updateStatus,
+                updateUrl = state.updateUrl,
                 onBack = viewModel::closeSettings,
                 onChange = viewModel::updateSettings,
                 onCheckUpdate = viewModel::checkForUpdates,
+                onOpenUpdate = { url ->
+                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                },
             )
             AppScreen.Debug -> DebugScreen(
                 state = state,
@@ -2407,9 +2420,11 @@ private fun SettingsScreen(
     settings: AppSettings,
     modelStatus: String,
     updateStatus: String?,
+    updateUrl: String?,
     onBack: () -> Unit,
     onChange: (AppSettings) -> Unit,
     onCheckUpdate: () -> Unit,
+    onOpenUpdate: (String) -> Unit,
 ) {
     val lang = settings.language
     Column(
@@ -2448,6 +2463,12 @@ private fun SettingsScreen(
         updateStatus?.let {
             Spacer(Modifier.height(6.dp))
             Text(it, style = MaterialTheme.typography.bodySmall)
+        }
+        updateUrl?.let { url ->
+            Spacer(Modifier.height(6.dp))
+            Button(onClick = { onOpenUpdate(url) }) {
+                Text(lang.t("下载更新", "Download update"))
+            }
         }
         Spacer(Modifier.height(16.dp))
 
@@ -2602,10 +2623,13 @@ private fun ViewerScreen(
             val photo = state.photos[page]
             if (photo.kind == MediaKind.VIDEO) {
                 val generated = state.videoEntries[photo.cacheKey]
+                val job = state.videoJobs.firstOrNull { it.item.cacheKey == photo.cacheKey }
+                val videoState = state.videoStates[photo.cacheKey] ?: VideoVrState.NORMAL
                 VideoPlayer(
                     uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
                     modifier = Modifier.fillMaxSize(),
                     controlsVisible = controlsVisible,
+                    statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}",
                     onSingleTap = { controlsVisible = !controlsVisible },
                 )
             } else {
@@ -2652,47 +2676,29 @@ private fun ViewerScreen(
                 Spacer(Modifier.width(8.dp))
                 OutlinedButton(onClick = { onOpenDebug(pagerState.currentPage) }) { Text(lang.t("调试", "Debug")) }
             }
-            Column(
+            val current = state.photos.getOrNull(pagerState.currentPage)
+            if (current?.kind != MediaKind.VIDEO) Column(
                 modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
             ) {
-                val current = state.photos.getOrNull(pagerState.currentPage)
                 if (current != null) {
-                    if (current.kind == MediaKind.VIDEO) {
-                        val job = state.videoJobs.firstOrNull { it.item.cacheKey == current.cacheKey }
-                        val videoState = state.videoStates[current.cacheKey] ?: VideoVrState.NORMAL
+                    Text(
+                        text = imageLoadedLine(state, pagerState.currentPage, lang),
+                        color = androidx.compose.ui.graphics.Color.White,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Text(
+                        text = imageQueueLine(state, pagerState.currentPage, lang),
+                        color = androidx.compose.ui.graphics.Color.White,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    val recentLines = imageRecentGenerationLines(state, lang)
+                    repeat(3) { lineIndex ->
                         Text(
-                            text = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  FPS ${job?.fps ?: 30}",
+                            text = recentLines.getOrNull(lineIndex).orEmpty(),
                             color = androidx.compose.ui.graphics.Color.White,
-                            style = MaterialTheme.typography.bodySmall,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
                         )
-                    } else {
-                        Text(
-                            text = imageLoadedLine(state, pagerState.currentPage, lang),
-                            color = androidx.compose.ui.graphics.Color.White,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                        Text(
-                            text = imageQueueLine(state, pagerState.currentPage, lang),
-                            color = androidx.compose.ui.graphics.Color.White,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                        val recentLines = imageRecentGenerationLines(state, lang)
-                        repeat(3) { lineIndex ->
-                            Text(
-                                text = recentLines.getOrNull(lineIndex).orEmpty(),
-                                color = androidx.compose.ui.graphics.Color.White,
-                                style = MaterialTheme.typography.labelSmall,
-                                maxLines = 1,
-                            )
-                        }
-                    }
-                }
-                if (current?.kind == MediaKind.VIDEO) {
-                    state.modelProgress?.let {
-                        Text(lang.pickMixed(state.modelStatus), color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.bodySmall)
-                    }
-                    state.logs.take(3).forEach {
-                        Text(it, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 1)
                     }
                 }
             }
@@ -3004,7 +3010,13 @@ private fun AsyncMediaThumbnail(kind: MediaKind, uri: Uri, maxSide: Int, content
 }
 
 @Composable
-private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, controlsVisible: Boolean, onSingleTap: () -> Unit) {
+private fun VideoPlayer(
+    uri: Uri,
+    modifier: Modifier = Modifier,
+    controlsVisible: Boolean,
+    statusText: String,
+    onSingleTap: () -> Unit,
+) {
     val context = LocalContext.current
     var videoView by remember { mutableStateOf<VideoView?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
@@ -3014,12 +3026,14 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, controlsVisible
     var progress by remember(uri) { mutableStateOf(0f) }
     var positionText by remember(uri) { mutableStateOf("00:00 / 00:00") }
     var hint by remember(uri) { mutableStateOf<String?>(null) }
+    var isPlaying by remember(uri) { mutableStateOf(false) }
 
     LaunchedEffect(uri, videoView) {
         while (true) {
             val view = videoView
             val duration = view?.duration?.takeIf { it > 0 } ?: 0
             val position = view?.currentPosition ?: 0
+            isPlaying = view?.isPlaying == true
             progress = if (duration > 0) (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else 0f
             positionText = "${formatDuration(position)} / ${formatDuration(duration)}"
             delay(350)
@@ -3042,6 +3056,7 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, controlsVisible
                         mediaPlayer = player
                         player.isLooping = true
                         start()
+                        isPlaying = true
                     }
                     videoView = this
                 }
@@ -3095,7 +3110,19 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, controlsVisible
                             if (!moved) {
                                 val now = System.currentTimeMillis()
                                 if (now - lastTapAt < 280L) {
-                                    view?.seekTo((view.currentPosition + 5_000).coerceAtMost(view.duration.coerceAtLeast(0)))
+                                    val player = mediaPlayer
+                                    val duration = (player?.duration ?: view?.duration ?: 0).coerceAtLeast(0)
+                                    val current = (player?.currentPosition ?: view?.currentPosition ?: 0).coerceAtLeast(0)
+                                    val target = (current + 5_000).let { if (duration > 0) it.coerceAtMost(duration) else it }
+                                    runCatching {
+                                        if (Build.VERSION.SDK_INT >= 26 && player != null) {
+                                            player.seekTo(target.toLong(), MediaPlayer.SEEK_CLOSEST)
+                                        } else {
+                                            view?.seekTo(target)
+                                        }
+                                    }
+                                    progress = if (duration > 0) (target.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else progress
+                                    positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
                                     hint = "快进 5 秒"
                                     lastTapAt = 0L
                                 } else {
@@ -3126,14 +3153,37 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, controlsVisible
                     .background(androidx.compose.ui.graphics.Color(0x99000000))
                     .padding(horizontal = 12.dp, vertical = 8.dp),
             ) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            val view = videoView
+                            if (view?.isPlaying == true) {
+                                view.pause()
+                                isPlaying = false
+                            } else {
+                                view?.start()
+                                isPlaying = true
+                            }
+                        },
+                    ) {
+                        Text(if (isPlaying) "暂停" else "播放")
+                    }
+                    Text(
+                        text = "$statusText  $positionText",
+                        color = androidx.compose.ui.graphics.Color.White,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
                 LinearProgressIndicator(
                     progress = { progress },
                     modifier = Modifier.fillMaxWidth(),
                     color = androidx.compose.ui.graphics.Color(0xff8f6df5),
                     trackColor = androidx.compose.ui.graphics.Color(0x55ffffff),
                 )
-                Spacer(Modifier.height(4.dp))
-                Text(positionText, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
             }
         }
     }
@@ -3154,12 +3204,21 @@ private fun hasVideoPermission(context: Context): Boolean {
     return ContextCompat.checkSelfPermission(context, videoPermission()) == PackageManager.PERMISSION_GRANTED
 }
 
+private fun hasNotificationPermission(context: Context): Boolean {
+    return Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+}
+
 private fun imagePermission(): String {
     return if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
 }
 
 private fun videoPermission(): String {
     return if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_EXTERNAL_STORAGE
+}
+
+private fun notificationPermission(): String {
+    return if (Build.VERSION.SDK_INT >= 33) Manifest.permission.POST_NOTIFICATIONS else Manifest.permission.READ_EXTERNAL_STORAGE
 }
 
 private fun mediaPermissions(): Array<String> {
