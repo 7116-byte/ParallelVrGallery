@@ -19,6 +19,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -355,6 +356,7 @@ data class UiState(
     val videoJobs: List<VideoVrJob> = emptyList(),
     val lastGeneration: LastGenerationInfo? = null,
     val recentGenerations: List<LastGenerationInfo> = emptyList(),
+    val updateStatus: String? = null,
 )
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
@@ -486,6 +488,35 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun closeSettings() {
         _uiState.update { it.copy(settingsOpen = false) }
+    }
+
+    fun checkForUpdates() {
+        val lang = _uiState.value.settings.language
+        _uiState.update { it.copy(updateStatus = lang.t("正在检查更新...", "Checking for updates...")) }
+        viewModelScope.launch {
+            val status = withContext(Dispatchers.IO) {
+                runCatching {
+                    val connection = (URL("https://api.github.com/repos/7116-byte/ParallelVrGallery/releases/latest").openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 12000
+                        readTimeout = 12000
+                        requestMethod = "GET"
+                        setRequestProperty("Accept", "application/vnd.github+json")
+                    }
+                    connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                }.mapCatching { body ->
+                    val latest = Regex("\"tag_name\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1) ?: "unknown"
+                    val current = "v0.11.2"
+                    if (latest == current) {
+                        lang.t("已是最新版本：$current", "Already up to date: $current")
+                    } else {
+                        lang.t("发现新版本：$latest，当前：$current", "New version: $latest, current: $current")
+                    }
+                }.getOrElse { error ->
+                    lang.t("检查更新失败：${error.message}", "Update check failed: ${error.message}")
+                }
+            }
+            _uiState.update { it.copy(updateStatus = status) }
+        }
     }
 
     fun updateSettings(settings: AppSettings) {
@@ -1948,8 +1979,10 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
             AppScreen.Settings -> SettingsScreen(
                 settings = state.settings,
                 modelStatus = state.modelStatus,
+                updateStatus = state.updateStatus,
                 onBack = viewModel::closeSettings,
                 onChange = viewModel::updateSettings,
+                onCheckUpdate = viewModel::checkForUpdates,
             )
             AppScreen.Debug -> DebugScreen(
                 state = state,
@@ -2041,12 +2074,12 @@ private fun GalleryScreen(
                         Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                         OutlinedButton(onClick = onManage) { Text(lang.t("管理", "Manage")) }
                         Spacer(Modifier.width(8.dp))
-                        OutlinedButton(onClick = onSettings) { Text(lang.t("璁剧疆", "Settings")) }
+                        OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
                         Spacer(Modifier.width(8.dp))
-                        OutlinedButton(onClick = onRefresh) { Text(lang.t("鍒锋柊", "Refresh")) }
+                        OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
                     } else {
                         Text(lang.t("已选择 ${selectedKeys.size} 项", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("鍙栨秷", "Cancel")) }
+                        OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
                         Spacer(Modifier.width(8.dp))
                         Button(onClick = {
                             onSaveGenerated(selectedIndexes)
@@ -2056,7 +2089,7 @@ private fun GalleryScreen(
                         Button(onClick = {
                             onReplaceOriginal(selectedIndexes)
                             selectedKeys = emptySet()
-                        }) { Text(lang.t("鏇挎崲", "Replace")) }
+                        }) { Text(lang.t("替换", "Replace")) }
                     }
                 }
                 Spacer(Modifier.height(10.dp))
@@ -2273,7 +2306,7 @@ private fun ManageScreen(
                                     Text(lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
                                 }
                                 OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
-                                    Text(lang.t("鍒犻櫎", "Delete"))
+                                    Text(lang.t("删除", "Delete"))
                                 }
                             }
                             Spacer(Modifier.height(8.dp))
@@ -2308,8 +2341,10 @@ private fun ManageScreen(
 private fun SettingsScreen(
     settings: AppSettings,
     modelStatus: String,
+    updateStatus: String?,
     onBack: () -> Unit,
     onChange: (AppSettings) -> Unit,
+    onCheckUpdate: () -> Unit,
 ) {
     val lang = settings.language
     Column(
@@ -2322,10 +2357,10 @@ private fun SettingsScreen(
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
             Spacer(Modifier.width(12.dp))
-            Text(lang.t("璁剧疆", "Settings"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(lang.t("设置", "Settings"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(16.dp))
-        Text(lang.t("璇█", "Language"), fontWeight = FontWeight.Bold)
+        Text(lang.t("语言", "Language"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow {
             listOf(AppLanguage.ZH to "中文", AppLanguage.EN to "English").forEachIndexed { index, option ->
@@ -2341,6 +2376,14 @@ private fun SettingsScreen(
         Text(lang.t("模型", "Model"), fontWeight = FontWeight.Bold)
         Text(lang.pickMixed(modelStatus), style = MaterialTheme.typography.bodySmall)
         Text(lang.t("覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载。", "Updating over the existing app keeps the downloaded model; uninstalling usually removes it."), style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(10.dp))
+        OutlinedButton(onClick = onCheckUpdate) {
+            Text(lang.t("检查更新", "Check for updates"))
+        }
+        updateStatus?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(it, style = MaterialTheme.typography.bodySmall)
+        }
         Spacer(Modifier.height(16.dp))
 
         Text(lang.t("模型选择", "Model selection"), fontWeight = FontWeight.Bold)
@@ -2370,7 +2413,7 @@ private fun SettingsScreen(
                         else onChange(settings.copy(autoPrefetch = false, prefetchWindow = option.toInt()))
                     },
                     shape = SegmentedButtonDefaults.itemShape(index, options.size),
-                ) { Text(if (option == "auto") lang.t("鑷姩", "Auto") else option) }
+                ) { Text(if (option == "auto") lang.t("自动", "Auto") else option) }
             }
         }
         Spacer(Modifier.height(14.dp))
@@ -2494,7 +2537,11 @@ private fun ViewerScreen(
             val photo = state.photos[page]
             if (photo.kind == MediaKind.VIDEO) {
                 val generated = state.videoEntries[photo.cacheKey]
-                VideoPlayer(generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri, Modifier.fillMaxSize())
+                VideoPlayer(
+                    uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
+                    modifier = Modifier.fillMaxSize(),
+                    onSingleTap = { controlsVisible = !controlsVisible },
+                )
             } else {
                 val entry = state.entries[photo.cacheKey]
                 val vrState = state.states[photo.cacheKey] ?: VrState.NORMAL
@@ -2601,7 +2648,7 @@ private fun StatusOverlay(state: VrState, lang: AppLanguage, onRetry: () -> Unit
         } else if (state == VrState.FAILED) {
             Text(lang.t("生成失败", "Generation failed"), color = androidx.compose.ui.graphics.Color.White)
             Spacer(Modifier.height(12.dp))
-            Button(onClick = onRetry) { Text(lang.t("閲嶈瘯", "Retry")) }
+            Button(onClick = onRetry) { Text(lang.t("重试", "Retry")) }
         }
     }
 }
@@ -2661,7 +2708,7 @@ private fun DebugScreen(
             }
         } else {
             Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                DebugImagePanel(lang.t("鍘熷浘", "Source"), photo?.uri, Modifier.weight(1f), lang)
+                DebugImagePanel(lang.t("原图", "Source"), photo?.uri, Modifier.weight(1f), lang)
                 DebugImagePanel(lang.t("深度图", "Depth"), entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f), lang)
                 DebugImagePanel("VR SBS", entry?.let { Uri.fromFile(File(it.outputPath)) }, Modifier.weight(1f), lang)
             }
@@ -2674,7 +2721,7 @@ private fun DebugScreen(
                 .background(androidx.compose.ui.graphics.Color(0xff202326))
                 .padding(8.dp),
         ) {
-            Text(lang.t("鏃ュ織", "Logs"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
+            Text(lang.t("日志", "Logs"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
             Text("${lang.t("模型", "Model")}: ${lang.pickMixed(state.modelStatus)}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
             job?.let {
                 Text("Job: ${it.state} progress=${(it.progress * 100f).roundToInt()}% error=${it.error.orEmpty()}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
@@ -2891,15 +2938,20 @@ private fun AsyncMediaThumbnail(kind: MediaKind, uri: Uri, maxSide: Int, content
 }
 
 @Composable
-private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier) {
+private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier, onSingleTap: () -> Unit) {
     val context = LocalContext.current
     var videoView by remember { mutableStateOf<VideoView?>(null) }
+    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+    var lastTapAt by remember { mutableStateOf(0L) }
+    var longPressRunnable by remember { mutableStateOf<Runnable?>(null) }
+    var longPressActive by remember { mutableStateOf(false) }
     Box(modifier.background(androidx.compose.ui.graphics.Color.Black)) {
         AndroidView(
             factory = {
                 VideoView(context).apply {
                     setVideoURI(uri)
                     setOnPreparedListener { player ->
+                        mediaPlayer = player
                         player.isLooping = true
                         start()
                     }
@@ -2920,14 +2972,48 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier) {
             Modifier
                 .fillMaxSize()
                 .pointerInput(uri) {
-                    detectTapGestures(
-                        onDoubleTap = {
-                            videoView?.let { it.seekTo(it.currentPosition + 10_000) }
-                        },
-                        onLongPress = {
-                            videoView?.let { it.seekTo(it.currentPosition + 30_000) }
-                        },
-                    )
+                    awaitPointerEventScope {
+                        while (true) {
+                            val down = awaitPointerEvent().changes.firstOrNull { it.pressed } ?: continue
+                            val view = videoView
+                            longPressActive = false
+                            val runnable = Runnable {
+                                longPressActive = true
+                                runCatching {
+                                    if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(2f) }
+                                }
+                            }
+                            longPressRunnable = runnable
+                            view?.postDelayed(runnable, 450L)
+                            var moved = false
+                            val start = down.position
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val pressed = event.changes.filter { it.pressed }
+                                if (pressed.isNotEmpty() && (pressed.first().position - start).getDistance() > 18f) moved = true
+                                if (pressed.isEmpty()) break
+                            }
+                            longPressRunnable?.let { view?.removeCallbacks(it) }
+                            longPressRunnable = null
+                            if (longPressActive) {
+                                runCatching {
+                                    if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(1f) }
+                                }
+                                longPressActive = false
+                                continue
+                            }
+                            if (!moved) {
+                                val now = System.currentTimeMillis()
+                                if (now - lastTapAt < 280L) {
+                                    view?.seekTo((view.currentPosition + 5_000).coerceAtMost(view.duration.coerceAtLeast(0)))
+                                    lastTapAt = 0L
+                                } else {
+                                    lastTapAt = now
+                                    onSingleTap()
+                                }
+                            }
+                        }
+                    }
                 },
         )
     }
