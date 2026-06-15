@@ -241,7 +241,8 @@ enum class AppLanguage {
 
 data class AppSettings(
     val language: AppLanguage = AppLanguage.ZH,
-    val modelId: String = "depth_anything_v2_small_tflite",
+    val imageModelId: String = "depth_anything_v2_small_tflite",
+    val videoModelId: String = "depth_anything_v2_small_tflite",
     val autoPrefetch: Boolean = true,
     val prefetchWindow: Int = 2,
     val depthScale: Float = 40f,
@@ -257,7 +258,7 @@ data class AppSettings(
     val videoUseGpu: Boolean = false,
 ) {
     fun toParams(): VrGenerationParams = VrGenerationParams(
-        depthModel = modelId,
+        depthModel = imageModelId,
         depthScale = depthScale,
         blurRadius = blurRadius,
         fillRadius = fillRadius,
@@ -268,7 +269,7 @@ data class AppSettings(
     )
 
     fun toVideoParams(): VideoGenerationParams = VideoGenerationParams(
-        vr = toParams(),
+        vr = toParams().copy(depthModel = videoModelId),
         modelThreads = videoModelThreads,
         useGpu = videoUseGpu,
     )
@@ -461,7 +462,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     message = "已加载 ${imageItems.size} 张图片、${videoItems.size} 个视频 / ${imageItems.size} images, ${videoItems.size} videos loaded",
                     cacheVersions = cache.summaries(),
                     managedCacheItems = managedItems,
-                    modelStatus = modelManager.statusText(it.settings.modelId),
+                    modelStatus = modelStatusText(it.settings),
                 )
             }
         }
@@ -550,7 +551,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.14"
+                    val current = "v1.15"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -570,7 +571,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             it.copy(
                 settings = settings,
                 activePrefetchWindow = if (settings.autoPrefetch) 2 else settings.prefetchWindow,
-                modelStatus = modelManager.statusText(settings.modelId),
+                modelStatus = modelStatusText(settings),
             )
         }
         _uiState.value.selectedIndex?.let { refreshWindow(it) }
@@ -862,6 +863,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         val existing = _uiState.value.videoStates[item.cacheKey]
+        if (force && existing == VideoVrState.PAUSED) {
+            videoCache.clearFrameCache(item)
+        }
         if (!force && (existing == VideoVrState.QUEUED || existing == VideoVrState.GENERATING)) return
         synchronized(videoPending) {
             videoPending.removeAll { it.item.cacheKey == item.cacheKey }
@@ -945,7 +949,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.READY),
                     videoEntries = it.videoEntries + (next.item.cacheKey to entry),
                     modelProgress = null,
-                    modelStatus = modelManager.statusText(it.settings.modelId),
+                    modelStatus = modelStatusText(it.settings),
                     message = "视频 VR 已生成：${next.item.displayName}（${elapsed}ms）",
                 )
             }
@@ -1020,7 +1024,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update {
                 it.copy(
                     modelProgress = null,
-                    modelStatus = modelManager.statusText(it.settings.modelId),
+                    modelStatus = modelStatusText(it.settings),
                     cacheVersions = cache.summaries(),
                     lastGeneration = generationInfo,
                     recentGenerations = (listOf(generationInfo) + it.recentGenerations).take(3),
@@ -1117,6 +1121,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private fun addLog(line: String) {
         val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         _uiState.update { it.copy(logs = (listOf("$stamp $line") + it.logs).take(200)) }
+    }
+
+    private fun modelStatusText(settings: AppSettings): String {
+        val lang = settings.language
+        return listOf(
+            "${lang.t("图片模型", "Image model")}：${lang.pickMixed(modelManager.statusText(settings.imageModelId))}",
+            "${lang.t("视频模型", "Video model")}：${lang.pickMixed(modelManager.statusText(settings.videoModelId))}",
+        ).joinToString("\n")
     }
 }
 
@@ -1260,9 +1272,11 @@ private class SettingsStore(context: Context) {
                 .apply()
             false
         }
+        val oldModelId = prefs.getString("modelId", "depth_anything_v2_small_tflite") ?: "depth_anything_v2_small_tflite"
         return AppSettings(
             language = runCatching { AppLanguage.valueOf(prefs.getString("language", AppLanguage.ZH.name) ?: AppLanguage.ZH.name) }.getOrDefault(AppLanguage.ZH),
-            modelId = prefs.getString("modelId", "depth_anything_v2_small_tflite") ?: "depth_anything_v2_small_tflite",
+            imageModelId = prefs.getString("imageModelId", oldModelId) ?: oldModelId,
+            videoModelId = prefs.getString("videoModelId", oldModelId) ?: oldModelId,
             autoPrefetch = prefs.getBoolean("autoPrefetch", true),
             prefetchWindow = prefs.getInt("prefetchWindow", 2),
             depthScale = prefs.getFloat("depthScale", 40f),
@@ -1282,7 +1296,9 @@ private class SettingsStore(context: Context) {
     fun save(settings: AppSettings) {
         prefs.edit()
             .putString("language", settings.language.name)
-            .putString("modelId", settings.modelId)
+            .putString("modelId", settings.imageModelId)
+            .putString("imageModelId", settings.imageModelId)
+            .putString("videoModelId", settings.videoModelId)
             .putBoolean("autoPrefetch", settings.autoPrefetch)
             .putInt("prefetchWindow", settings.prefetchWindow)
             .putFloat("depthScale", settings.depthScale)
@@ -1476,6 +1492,10 @@ private class VideoVrCacheManager(private val context: Context) {
 
     fun delete(item: GalleryItem) {
         File(root, item.cacheKey).deleteRecursively()
+    }
+
+    fun clearFrameCache(item: GalleryItem) {
+        File(entryDir(item), "frames").deleteRecursively()
     }
 
     private fun readEntry(videoKey: String, dir: File): VideoCacheEntry? {
@@ -1907,6 +1927,7 @@ private class VideoVrGenerator(
                 "durationMs=$durationMs",
                 "fps=$fps",
                 "source=${item.displayName}",
+                "depthModel=${vrParams.depthModel}",
                 "maxLongEdge=${vrParams.maxLongEdge}",
             ).joinToString("\n"),
             Charsets.UTF_8,
@@ -2598,29 +2619,12 @@ private fun SettingsScreen(
         }
         Spacer(Modifier.height(16.dp))
 
-        Text(lang.t("模型选择", "Model selection"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            AvailableModels.forEach { spec ->
-                val selected = settings.modelId == spec.id
-                val buttonModifier = Modifier.fillMaxWidth()
-                if (selected) {
-                    Button(
-                        onClick = { onChange(settings.copy(modelId = spec.id, depthResolution = spec.inputSize)) },
-                        modifier = buttonModifier,
-                    ) {
-                        Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    }
-                } else {
-                    OutlinedButton(
-                        onClick = { onChange(settings.copy(modelId = spec.id, depthResolution = spec.inputSize)) },
-                        modifier = buttonModifier,
-                    ) {
-                        Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    }
-                }
-            }
-        }
+        ModelPicker(
+            title = lang.t("图片模型选择", "Image model"),
+            selectedModelId = settings.imageModelId,
+            lang = lang,
+            onSelect = { spec -> onChange(settings.copy(imageModelId = spec.id, depthResolution = spec.inputSize)) },
+        )
         Text(lang.t("实验模型首次使用会单独下载；如果模型输入输出不兼容，会在日志里显示失败原因。", "Experimental models download separately on first use. Shape incompatibility is reported in logs."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(16.dp))
 
@@ -2669,6 +2673,13 @@ private fun SettingsScreen(
         Text(lang.t("GPU 会尝试使用 TFLite GPU Delegate；不兼容时自动回退 CPU。", "GPU uses TFLite GPU Delegate when compatible and falls back to CPU if needed."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(12.dp))
         Text(lang.t("视频生成优化", "Video generation tuning"), fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        ModelPicker(
+            title = lang.t("视频模型选择", "Video model"),
+            selectedModelId = settings.videoModelId,
+            lang = lang,
+            onSelect = { spec -> onChange(settings.copy(videoModelId = spec.id)) },
+        )
         SettingInt(lang.t("视频模型 CPU 线程", "Video model CPU threads"), settings.videoModelThreads, listOf(1, 2, 4, 8)) {
             onChange(settings.copy(videoModelThreads = it))
         }
@@ -2683,8 +2694,9 @@ private fun SettingsScreen(
 
         Spacer(Modifier.height(12.dp))
         Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
-        val spec = modelSpec(settings.modelId)
-        Text(lang.t("${spec.inputSize} x ${spec.inputSize}（由当前模型固定；选择其他模型后这里会随模型变化）", "${spec.inputSize} x ${spec.inputSize}. Fixed by the selected model; choosing another model changes this value."), style = MaterialTheme.typography.bodySmall)
+        val imageSpec = modelSpec(settings.imageModelId)
+        val videoSpec = modelSpec(settings.videoModelId)
+        Text(lang.t("图片 ${imageSpec.inputSize} x ${imageSpec.inputSize}；视频 ${videoSpec.inputSize} x ${videoSpec.inputSize}（由所选模型固定）", "Image ${imageSpec.inputSize} x ${imageSpec.inputSize}; video ${videoSpec.inputSize} x ${videoSpec.inputSize}. Fixed by selected models."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(12.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
@@ -2694,6 +2706,37 @@ private fun SettingsScreen(
             Text(lang.t("反转深度", "Invert depth"))
         }
     }
+}
+
+@Composable
+private fun ModelPicker(
+    title: String,
+    selectedModelId: String,
+    lang: AppLanguage,
+    onSelect: (ModelSpec) -> Unit,
+) {
+    Text(title, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(6.dp))
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        AvailableModels.forEach { spec ->
+            val selected = selectedModelId == spec.id
+            val buttonModifier = Modifier.fillMaxWidth()
+            if (selected) {
+                Button(onClick = { onSelect(spec) }, modifier = buttonModifier) {
+                    Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
+            } else {
+                OutlinedButton(onClick = { onSelect(spec) }, modifier = buttonModifier) {
+                    Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+    Text(
+        lang.t("当前选择会在首次生成前自动下载。", "The selected model downloads automatically before first generation."),
+        style = MaterialTheme.typography.bodySmall,
+    )
+    Spacer(Modifier.height(10.dp))
 }
 
 @Composable
