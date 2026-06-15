@@ -118,6 +118,8 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -223,6 +225,14 @@ data class VrGenerationParams(
     val quality: Int = 94,
 )
 
+data class VideoGenerationParams(
+    val vr: VrGenerationParams,
+    val modelThreads: Int = 4,
+    val useGpu: Boolean = false,
+) {
+    fun toVrParams(): VrGenerationParams = vr.copy(modelThreads = modelThreads, useGpu = useGpu)
+}
+
 enum class AppLanguage {
     ZH,
     EN,
@@ -242,6 +252,8 @@ data class AppSettings(
     val generationWorkers: Int = 1,
     val modelThreads: Int = 4,
     val useGpu: Boolean = false,
+    val videoModelThreads: Int = 4,
+    val videoUseGpu: Boolean = false,
 ) {
     fun toParams(): VrGenerationParams = VrGenerationParams(
         depthModel = modelId,
@@ -252,6 +264,12 @@ data class AppSettings(
         maxLongEdge = maxLongEdge,
         modelThreads = modelThreads,
         useGpu = useGpu,
+    )
+
+    fun toVideoParams(): VideoGenerationParams = VideoGenerationParams(
+        vr = toParams(),
+        modelThreads = videoModelThreads,
+        useGpu = videoUseGpu,
     )
 }
 
@@ -276,6 +294,10 @@ private val AvailableModels = listOf(
 )
 
 private const val GENERATED_VR_PREFIX = "PVG_VR_"
+
+private object AppWorkScopes {
+    val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+}
 
 private fun modelSpec(id: String): ModelSpec = AvailableModels.firstOrNull { it.id == id } ?: AvailableModels.first()
 
@@ -319,6 +341,7 @@ data class VideoVrJob(
     val currentFrame: Int = 0,
     val totalFrames: Int = 0,
     val fps: Int = 30,
+    val avgFrameMs: Long = 0L,
     val startedAt: Long? = null,
     val finishedAt: Long? = null,
     val error: String? = null,
@@ -516,7 +539,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v0.11.4"
+                    val current = "v1.12"
                     if (latest == current) {
                         lang.t("已是最新版本：$current", "Already up to date: $current") to url
                     } else {
@@ -733,13 +756,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (!_uiState.value.vrMode) return
         if (photos.isEmpty()) return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
-        val desiredCount = _uiState.value.activePrefetchWindow * 2
+        val window = _uiState.value.activePrefetchWindow.coerceAtMost(8)
+        val desiredCount = window * 2
         val targets = mutableListOf<Pair<Int, Int>>()
         if (includeCurrent) {
             if (photos.getOrNull(index)?.kind == MediaKind.IMAGE) enqueuePhoto(index, priority = 0, force = false, current = true)
         }
         var distance = 1
-        while (targets.size < desiredCount && distance < photos.size) {
+        while (targets.size < desiredCount && distance <= window && distance < photos.size) {
             val next = index + distance
             val prev = index - distance
             if (next in photos.indices && photos[next].kind == MediaKind.IMAGE && cache.findEntry(photos[next], currentVersion) == null) targets += next to distance * 2 - 1
@@ -834,7 +858,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private fun startVideoWorkers() {
         videoWorkers.removeAll { !it.isActive }
         repeat((3 - videoWorkers.size).coerceAtLeast(0)) {
-            videoWorkers += viewModelScope.launch(Dispatchers.IO) {
+            videoWorkers += AppWorkScopes.video.launch {
                 while (true) {
                     val next = synchronized(videoPending) { videoPending.poll() } ?: break
                     processVideoJob(next)
@@ -849,10 +873,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f)
         videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
         val started = System.currentTimeMillis()
+        val firstFrameTimes = mutableListOf<Long>()
+        var lastFrameAt = System.currentTimeMillis()
         val result = runCatching {
             videoGenerator.generate(
                 next.item,
-                _uiState.value.settings.toParams(),
+                _uiState.value.settings.toVideoParams(),
                 onModelProgress = { progress ->
                     _uiState.update {
                         it.copy(
@@ -862,7 +888,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     }
                 },
             ) { progress, frame, total, fps ->
-                upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps)
+                val now = System.currentTimeMillis()
+                if (frame > 0 && firstFrameTimes.size < 3) firstFrameTimes += (now - lastFrameAt).coerceAtLeast(0L)
+                lastFrameAt = now
+                val avgFrameMs = if (firstFrameTimes.isNotEmpty()) firstFrameTimes.average().roundToInt().toLong() else 0L
+                upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, avgFrameMs = avgFrameMs)
                 videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
             }
         }
@@ -1013,6 +1043,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         currentFrame: Int = 0,
         totalFrames: Int = 0,
         fps: Int = 30,
+        avgFrameMs: Long = 0L,
         finishedAt: Long? = null,
         error: String? = null,
     ) {
@@ -1025,6 +1056,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 currentFrame = currentFrame,
                 totalFrames = totalFrames,
                 fps = fps,
+                avgFrameMs = avgFrameMs,
                 startedAt = current.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }?.startedAt ?: System.currentTimeMillis(),
                 finishedAt = finishedAt,
                 error = error,
@@ -1173,6 +1205,8 @@ private class SettingsStore(context: Context) {
             generationWorkers = prefs.getInt("generationWorkers", 1),
             modelThreads = prefs.getInt("modelThreads", 4),
             useGpu = prefs.getBoolean("useGpu", false),
+            videoModelThreads = prefs.getInt("videoModelThreads", 4),
+            videoUseGpu = prefs.getBoolean("videoUseGpu", false),
         )
     }
 
@@ -1191,6 +1225,8 @@ private class SettingsStore(context: Context) {
             .putInt("generationWorkers", settings.generationWorkers)
             .putInt("modelThreads", settings.modelThreads)
             .putBoolean("useGpu", settings.useGpu)
+            .putInt("videoModelThreads", settings.videoModelThreads)
+            .putBoolean("videoUseGpu", settings.videoUseGpu)
             .apply()
     }
 }
@@ -1408,12 +1444,13 @@ private class VideoGenerationNotifier(private val context: Context) {
     fun show(item: GalleryItem, frame: Int, total: Int, indeterminate: Boolean, status: String) {
         if (!canNotify()) return
         val progress = if (total > 0) ((frame.toFloat() / total.toFloat()) * 100f).roundToInt().coerceIn(0, 100) else 0
-        val text = if (total > 0) "$status：$frame / $total（$progress%）" else status
+        val text = if (total > 0) "$progress%  $frame / $total  $status" else status
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("视频 VR 生成")
-            .setContentText("${item.displayName}  $text")
-            .setStyle(NotificationCompat.BigTextStyle().bigText("${item.displayName}\n$text"))
+            .setContentTitle("视频 VR 生成：$text")
+            .setContentText(item.displayName)
+            .setSubText(if (total > 0) "$progress%" else null)
+            .setStyle(NotificationCompat.BigTextStyle().bigText("$text\n${item.displayName}"))
             .setOnlyAlertOnce(true)
             .setOngoing(status != "已完成")
             .setProgress(if (total > 0) total else 100, frame.coerceAtLeast(0), indeterminate)
@@ -1738,11 +1775,13 @@ private class VideoVrGenerator(
 ) {
     fun generate(
         item: GalleryItem,
-        params: VrGenerationParams,
+        params: VideoGenerationParams,
         onModelProgress: (Float) -> Unit,
         onProgress: (Float, Int, Int, Int) -> Unit,
     ): VideoCacheEntry {
+        val vrParams = params.toVrParams()
         val dir = cache.entryDir(item)
+        val framesDir = File(dir, "frames").also { it.mkdirs() }
         val output = File(dir, "vr_sbs.mp4")
         val logPath = File(dir, "job.log")
         val metaPath = File(dir, "video_params.txt")
@@ -1762,7 +1801,14 @@ private class VideoVrGenerator(
         mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames")
 
         val first = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST) ?: error("Unable to decode first video frame")
-        val firstSbs = frameGenerator.generateSbsBitmap(first.copy(Bitmap.Config.ARGB_8888, false), params, onModelProgress)
+        val firstFrameCache = File(framesDir, "frame_000000.jpg")
+        val firstSbs = if (firstFrameCache.exists()) {
+            BitmapFactory.decodeFile(firstFrameCache.absolutePath) ?: frameGenerator.generateSbsBitmap(first.copy(Bitmap.Config.ARGB_8888, false), vrParams, onModelProgress)
+        } else {
+            frameGenerator.generateSbsBitmap(first.copy(Bitmap.Config.ARGB_8888, false), vrParams, onModelProgress).also { bitmap ->
+                FileOutputStream(firstFrameCache).use { bitmap.compress(Bitmap.CompressFormat.JPEG, vrParams.quality, it) }
+            }
+        }
         val width = even(firstSbs.width)
         val height = even(firstSbs.height)
         first.recycle()
@@ -1772,12 +1818,13 @@ private class VideoVrGenerator(
             item = item,
             retriever = retriever,
             firstSbs = firstSbs,
+            framesDir = framesDir,
             output = output,
             width = width,
             height = height,
             fps = fps,
             totalFrames = totalFrames,
-            params = params,
+            params = vrParams,
             onModelProgress = onModelProgress,
             onProgress = onProgress,
             mark = ::mark,
@@ -1791,7 +1838,7 @@ private class VideoVrGenerator(
                 "durationMs=$durationMs",
                 "fps=$fps",
                 "source=${item.displayName}",
-                "maxLongEdge=${params.maxLongEdge}",
+                "maxLongEdge=${vrParams.maxLongEdge}",
             ).joinToString("\n"),
             Charsets.UTF_8,
         )
@@ -1803,6 +1850,7 @@ private class VideoVrGenerator(
         item: GalleryItem,
         retriever: MediaMetadataRetriever,
         firstSbs: Bitmap,
+        framesDir: File,
         output: File,
         width: Int,
         height: Int,
@@ -1858,17 +1906,24 @@ private class VideoVrGenerator(
         }
 
         try {
+            fun cachedOrGenerateFrame(frame: Int): Bitmap? {
+                val frameCache = File(framesDir, "frame_${frame.toString().padStart(6, '0')}.jpg")
+                BitmapFactory.decodeFile(frameCache.absolutePath)?.let { return it }
+                val timeUs = frame * 1_000_000L / fps
+                val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: return null
+                val generated = frameGenerator.generateSbsBitmap(bitmap.copy(Bitmap.Config.ARGB_8888, false), params, onModelProgress)
+                FileOutputStream(frameCache).use { generated.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
+                bitmap.recycle()
+                return generated
+            }
+
             for (frame in 0 until totalFrames) {
                 val sbs = if (frame == 0) {
                     firstSbs
                 } else {
-                    val timeUs = frame * 1_000_000L / fps
-                    val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                        ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                        ?: continue
-                    val generated = frameGenerator.generateSbsBitmap(bitmap.copy(Bitmap.Config.ARGB_8888, false), params, onModelProgress)
-                    bitmap.recycle()
-                    generated
+                    cachedOrGenerateFrame(frame) ?: continue
                 }
                 drawBitmapToSurface(surface, sbs, width, height)
                 if (frame != 0) sbs.recycle()
@@ -2529,6 +2584,19 @@ private fun SettingsScreen(
             Text(lang.t("尝试 GPU 加速", "Try GPU acceleration"))
         }
         Text(lang.t("GPU 会尝试使用 TFLite GPU Delegate；不兼容时自动回退 CPU。", "GPU uses TFLite GPU Delegate when compatible and falls back to CPU if needed."), style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(12.dp))
+        Text(lang.t("视频生成优化", "Video generation tuning"), fontWeight = FontWeight.Bold)
+        SettingInt(lang.t("视频模型 CPU 线程", "Video model CPU threads"), settings.videoModelThreads, listOf(1, 2, 4, 8)) {
+            onChange(settings.copy(videoModelThreads = it))
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = settings.videoUseGpu,
+                onCheckedChange = { onChange(settings.copy(videoUseGpu = it)) },
+            )
+            Text(lang.t("视频生成尝试 GPU 加速", "Try GPU for video generation"))
+        }
+        Text(lang.t("视频设置只影响视频 VR 生成；图片仍使用上面的图片模型设置。", "Video settings only affect video VR generation; images use the image settings above."), style = MaterialTheme.typography.bodySmall)
 
         Spacer(Modifier.height(12.dp))
         Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
@@ -2629,7 +2697,7 @@ private fun ViewerScreen(
                     uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
                     modifier = Modifier.fillMaxSize(),
                     controlsVisible = controlsVisible,
-                    statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}",
+                    statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  帧生成${job?.avgFrameMs ?: 0}ms",
                     onSingleTap = { controlsVisible = !controlsVisible },
                 )
             } else {
@@ -2665,7 +2733,13 @@ private fun ViewerScreen(
                 Button(onClick = { onVr(pagerState.currentPage) }) {
                     Text(
                         if (currentItem?.kind == MediaKind.VIDEO) {
-                            lang.t("加入 VR 队列", "Add to VR queue")
+                            when (state.videoStates[currentItem.cacheKey] ?: VideoVrState.NORMAL) {
+                                VideoVrState.NORMAL -> lang.t("加入 VR 队列", "Add to VR queue")
+                                VideoVrState.QUEUED -> lang.t("已在队列", "Queued")
+                                VideoVrState.GENERATING -> lang.t("生成中", "Generating")
+                                VideoVrState.READY -> lang.t("已生成", "Ready")
+                                VideoVrState.FAILED -> lang.t("重试视频 VR", "Retry video VR")
+                            }
                         } else if (state.vrMode) {
                             lang.t("关闭 VR", "VR Off")
                         } else {
@@ -3169,13 +3243,14 @@ private fun VideoPlayer(
                         Text(if (isPlaying) "暂停" else "播放")
                     }
                     Text(
-                        text = "$statusText  $positionText",
+                        text = statusText,
                         color = androidx.compose.ui.graphics.Color.White,
                         style = MaterialTheme.typography.labelSmall,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
                     )
+                    Text(positionText, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
                 }
                 Spacer(Modifier.height(6.dp))
                 LinearProgressIndicator(
