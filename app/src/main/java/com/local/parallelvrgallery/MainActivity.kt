@@ -1,4 +1,4 @@
-package com.local.parallelvrgallery
+﻿package com.local.parallelvrgallery
 
 import android.Manifest
 import android.app.Activity
@@ -13,12 +13,22 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageDecoder
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
+import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
+import android.util.Size
+import android.view.MotionEvent
+import android.view.Surface
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.widget.VideoView
 import androidx.activity.result.IntentSenderRequest
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
@@ -39,6 +49,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -94,6 +105,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
@@ -142,6 +154,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+enum class MediaKind {
+    IMAGE,
+    VIDEO,
+}
+
 data class PhotoItem(
     val id: Long,
     val uri: Uri,
@@ -150,14 +167,25 @@ data class PhotoItem(
     val height: Int,
     val size: Long,
     val modifiedTime: Long,
+    val kind: MediaKind = MediaKind.IMAGE,
 ) {
     val cacheKey: String
-        get() = "${id}_${size}_${modifiedTime}"
+        get() = if (kind == MediaKind.IMAGE) "${id}_${size}_${modifiedTime}" else "VIDEO_${id}_${size}_${modifiedTime}"
 }
+
+typealias GalleryItem = PhotoItem
 
 enum class VrState {
     NORMAL,
     PAUSED,
+    QUEUED,
+    GENERATING,
+    READY,
+    FAILED,
+}
+
+enum class VideoVrState {
+    NORMAL,
     QUEUED,
     GENERATING,
     READY,
@@ -258,6 +286,17 @@ data class ManagedCacheItem(
     val entry: VrCacheEntry,
 )
 
+data class VideoCacheEntry(
+    val videoKey: String,
+    val outputPath: String,
+    val logPath: String,
+    val width: Int,
+    val height: Int,
+    val durationMs: Long,
+    val fps: Int,
+    val createdAt: Long,
+)
+
 data class VrJob(
     val photoItem: PhotoItem,
     val priority: Int,
@@ -266,6 +305,23 @@ data class VrJob(
     val startedAt: Long? = null,
     val finishedAt: Long? = null,
     val error: String? = null,
+)
+
+data class VideoVrJob(
+    val item: GalleryItem,
+    val state: VideoVrState,
+    val progress: Float,
+    val currentFrame: Int = 0,
+    val totalFrames: Int = 0,
+    val fps: Int = 30,
+    val startedAt: Long? = null,
+    val finishedAt: Long? = null,
+    val error: String? = null,
+)
+
+data class LastGenerationInfo(
+    val relativeIndex: Int,
+    val elapsedMs: Long,
 )
 
 data class UiState(
@@ -289,24 +345,33 @@ data class UiState(
     val message: String? = null,
     val debugIndex: Int? = null,
     val modelProgress: Float? = null,
-    val modelStatus: String = "模型未下载 / Model not downloaded",
+    val modelStatus: String = "妯″瀷鏈笅杞?/ Model not downloaded",
     val blockingMessage: String? = null,
     val cacheVersions: List<CacheVersionSummary> = emptyList(),
     val managedCacheItems: List<ManagedCacheItem> = emptyList(),
+    val videoStates: Map<String, VideoVrState> = emptyMap(),
+    val videoEntries: Map<String, VideoCacheEntry> = emptyMap(),
+    val videoJobs: List<VideoVrJob> = emptyList(),
+    val lastGeneration: LastGenerationInfo? = null,
 )
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application
     private val repository = PhotoRepository(app)
     private val cache = VrCacheManager(app)
+    private val videoCache = VideoVrCacheManager(app)
     private val modelManager = ModelManager(app)
     private val generator = VrGenerator(app, cache, modelManager)
+    private val videoGenerator = VideoVrGenerator(app, videoCache, generator)
     private val settingsStore = SettingsStore(app)
     private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
     private val currentPending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
+    private val videoPending = PriorityQueue<VideoQueuedJob>(compareBy<VideoQueuedJob> { it.sequence })
     private val paused = linkedMapOf<String, QueuedJob>()
     private var sequence = 0L
+    private var videoSequence = 0L
     private val workers = mutableListOf<Job>()
+    private val videoWorkers = mutableListOf<Job>()
     private var currentWorker: Job? = null
     private var activeKey: String? = null
 
@@ -327,16 +392,21 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun loadPhotos() {
         viewModelScope.launch {
             _uiState.update { it.copy(loading = true, message = null) }
-            val photos = withContext(Dispatchers.IO) { repository.loadImages() }
-            val entries = withContext(Dispatchers.IO) { photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey } }
-            val managedItems = withContext(Dispatchers.IO) { cache.allEntries(photos) }
+            val photos = withContext(Dispatchers.IO) { repository.loadMedia() }
+            val imageItems = photos.filter { it.kind == MediaKind.IMAGE }
+            val videoItems = photos.filter { it.kind == MediaKind.VIDEO }
+            val entries = withContext(Dispatchers.IO) { imageItems.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey } }
+            val managedItems = withContext(Dispatchers.IO) { cache.allEntries(imageItems) }
+            val videoEntries = withContext(Dispatchers.IO) { videoItems.mapNotNull { videoCache.findEntry(it) }.associateBy { it.videoKey } }
             _uiState.update {
                 it.copy(
                     photos = photos,
                     entries = entries,
-                    states = photos.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
+                    states = imageItems.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
+                    videoStates = videoItems.associate { item -> item.cacheKey to if (videoEntries.containsKey(item.cacheKey)) VideoVrState.READY else VideoVrState.NORMAL },
+                    videoEntries = videoEntries,
                     loading = false,
-                    message = "已加载 ${photos.size} 张图片 / ${photos.size} images loaded",
+                    message = "宸插姞杞?${photos.size} 寮犲浘鐗?/ ${photos.size} images loaded",
                     cacheVersions = cache.summaries(),
                     managedCacheItems = managedItems,
                     modelStatus = modelManager.statusText(it.settings.modelId),
@@ -346,6 +416,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun openPhoto(index: Int, firstVisibleIndex: Int = index, firstVisibleOffset: Int = 0) {
+        val item = _uiState.value.photos.getOrNull(index)
         _uiState.update {
             it.copy(
                 selectedIndex = index,
@@ -357,7 +428,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 message = null,
             )
         }
-        enqueueWindow(index, includeCurrent = true)
+        if (item?.kind == MediaKind.IMAGE) enqueueWindow(index, includeCurrent = true)
     }
 
     fun openGeneratedPhoto(index: Int, entry: VrCacheEntry? = null) {
@@ -370,6 +441,19 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 vrMode = true,
                 manageOpen = false,
                 entries = if (photo != null && entry != null) it.entries + (photo.cacheKey to entry) else it.entries,
+                message = null,
+            )
+        }
+    }
+
+    fun openGeneratedVideo(index: Int) {
+        _uiState.update {
+            it.copy(
+                selectedIndex = index,
+                galleryAnchorIndex = index,
+                galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
+                vrMode = true,
+                manageOpen = false,
                 message = null,
             )
         }
@@ -411,12 +495,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun onPagerIndexChanged(index: Int) {
         _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow) }
-        if (_uiState.value.vrMode) {
+        if (_uiState.value.vrMode && _uiState.value.photos.getOrNull(index)?.kind == MediaKind.IMAGE) {
             enqueueWindow(index, includeCurrent = true)
         }
     }
 
     fun requestVr(index: Int) {
+        val item = _uiState.value.photos.getOrNull(index) ?: return
+        if (item.kind == MediaKind.VIDEO) {
+            enqueueVideo(item)
+            return
+        }
         if (_uiState.value.vrMode) {
             stopVr()
         } else {
@@ -434,8 +523,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun retry(index: Int) {
-        enqueuePhoto(index, priority = 0, force = true, current = true)
-        startCurrentWorker()
+        val item = _uiState.value.photos.getOrNull(index) ?: return
+        if (item.kind == MediaKind.VIDEO) {
+            enqueueVideo(item, force = true)
+        } else {
+            enqueuePhoto(index, priority = 0, force = true, current = true)
+            startCurrentWorker()
+        }
     }
 
     fun exportDebug(context: Context, index: Int) {
@@ -446,7 +540,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 DebugExporter(context, cache).export(photo, entry)
             }
             if (result == null) {
-                _uiState.update { it.copy(message = "当前图片还没有可导出的 VR 缓存 / No READY cache yet") }
+                _uiState.update { it.copy(message = "褰撳墠鍥剧墖杩樻病鏈夊彲瀵煎嚭鐨?VR 缂撳瓨 / No READY cache yet") }
             } else {
                 val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", result)
                 val intent = Intent(Intent.ACTION_SEND).apply {
@@ -454,8 +548,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     putExtra(Intent.EXTRA_STREAM, uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                context.startActivity(Intent.createChooser(intent, "导出调试包 / Export debug package"))
-                _uiState.update { it.copy(message = "调试包已创建 / Debug package created: ${result.name}") }
+                context.startActivity(Intent.createChooser(intent, "瀵煎嚭璋冭瘯鍖?/ Export debug package"))
+                _uiState.update { it.copy(message = "璋冭瘯鍖呭凡鍒涘缓 / Debug package created: ${result.name}") }
             }
         }
     }
@@ -487,7 +581,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     states = photos.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
                     cacheVersions = cache.summaries(),
                     managedCacheItems = cache.allEntries(photos),
-                    message = "已删除版本 / Deleted version: $version",
+                    message = "宸插垹闄ょ増鏈?/ Deleted version: $version",
                 )
             }
         }
@@ -514,11 +608,40 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 }
                 when {
                     saved == 0 -> lang.t("没有可保存的已生成 VR 图", "No generated VR images to save")
-                    failed == 0 -> lang.t("已保存 $saved 张到系统图库", "Saved $saved images to system gallery")
+                    failed == 0 -> lang.t("宸蹭繚瀛?$saved 寮犲埌绯荤粺鍥惧簱", "Saved $saved images to system gallery")
                     else -> lang.t("已保存 $saved 张，失败 $failed 张", "Saved $saved images, failed $failed")
                 }
             }
             _uiState.update { it.copy(blockingMessage = null, message = message) }
+        }
+    }
+
+    fun saveGeneratedVideo(context: Context, index: Int) {
+        val item = _uiState.value.photos.getOrNull(index) ?: return
+        val entry = _uiState.value.videoEntries[item.cacheKey] ?: return
+        viewModelScope.launch {
+            val message = withContext(Dispatchers.IO) {
+                runCatching {
+                    saveVideoToGallery(context, File(entry.outputPath), "${GENERATED_VR_PREFIX}${item.cacheKey}_${item.displayName}")
+                    "视频已保存到系统相册 / Video saved to system gallery"
+                }.getOrElse { "视频保存失败：${it.message} / Video save failed" }
+            }
+            _uiState.update { it.copy(message = message) }
+        }
+    }
+
+    fun deleteGeneratedVideo(index: Int) {
+        val item = _uiState.value.photos.getOrNull(index) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            videoCache.delete(item)
+            _uiState.update {
+                it.copy(
+                    videoEntries = it.videoEntries - item.cacheKey,
+                    videoStates = it.videoStates + (item.cacheKey to VideoVrState.NORMAL),
+                    videoJobs = it.videoJobs.filterNot { job -> job.item.cacheKey == item.cacheKey },
+                    message = "已删除视频 VR 缓存：${item.displayName}",
+                )
+            }
         }
     }
 
@@ -541,7 +664,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     }.onFailure { failed++ }
                 }
                 when {
-                    replaced == 0 -> lang.t("替换失败：系统可能不允许写入这些原图", "Replace failed: Android may not allow writing these originals")
+                    replaced == 0 -> lang.t("鏇挎崲澶辫触锛氱郴缁熷彲鑳戒笉鍏佽鍐欏叆杩欎簺鍘熷浘", "Replace failed: Android may not allow writing these originals")
                     failed == 0 -> lang.t("已替换 $replaced 张并尝试保留原时间", "Replaced $replaced images and tried to keep timestamps")
                     else -> lang.t("已替换 $replaced 张，失败 $failed 张", "Replaced $replaced images, failed $failed")
                 }
@@ -563,14 +686,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val desiredCount = _uiState.value.activePrefetchWindow * 2
         val targets = mutableListOf<Pair<Int, Int>>()
         if (includeCurrent) {
-            enqueuePhoto(index, priority = 0, force = false, current = true)
+            if (photos.getOrNull(index)?.kind == MediaKind.IMAGE) enqueuePhoto(index, priority = 0, force = false, current = true)
         }
         var distance = 1
         while (targets.size < desiredCount && distance < photos.size) {
             val next = index + distance
             val prev = index - distance
-            if (next in photos.indices && cache.findEntry(photos[next], currentVersion) == null) targets += next to distance * 2 - 1
-            if (targets.size < desiredCount && prev in photos.indices && cache.findEntry(photos[prev], currentVersion) == null) targets += prev to distance * 2
+            if (next in photos.indices && photos[next].kind == MediaKind.IMAGE && cache.findEntry(photos[next], currentVersion) == null) targets += next to distance * 2 - 1
+            if (targets.size < desiredCount && prev in photos.indices && photos[prev].kind == MediaKind.IMAGE && cache.findEntry(photos[prev], currentVersion) == null) targets += prev to distance * 2
             distance++
         }
 
@@ -590,6 +713,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun enqueuePhoto(index: Int, priority: Int, force: Boolean, current: Boolean = false) {
         val photo = _uiState.value.photos.getOrNull(index) ?: return
+        if (photo.kind != MediaKind.IMAGE) return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
         if (!force && cache.findEntry(photo, currentVersion) != null) {
             markState(photo.cacheKey, VrState.READY)
@@ -639,6 +763,77 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    private fun enqueueVideo(item: GalleryItem, force: Boolean = false) {
+        if (item.kind != MediaKind.VIDEO) return
+        if (!force && videoCache.findEntry(item) != null) {
+            _uiState.update { it.copy(videoStates = it.videoStates + (item.cacheKey to VideoVrState.READY)) }
+            return
+        }
+        val existing = _uiState.value.videoStates[item.cacheKey]
+        if (!force && (existing == VideoVrState.QUEUED || existing == VideoVrState.GENERATING)) return
+        synchronized(videoPending) {
+            videoPending.removeAll { it.item.cacheKey == item.cacheKey }
+            videoPending.add(VideoQueuedJob(item, videoSequence++))
+        }
+        upsertVideoJob(item, VideoVrState.QUEUED, 0f)
+        _uiState.update { it.copy(videoStates = it.videoStates + (item.cacheKey to VideoVrState.QUEUED), message = "视频已加入 VR 队列：${item.displayName}") }
+        addLog("video queued ${item.displayName}")
+        startVideoWorkers()
+    }
+
+    private fun startVideoWorkers() {
+        videoWorkers.removeAll { !it.isActive }
+        repeat((3 - videoWorkers.size).coerceAtLeast(0)) {
+            videoWorkers += viewModelScope.launch(Dispatchers.IO) {
+                while (true) {
+                    val next = synchronized(videoPending) { videoPending.poll() } ?: break
+                    processVideoJob(next)
+                    delay(100)
+                }
+            }
+        }
+    }
+
+    private fun processVideoJob(next: VideoQueuedJob) {
+        _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.GENERATING)) }
+        upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f)
+        val started = System.currentTimeMillis()
+        val result = runCatching {
+            videoGenerator.generate(
+                next.item,
+                _uiState.value.settings.toParams(),
+                onModelProgress = { progress ->
+                    _uiState.update {
+                        it.copy(
+                            modelProgress = progress,
+                            modelStatus = if (progress < 1f) "姝ｅ湪涓嬭浇妯″瀷 / Downloading model ${(progress * 100f).roundToInt()}%" else "妯″瀷宸插氨缁?/ Model ready",
+                        )
+                    }
+                },
+            ) { progress, frame, total, fps ->
+                upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps)
+            }
+        }
+        result.onSuccess { entry ->
+            val elapsed = System.currentTimeMillis() - started
+            _uiState.update {
+                it.copy(
+                    videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.READY),
+                    videoEntries = it.videoEntries + (next.item.cacheKey to entry),
+                    modelProgress = null,
+                    modelStatus = modelManager.statusText(it.settings.modelId),
+                    message = "视频 VR 已生成：${next.item.displayName}（${elapsed}ms）",
+                )
+            }
+            upsertVideoJob(next.item, VideoVrState.READY, 1f, finishedAt = System.currentTimeMillis())
+            addLog("video ready ${next.item.displayName} ${entry.width}x${entry.height} ${elapsed}ms")
+        }.onFailure { error ->
+            _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
+            upsertVideoJob(next.item, VideoVrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
+            addLog("video failed ${next.item.displayName}: ${error.message}")
+        }
+    }
+
     private suspend fun workerLoop() {
             while (true) {
                 if (!_uiState.value.vrMode) {
@@ -662,6 +857,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         activeKey = next.photo.cacheKey
         markState(next.photo.cacheKey, VrState.GENERATING)
         upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f)
+        val started = System.currentTimeMillis()
         val result = runCatching {
             generator.generate(
                 next.photo,
@@ -671,9 +867,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         it.copy(
                             modelProgress = progress,
                             modelStatus = if (progress < 1f) {
-                                "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%"
+                                "姝ｅ湪涓嬭浇妯″瀷 / Downloading model ${(progress * 100f).roundToInt()}%"
                             } else {
-                                "模型已就绪 / Model ready"
+                                "妯″瀷宸插氨缁?/ Model ready"
                             },
                         )
                     }
@@ -686,7 +882,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             markReady(next.photo.cacheKey, entry)
             upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis())
             addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
-            _uiState.update { it.copy(modelProgress = null, modelStatus = modelManager.statusText(it.settings.modelId), cacheVersions = cache.summaries()) }
+            val selected = _uiState.value.selectedIndex ?: _uiState.value.galleryAnchorIndex
+            val doneIndex = _uiState.value.photos.indexOfFirst { it.cacheKey == next.photo.cacheKey }
+            _uiState.update { it.copy(modelProgress = null, modelStatus = modelManager.statusText(it.settings.modelId), cacheVersions = cache.summaries(), lastGeneration = LastGenerationInfo(doneIndex - selected, System.currentTimeMillis() - started)) }
         }.onFailure { error ->
             markState(next.photo.cacheKey, VrState.FAILED)
             upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
@@ -745,6 +943,33 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    private fun upsertVideoJob(
+        item: GalleryItem,
+        state: VideoVrState,
+        progress: Float,
+        currentFrame: Int = 0,
+        totalFrames: Int = 0,
+        fps: Int = 30,
+        finishedAt: Long? = null,
+        error: String? = null,
+    ) {
+        _uiState.update { current ->
+            val existing = current.videoJobs.filterNot { it.item.cacheKey == item.cacheKey }
+            val job = VideoVrJob(
+                item = item,
+                state = state,
+                progress = progress,
+                currentFrame = currentFrame,
+                totalFrames = totalFrames,
+                fps = fps,
+                startedAt = current.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }?.startedAt ?: System.currentTimeMillis(),
+                finishedAt = finishedAt,
+                error = error,
+            )
+            current.copy(videoJobs = (listOf(job) + existing).take(100))
+        }
+    }
+
     private fun addLog(line: String) {
         val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         _uiState.update { it.copy(logs = (listOf("$stamp $line") + it.logs).take(200)) }
@@ -752,6 +977,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 }
 
 private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long)
+
+private data class VideoQueuedJob(val item: GalleryItem, val sequence: Long)
 
 private fun AppLanguage.t(zh: String, en: String): String = if (this == AppLanguage.ZH) zh else en
 
@@ -763,12 +990,55 @@ private fun AppLanguage.pickMixed(text: String): String {
 }
 
 private fun VrState.label(lang: AppLanguage): String = when (this) {
-    VrState.NORMAL -> lang.t("原图", "Normal")
-    VrState.PAUSED -> lang.t("暂停", "Paused")
-    VrState.QUEUED -> lang.t("排队", "Queued")
+    VrState.NORMAL -> lang.t("鍘熷浘", "Normal")
+    VrState.PAUSED -> lang.t("鏆傚仠", "Paused")
+    VrState.QUEUED -> lang.t("鎺掗槦", "Queued")
     VrState.GENERATING -> lang.t("生成中", "Generating")
     VrState.READY -> lang.t("已生成", "Ready")
-    VrState.FAILED -> lang.t("失败", "Failed")
+    VrState.FAILED -> lang.t("澶辫触", "Failed")
+}
+
+private fun VideoVrState.label(lang: AppLanguage): String = when (this) {
+    VideoVrState.NORMAL -> lang.t("未生成", "Normal")
+    VideoVrState.QUEUED -> lang.t("队列中", "Queued")
+    VideoVrState.GENERATING -> lang.t("生成中", "Generating")
+    VideoVrState.READY -> lang.t("已生成", "Ready")
+    VideoVrState.FAILED -> lang.t("失败", "Failed")
+}
+
+private fun imagePrefetchSummary(state: UiState, index: Int, lang: AppLanguage): String {
+    fun countSide(offsetStep: Int, states: Set<VrState>): Int {
+        var count = 0
+        var cursor = index + offsetStep
+        while (cursor in state.photos.indices) {
+            val item = state.photos[cursor]
+            if (item.kind != MediaKind.IMAGE) {
+                cursor += offsetStep
+                continue
+            }
+            val itemState = state.states[item.cacheKey] ?: VrState.NORMAL
+            if (itemState !in states) break
+            count++
+            cursor += offsetStep
+        }
+        return count
+    }
+    val readyPrev = countSide(-1, setOf(VrState.READY))
+    val readyNext = countSide(1, setOf(VrState.READY))
+    val queuedPrev = countSide(-1, setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED))
+    val queuedNext = countSide(1, setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED))
+    val last = state.lastGeneration?.let {
+        val side = when {
+            it.relativeIndex < 0 -> lang.t("前${abs(it.relativeIndex)}", "prev ${abs(it.relativeIndex)}")
+            it.relativeIndex > 0 -> lang.t("后${it.relativeIndex}", "next ${it.relativeIndex}")
+            else -> lang.t("当前", "current")
+        }
+        "  ${side}${lang.t("已生成", " ready")}（${it.elapsedMs}ms）"
+    }.orEmpty()
+    return lang.t(
+        "已加载：前$readyPrev 后$readyNext  队列中：前$queuedPrev 后$queuedNext$last",
+        "Ready: prev $readyPrev next $readyNext  Queued: prev $queuedPrev next $queuedNext$last",
+    )
 }
 
 private class SettingsStore(context: Context) {
@@ -822,30 +1092,61 @@ private class SettingsStore(context: Context) {
 }
 
 private class PhotoRepository(private val context: Context) {
-    fun loadImages(): List<PhotoItem> {
-        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val projection = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DISPLAY_NAME,
-            MediaStore.Images.Media.WIDTH,
-            MediaStore.Images.Media.HEIGHT,
-            MediaStore.Images.Media.SIZE,
-            MediaStore.Images.Media.DATE_MODIFIED,
-        )
-        val sort = "${MediaStore.Images.Media.DATE_MODIFIED} DESC"
+    fun loadImages(): List<PhotoItem> = loadMedia()
+
+    fun loadMedia(): List<GalleryItem> {
         val result = mutableListOf<PhotoItem>()
-        context.contentResolver.query(collection, projection, null, null, sort)?.use { cursor ->
-            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
-            val widthCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
-            val heightCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
-            val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
-            val modifiedCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
+        if (hasImagePermission(context)) {
+            result += queryMedia(
+                collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                idColumn = MediaStore.Images.Media._ID,
+                nameColumn = MediaStore.Images.Media.DISPLAY_NAME,
+                widthColumn = MediaStore.Images.Media.WIDTH,
+                heightColumn = MediaStore.Images.Media.HEIGHT,
+                sizeColumn = MediaStore.Images.Media.SIZE,
+                modifiedColumn = MediaStore.Images.Media.DATE_MODIFIED,
+                kind = MediaKind.IMAGE,
+            )
+        }
+        if (hasVideoPermission(context)) {
+            result += queryMedia(
+                collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                idColumn = MediaStore.Video.Media._ID,
+                nameColumn = MediaStore.Video.Media.DISPLAY_NAME,
+                widthColumn = MediaStore.Video.Media.WIDTH,
+                heightColumn = MediaStore.Video.Media.HEIGHT,
+                sizeColumn = MediaStore.Video.Media.SIZE,
+                modifiedColumn = MediaStore.Video.Media.DATE_MODIFIED,
+                kind = MediaKind.VIDEO,
+            )
+        }
+        return result.sortedByDescending { it.modifiedTime }
+    }
+
+    private fun queryMedia(
+        collection: Uri,
+        idColumn: String,
+        nameColumn: String,
+        widthColumn: String,
+        heightColumn: String,
+        sizeColumn: String,
+        modifiedColumn: String,
+        kind: MediaKind,
+    ): List<GalleryItem> {
+        val projection = arrayOf(idColumn, nameColumn, widthColumn, heightColumn, sizeColumn, modifiedColumn)
+        val result = mutableListOf<GalleryItem>()
+        context.contentResolver.query(collection, projection, null, null, "$modifiedColumn DESC")?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(idColumn)
+            val nameCol = cursor.getColumnIndexOrThrow(nameColumn)
+            val widthCol = cursor.getColumnIndexOrThrow(widthColumn)
+            val heightCol = cursor.getColumnIndexOrThrow(heightColumn)
+            val sizeCol = cursor.getColumnIndexOrThrow(sizeColumn)
+            val modifiedCol = cursor.getColumnIndexOrThrow(modifiedColumn)
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
-                val displayName = cursor.getString(nameCol) ?: "image-$id"
-                if (displayName.startsWith(GENERATED_VR_PREFIX) || displayName.startsWith("VR_")) continue
-                result += PhotoItem(
+                val displayName = cursor.getString(nameCol) ?: "${kind.name.lowercase(Locale.US)}-$id"
+                if (kind == MediaKind.IMAGE && (displayName.startsWith(GENERATED_VR_PREFIX) || displayName.startsWith("VR_"))) continue
+                result += GalleryItem(
                     id = id,
                     uri = ContentUris.withAppendedId(collection, id),
                     displayName = displayName,
@@ -853,6 +1154,7 @@ private class PhotoRepository(private val context: Context) {
                     height = cursor.getInt(heightCol),
                     size = cursor.getLong(sizeCol),
                     modifiedTime = cursor.getLong(modifiedCol),
+                    kind = kind,
                 )
             }
         }
@@ -897,7 +1199,7 @@ private class VrCacheManager(private val context: Context) {
             }
         }
         return map.map { (version, value) ->
-            CacheVersionSummary(version = version, kind = "图片 / Images", count = value.first, bytes = value.second)
+            CacheVersionSummary(version = version, kind = "鍥剧墖 / Images", count = value.first, bytes = value.second)
         }.sortedBy { it.version }
     }
 
@@ -950,6 +1252,45 @@ private class VrCacheManager(private val context: Context) {
     }
 }
 
+private class VideoVrCacheManager(private val context: Context) {
+    val root: File = File(context.getExternalFilesDir(null), "video_vr_cache").also { it.mkdirs() }
+
+    fun entryDir(item: GalleryItem): File = File(root, item.cacheKey).also { it.mkdirs() }
+
+    fun findEntry(item: GalleryItem): VideoCacheEntry? = readEntry(item.cacheKey, entryDir(item))
+
+    fun allEntries(items: List<GalleryItem>): List<Pair<GalleryItem, VideoCacheEntry>> {
+        return items.filter { it.kind == MediaKind.VIDEO }.mapNotNull { item ->
+            findEntry(item)?.let { item to it }
+        }.sortedByDescending { it.second.createdAt }
+    }
+
+    fun delete(item: GalleryItem) {
+        File(root, item.cacheKey).deleteRecursively()
+    }
+
+    private fun readEntry(videoKey: String, dir: File): VideoCacheEntry? {
+        val output = File(dir, "vr_sbs.mp4")
+        val log = File(dir, "job.log")
+        val meta = File(dir, "video_params.txt")
+        if (!output.exists() || !log.exists() || !meta.exists()) return null
+        val values = meta.readLines().associate {
+            val parts = it.split("=", limit = 2)
+            parts.first() to parts.getOrElse(1) { "" }
+        }
+        return VideoCacheEntry(
+            videoKey = videoKey,
+            outputPath = output.absolutePath,
+            logPath = log.absolutePath,
+            width = values["width"]?.toIntOrNull() ?: 0,
+            height = values["height"]?.toIntOrNull() ?: 0,
+            durationMs = values["durationMs"]?.toLongOrNull() ?: 0L,
+            fps = values["fps"]?.toIntOrNull() ?: 30,
+            createdAt = output.lastModified(),
+        )
+    }
+}
+
 private class ModelManager(private val context: Context) {
     private val modelsDir = File(context.getExternalFilesDir(null), "models").also { it.mkdirs() }
 
@@ -957,9 +1298,9 @@ private class ModelManager(private val context: Context) {
         val spec = modelSpec(modelId)
         val modelFile = File(modelsDir, spec.fileName)
         return if (modelFile.exists() && modelFile.sha256().equals(spec.sha256, ignoreCase = true)) {
-            "模型已就绪 / Model ready"
+            "妯″瀷宸插氨缁?/ Model ready"
         } else {
-            "模型未下载 / Model not downloaded"
+            "妯″瀷鏈笅杞?/ Model not downloaded"
         }
     }
 
@@ -1076,6 +1417,23 @@ private class VrGenerator(
             height = vr.height,
             createdAt = System.currentTimeMillis(),
         )
+    }
+
+    fun generateSbsBitmap(
+        source: Bitmap,
+        params: VrGenerationParams,
+        onModelProgress: (Float) -> Unit = {},
+    ): Bitmap {
+        val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress)
+        val working = if (max(source.width, source.height) > params.maxLongEdge) {
+            val scale = params.maxLongEdge.toFloat() / max(source.width, source.height).toFloat()
+            Bitmap.createScaledBitmap(source, max(1, (source.width * scale).roundToInt()), max(1, (source.height * scale).roundToInt()), true)
+        } else {
+            source
+        }
+        val rawDepth = runDepthModel(working, modelFile, params.modelThreads, params.useGpu)
+        val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
+        return makeParallelSbs(working, depthSmall, params.depthScale, params.fillRadius)
     }
 
     private fun runDepthModel(bitmap: Bitmap, modelFile: File, modelThreads: Int, useGpu: Boolean): FloatArray {
@@ -1218,6 +1576,210 @@ private class VrGenerator(
     }
 }
 
+private class VideoVrGenerator(
+    private val context: Context,
+    private val cache: VideoVrCacheManager,
+    private val frameGenerator: VrGenerator,
+) {
+    fun generate(
+        item: GalleryItem,
+        params: VrGenerationParams,
+        onModelProgress: (Float) -> Unit,
+        onProgress: (Float, Int, Int, Int) -> Unit,
+    ): VideoCacheEntry {
+        val dir = cache.entryDir(item)
+        val output = File(dir, "vr_sbs.mp4")
+        val logPath = File(dir, "job.log")
+        val metaPath = File(dir, "video_params.txt")
+        if (output.exists()) output.delete()
+        val log = StringBuilder()
+        val started = System.currentTimeMillis()
+        fun mark(line: String) {
+            log.append(System.currentTimeMillis() - started).append("ms ").append(line).append('\n')
+            logPath.writeText(log.toString(), Charsets.UTF_8)
+        }
+
+        val retriever = MediaMetadataRetriever()
+        retriever.setDataSource(context, item.uri)
+        val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()?.coerceAtLeast(1L) ?: 1L
+        val fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()?.roundToInt()?.coerceIn(1, 60) ?: 30
+        val totalFrames = ((durationMs / 1000f) * fps).roundToInt().coerceAtLeast(1)
+        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames")
+
+        val first = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST) ?: error("Unable to decode first video frame")
+        val firstSbs = frameGenerator.generateSbsBitmap(first.copy(Bitmap.Config.ARGB_8888, false), params, onModelProgress)
+        val width = even(firstSbs.width)
+        val height = even(firstSbs.height)
+        first.recycle()
+        mark("first frame sbs=${firstSbs.width}x${firstSbs.height} encode=${width}x${height}")
+
+        encodeVideo(
+            item = item,
+            retriever = retriever,
+            firstSbs = firstSbs,
+            output = output,
+            width = width,
+            height = height,
+            fps = fps,
+            totalFrames = totalFrames,
+            params = params,
+            onModelProgress = onModelProgress,
+            onProgress = onProgress,
+            mark = ::mark,
+        )
+        retriever.release()
+
+        metaPath.writeText(
+            listOf(
+                "width=$width",
+                "height=$height",
+                "durationMs=$durationMs",
+                "fps=$fps",
+                "source=${item.displayName}",
+                "maxLongEdge=${params.maxLongEdge}",
+            ).joinToString("\n"),
+            Charsets.UTF_8,
+        )
+        mark("done output=${output.absolutePath}")
+        return cache.findEntry(item) ?: error("Video output cache missing")
+    }
+
+    private fun encodeVideo(
+        item: GalleryItem,
+        retriever: MediaMetadataRetriever,
+        firstSbs: Bitmap,
+        output: File,
+        width: Int,
+        height: Int,
+        fps: Int,
+        totalFrames: Int,
+        params: VrGenerationParams,
+        onModelProgress: (Float) -> Unit,
+        onProgress: (Float, Int, Int, Int) -> Unit,
+        mark: (String) -> Unit,
+    ) {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, (width * height * fps * 0.08f).roundToInt().coerceAtLeast(2_000_000))
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val surface = codec.createInputSurface()
+        codec.start()
+
+        val muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        val audio = prepareAudioExtractor(item)
+        val audioTrack = audio?.format?.let { muxer.addTrack(it) } ?: -1
+        var videoTrack = -1
+        var muxerStarted = false
+        val bufferInfo = MediaCodec.BufferInfo()
+
+        fun drain(end: Boolean) {
+            if (end) codec.signalEndOfInputStream()
+            while (true) {
+                val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
+                when {
+                    outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> if (!end) return
+                    outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        videoTrack = muxer.addTrack(codec.outputFormat)
+                        muxer.start()
+                        muxerStarted = true
+                    }
+                    outputIndex >= 0 -> {
+                        val encoded = codec.getOutputBuffer(outputIndex)
+                        if (encoded != null && bufferInfo.size > 0 && muxerStarted) {
+                            encoded.position(bufferInfo.offset)
+                            encoded.limit(bufferInfo.offset + bufferInfo.size)
+                            muxer.writeSampleData(videoTrack, encoded, bufferInfo)
+                        }
+                        val flags = bufferInfo.flags
+                        codec.releaseOutputBuffer(outputIndex, false)
+                        if ((flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) return
+                    }
+                }
+            }
+        }
+
+        try {
+            for (frame in 0 until totalFrames) {
+                val sbs = if (frame == 0) {
+                    firstSbs
+                } else {
+                    val timeUs = frame * 1_000_000L / fps
+                    val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        ?: continue
+                    val generated = frameGenerator.generateSbsBitmap(bitmap.copy(Bitmap.Config.ARGB_8888, false), params, onModelProgress)
+                    bitmap.recycle()
+                    generated
+                }
+                drawBitmapToSurface(surface, sbs, width, height)
+                if (frame != 0) sbs.recycle()
+                drain(end = false)
+                onProgress((frame + 1).toFloat() / totalFrames.toFloat(), frame + 1, totalFrames, fps)
+            }
+            drain(end = true)
+            if (audio != null && audioTrack >= 0 && muxerStarted) {
+                copyAudio(audio.extractor, muxer, audioTrack)
+                mark("audio copied")
+            }
+        } finally {
+            firstSbs.recycle()
+            surface.release()
+            codec.stop()
+            codec.release()
+            audio?.extractor?.release()
+            runCatching { muxer.stop() }
+            muxer.release()
+        }
+    }
+
+    private data class AudioSource(val extractor: MediaExtractor, val format: MediaFormat)
+
+    private fun prepareAudioExtractor(item: GalleryItem): AudioSource? {
+        val extractor = MediaExtractor()
+        extractor.setDataSource(context, item.uri, null)
+        for (i in 0 until extractor.trackCount) {
+            val format = extractor.getTrackFormat(i)
+            val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
+            if (mime.startsWith("audio/")) {
+                extractor.selectTrack(i)
+                return AudioSource(extractor, format)
+            }
+        }
+        extractor.release()
+        return null
+    }
+
+    private fun copyAudio(extractor: MediaExtractor, muxer: MediaMuxer, track: Int) {
+        val buffer = ByteBuffer.allocateDirect(512 * 1024)
+        val info = MediaCodec.BufferInfo()
+        while (true) {
+            val size = extractor.readSampleData(buffer, 0)
+            if (size < 0) break
+            info.set(0, size, extractor.sampleTime.coerceAtLeast(0L), extractor.sampleFlags)
+            muxer.writeSampleData(track, buffer, info)
+            extractor.advance()
+        }
+    }
+
+    private fun drawBitmapToSurface(surface: Surface, bitmap: Bitmap, width: Int, height: Int) {
+        val canvas = surface.lockCanvas(null)
+        try {
+            canvas.drawColor(Color.BLACK)
+            val scaled = if (bitmap.width == width && bitmap.height == height) bitmap else Bitmap.createScaledBitmap(bitmap, width, height, true)
+            canvas.drawBitmap(scaled, 0f, 0f, null)
+            if (scaled !== bitmap) scaled.recycle()
+        } finally {
+            surface.unlockCanvasAndPost(canvas)
+        }
+    }
+
+    private fun even(value: Int): Int = if (value % 2 == 0) value else value - 1
+}
+
 private class DebugExporter(
     private val context: Context,
     private val cache: VrCacheManager,
@@ -1254,10 +1816,9 @@ private sealed class AppScreen {
 fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
-    val permission = imagePermission()
     var pendingReplaceIndexes by remember { mutableStateOf<List<Int>>(emptyList()) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        viewModel.onPermissionChanged(granted)
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+        viewModel.onPermissionChanged(grants[imagePermission()] == true || hasImagePermission(context))
     }
     val replaceLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK && pendingReplaceIndexes.isNotEmpty()) {
@@ -1268,12 +1829,12 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
 
     LaunchedEffect(Unit) {
         if (!state.hasPermission) {
-            launcher.launch(permission)
+            launcher.launch(mediaPermissions())
         }
     }
 
     if (!state.hasPermission) {
-        PermissionScreen(state.settings.language) { launcher.launch(permission) }
+        PermissionScreen(state.settings.language) { launcher.launch(mediaPermissions()) }
         return
     }
 
@@ -1317,6 +1878,9 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onBack = viewModel::closeManage,
                 onDeleteVersion = viewModel::deleteCacheVersion,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
+                onOpenGeneratedVideo = viewModel::openGeneratedVideo,
+                onSaveVideo = { viewModel.saveGeneratedVideo(context, it) },
+                onDeleteVideo = viewModel::deleteGeneratedVideo,
             )
             AppScreen.Settings -> SettingsScreen(
                 settings = state.settings,
@@ -1370,11 +1934,11 @@ private fun PermissionScreen(lang: AppLanguage, onGrant: () -> Unit) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Text(lang.t("骞宠鐪?VR 鍥惧簱", "Parallel VR Gallery"), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(12.dp))
-        Text(lang.t("授权读取图片后，可以浏览系统相册，并在本地生成平行眼 SBS VR 缓存。", "Allow image access to browse your gallery and build local parallel-eye VR cache."))
+        Text(lang.t("授权读取图片和视频后，可以浏览系统相册，并在本地生成平行眼 SBS VR 缓存。", "Allow image and video access to browse your gallery and build local parallel-eye VR cache."))
         Spacer(Modifier.height(20.dp))
-        Button(onClick = onGrant) { Text(lang.t("授权图片访问", "Grant access")) }
+        Button(onClick = onGrant) { Text(lang.t("鎺堟潈鍥剧墖璁块棶", "Grant access")) }
     }
 }
 
@@ -1411,30 +1975,30 @@ private fun GalleryScreen(
             Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selectedKeys.isEmpty()) {
-                        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        OutlinedButton(onClick = onManage) { Text(lang.t("管理", "Manage")) }
+                        Text(lang.t("骞宠鐪?VR 鍥惧簱", "Parallel VR Gallery"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = onManage) { Text(lang.t("绠＄悊", "Manage")) }
                         Spacer(Modifier.width(8.dp))
-                        OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
+                        OutlinedButton(onClick = onSettings) { Text(lang.t("璁剧疆", "Settings")) }
                         Spacer(Modifier.width(8.dp))
-                        OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
+                        OutlinedButton(onClick = onRefresh) { Text(lang.t("鍒锋柊", "Refresh")) }
                     } else {
-                        Text(lang.t("已选择 ${selectedKeys.size} 张", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
+                        Text(lang.t("已选择 ${selectedKeys.size} 项", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("鍙栨秷", "Cancel")) }
                         Spacer(Modifier.width(8.dp))
                         Button(onClick = {
                             onSaveGenerated(selectedIndexes)
                             selectedKeys = emptySet()
-                        }) { Text(lang.t("保存", "Save")) }
+                        }) { Text(lang.t("淇濆瓨", "Save")) }
                         Spacer(Modifier.width(8.dp))
                         Button(onClick = {
                             onReplaceOriginal(selectedIndexes)
                             selectedKeys = emptySet()
-                        }) { Text(lang.t("替换", "Replace")) }
+                        }) { Text(lang.t("鏇挎崲", "Replace")) }
                     }
                 }
                 Spacer(Modifier.height(10.dp))
-                val prefetch = if (state.settings.autoPrefetch) lang.t("自动：2→4→8", "Auto: 2→4→8") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
-                Text(lang.t("预加载：$prefetch", "Prefetch: $prefetch"), style = MaterialTheme.typography.bodySmall)
+                val prefetch = if (state.settings.autoPrefetch) lang.t("自动：2 -> 4 -> 8", "Auto: 2 -> 4 -> 8") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
+                Text(lang.t("棰勫姞杞斤細$prefetch", "Prefetch: $prefetch"), style = MaterialTheme.typography.bodySmall)
                 state.message?.let {
                     Spacer(Modifier.height(6.dp))
                     Text(lang.pickMixed(it), style = MaterialTheme.typography.bodySmall)
@@ -1524,8 +2088,16 @@ private fun PhotoTile(
                 onLongClick = onLongClick,
             ),
     ) {
-        val displayUri = entry?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri
-        AsyncBitmapImage(displayUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+        val displayUri = if (photo.kind == MediaKind.IMAGE) entry?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri else photo.uri
+        AsyncMediaThumbnail(photo.kind, displayUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+        if (photo.kind == MediaKind.VIDEO) {
+            Text(
+                text = "▶",
+                color = androidx.compose.ui.graphics.Color.White,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.align(Alignment.Center).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(horizontal = 8.dp, vertical = 4.dp),
+            )
+        }
         if (selected) {
             Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0x6638d8b4)))
             Text(
@@ -1550,6 +2122,9 @@ private fun ManageScreen(
     onBack: () -> Unit,
     onDeleteVersion: (String) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
+    onOpenGeneratedVideo: (Int) -> Unit,
+    onSaveVideo: (Int) -> Unit,
+    onDeleteVideo: (Int) -> Unit,
 ) {
     val lang = state.settings.language
     var tab by remember { mutableStateOf("images") }
@@ -1560,13 +2135,13 @@ private fun ManageScreen(
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
+            OutlinedButton(onClick = onBack) { Text(lang.t("杩斿洖", "Back")) }
             Spacer(Modifier.width(12.dp))
-            Text(lang.t("生成管理", "Generated Manager"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(lang.t("鐢熸垚绠＄悊", "Generated Manager"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(16.dp))
         SingleChoiceSegmentedButtonRow {
-            listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")).forEachIndexed { index, option ->
+            listOf("images" to lang.t("鍥剧墖", "Images"), "videos" to lang.t("瑙嗛", "Videos")).forEachIndexed { index, option ->
                 SegmentedButton(
                     selected = tab == option.first,
                     onClick = { tab = option.first },
@@ -1576,7 +2151,51 @@ private fun ManageScreen(
         }
         Spacer(Modifier.height(8.dp))
         if (tab == "videos") {
-            Text(lang.t("视频生成入口已预留，当前版本暂未实现。", "Video generation entry is reserved; not implemented in this version."), style = MaterialTheme.typography.bodySmall)
+            val videos = state.photos.filter { it.kind == MediaKind.VIDEO }
+            if (videos.isEmpty()) {
+                Text(lang.t("暂无视频", "No videos"))
+            } else {
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(130.dp),
+                    modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.White).padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(videos, key = { it.cacheKey }) { item ->
+                        val index = state.photos.indexOfFirst { it.cacheKey == item.cacheKey }
+                        val videoState = state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL
+                        val job = state.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(androidx.compose.ui.graphics.Color(0xff16191c)),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(1f)
+                                    .clickable(enabled = index >= 0) { onOpenGeneratedVideo(index) },
+                            ) {
+                                AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+                                Text(
+                                    text = "${videoState.label(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}%",
+                                    color = androidx.compose.ui.graphics.Color.White,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    modifier = Modifier.align(Alignment.BottomStart).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(5.dp),
+                                )
+                            }
+                            Row(Modifier.fillMaxWidth().padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                OutlinedButton(onClick = { onSaveVideo(index) }, enabled = videoState == VideoVrState.READY && index >= 0, modifier = Modifier.weight(1f)) {
+                                    Text(lang.t("保存", "Save"), style = MaterialTheme.typography.labelSmall)
+                                }
+                                OutlinedButton(onClick = { onDeleteVideo(index) }, enabled = videoState == VideoVrState.READY && index >= 0, modifier = Modifier.weight(1f)) {
+                                    Text(lang.t("删除", "Delete"), style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         } else {
             if (state.cacheVersions.isEmpty()) {
                 Text(lang.t("暂无已生成图片", "No generated images yet"))
@@ -1587,11 +2206,11 @@ private fun ManageScreen(
                         Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
-                                    Text(lang.t("版本：${summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
-                                    Text(lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
+                                    Text(lang.t("鐗堟湰锛?{summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
+                                    Text(lang.t("${summary.count} 寮? ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
                                 }
                                 OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
-                                    Text(lang.t("删除", "Delete"))
+                                    Text(lang.t("鍒犻櫎", "Delete"))
                                 }
                             }
                             Spacer(Modifier.height(8.dp))
@@ -1638,15 +2257,15 @@ private fun SettingsScreen(
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
+            OutlinedButton(onClick = onBack) { Text(lang.t("杩斿洖", "Back")) }
             Spacer(Modifier.width(12.dp))
-            Text(lang.t("设置", "Settings"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(lang.t("璁剧疆", "Settings"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(16.dp))
-        Text(lang.t("语言", "Language"), fontWeight = FontWeight.Bold)
+        Text(lang.t("璇█", "Language"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow {
-            listOf(AppLanguage.ZH to "中文", AppLanguage.EN to "English").forEachIndexed { index, option ->
+            listOf(AppLanguage.ZH to "涓枃", AppLanguage.EN to "English").forEachIndexed { index, option ->
                 SegmentedButton(
                     selected = settings.language == option.first,
                     onClick = { onChange(settings.copy(language = option.first)) },
@@ -1656,12 +2275,12 @@ private fun SettingsScreen(
         }
         Spacer(Modifier.height(16.dp))
 
-        Text(lang.t("模型", "Model"), fontWeight = FontWeight.Bold)
+        Text(lang.t("妯″瀷", "Model"), fontWeight = FontWeight.Bold)
         Text(lang.pickMixed(modelStatus), style = MaterialTheme.typography.bodySmall)
         Text(lang.t("覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载。", "Updating over the existing app keeps the downloaded model; uninstalling usually removes it."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(16.dp))
 
-        Text(lang.t("模型选择", "Model selection"), fontWeight = FontWeight.Bold)
+        Text(lang.t("妯″瀷閫夋嫨", "Model selection"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow {
             AvailableModels.forEachIndexed { index, spec ->
@@ -1688,17 +2307,17 @@ private fun SettingsScreen(
                         else onChange(settings.copy(autoPrefetch = false, prefetchWindow = option.toInt()))
                     },
                     shape = SegmentedButtonDefaults.itemShape(index, options.size),
-                ) { Text(if (option == "auto") lang.t("自动", "Auto") else option) }
+                ) { Text(if (option == "auto") lang.t("鑷姩", "Auto") else option) }
             }
         }
         Spacer(Modifier.height(14.dp))
-        SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
+        SettingFloat(lang.t("娣卞害寮哄害", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
             onChange(settings.copy(depthScale = it))
         }
-        SettingInt(lang.t("深度平滑", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
+        SettingInt(lang.t("娣卞害骞虫粦", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
             onChange(settings.copy(blurRadius = it))
         }
-        SettingInt(lang.t("边缘填充", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
+        SettingInt(lang.t("杈圭紭濉厖", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
             onChange(settings.copy(fillRadius = it))
         }
         SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
@@ -1707,7 +2326,7 @@ private fun SettingsScreen(
         SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) {
             onChange(settings.copy(generationWorkers = it))
         }
-        SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
+        SettingInt(lang.t("妯″瀷 CPU 绾跨▼", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
             onChange(settings.copy(modelThreads = it))
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1720,16 +2339,16 @@ private fun SettingsScreen(
         Text(lang.t("GPU 会尝试使用 TFLite GPU Delegate；不兼容时自动回退 CPU。", "GPU uses TFLite GPU Delegate when compatible and falls back to CPU if needed."), style = MaterialTheme.typography.bodySmall)
 
         Spacer(Modifier.height(12.dp))
-        Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
+        Text(lang.t("娣卞害鍥惧垎杈ㄧ巼", "Depth resolution"), fontWeight = FontWeight.Bold)
         val spec = modelSpec(settings.modelId)
-        Text(lang.t("${spec.inputSize} x ${spec.inputSize}（由当前模型固定；选择其他模型后这里会随模型变化）", "${spec.inputSize} x ${spec.inputSize}. Fixed by the selected model; choosing another model changes this value."), style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("${spec.inputSize} x ${spec.inputSize}锛堢敱褰撳墠妯″瀷鍥哄畾锛涢€夋嫨鍏朵粬妯″瀷鍚庤繖閲屼細闅忔ā鍨嬪彉鍖栵級", "${spec.inputSize} x ${spec.inputSize}. Fixed by the selected model; choosing another model changes this value."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(12.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = settings.invertDepth,
                 onCheckedChange = { onChange(settings.copy(invertDepth = it)) },
             )
-            Text(lang.t("反转深度", "Invert depth"))
+            Text(lang.t("鍙嶈浆娣卞害", "Invert depth"))
         }
     }
 }
@@ -1810,16 +2429,21 @@ private fun ViewerScreen(
     ) {
         HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
             val photo = state.photos[page]
-            val entry = state.entries[photo.cacheKey]
-            val vrState = state.states[photo.cacheKey] ?: VrState.NORMAL
-            if (state.vrMode && entry != null) {
-                SyncSbsZoomImage(Uri.fromFile(File(entry.outputPath)), Modifier.fillMaxSize()) {
-                    controlsVisible = true
-                }
+            if (photo.kind == MediaKind.VIDEO) {
+                val generated = state.videoEntries[photo.cacheKey]
+                VideoPlayer(generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri, Modifier.fillMaxSize())
             } else {
-                AsyncBitmapImage(photo.uri, 4096, ContentScale.Fit, Modifier.fillMaxSize())
-                if (state.vrMode && vrState != VrState.READY) {
-                    StatusOverlay(vrState, lang, onRetry = { onRetry(page) })
+                val entry = state.entries[photo.cacheKey]
+                val vrState = state.states[photo.cacheKey] ?: VrState.NORMAL
+                if (state.vrMode && entry != null) {
+                    SyncSbsZoomImage(Uri.fromFile(File(entry.outputPath)), Modifier.fillMaxSize()) {
+                        controlsVisible = true
+                    }
+                } else {
+                    AsyncBitmapImage(photo.uri, 4096, ContentScale.Fit, Modifier.fillMaxSize())
+                    if (state.vrMode && vrState != VrState.READY) {
+                        StatusOverlay(vrState, lang, onRetry = { onRetry(page) })
+                    }
                 }
             }
         }
@@ -1828,36 +2452,50 @@ private fun ViewerScreen(
                 modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                OutlinedButton(onClick = onClose) { Text(lang.t("返回", "Back")) }
+                OutlinedButton(onClick = onClose) { Text(lang.t("杩斿洖", "Back")) }
                 Spacer(Modifier.width(8.dp))
-                val prefetchText = if (state.settings.autoPrefetch) {
-                    lang.t("自动预加载：前 ${state.activePrefetchWindow} / 后 ${state.activePrefetchWindow}", "Auto prefetch: prev ${state.activePrefetchWindow} / next ${state.activePrefetchWindow}")
-                } else {
-                    lang.t("预加载：前 ${state.settings.prefetchWindow} / 后 ${state.settings.prefetchWindow}", "Prefetch: prev ${state.settings.prefetchWindow} / next ${state.settings.prefetchWindow}")
-                }
+                val currentItem = state.photos.getOrNull(pagerState.currentPage)
                 Text(
-                    text = prefetchText,
+                    text = currentItem?.displayName.orEmpty(),
                     color = androidx.compose.ui.graphics.Color.White,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
                 Button(onClick = { onVr(pagerState.currentPage) }) {
-                    Text(if (state.vrMode) lang.t("关闭 VR", "VR Off") else lang.t("开启 VR", "VR On"))
+                    Text(
+                        if (currentItem?.kind == MediaKind.VIDEO) {
+                            lang.t("加入 VR 队列", "Add to VR queue")
+                        } else if (state.vrMode) {
+                            lang.t("关闭 VR", "VR Off")
+                        } else {
+                            lang.t("开启 VR", "VR On")
+                        },
+                    )
                 }
                 Spacer(Modifier.width(8.dp))
-                OutlinedButton(onClick = { onOpenDebug(pagerState.currentPage) }) { Text(lang.t("调试", "Debug")) }
+                OutlinedButton(onClick = { onOpenDebug(pagerState.currentPage) }) { Text(lang.t("璋冭瘯", "Debug")) }
             }
             Column(
                 modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
             ) {
                 val current = state.photos.getOrNull(pagerState.currentPage)
                 if (current != null) {
-                    Text(
-                        text = "${lang.t("状态", "State")}: ${(state.states[current.cacheKey] ?: VrState.NORMAL).label(lang)}   ${pagerState.currentPage + 1}/${state.photos.size}",
-                        color = androidx.compose.ui.graphics.Color.White,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
+                    if (current.kind == MediaKind.VIDEO) {
+                        val job = state.videoJobs.firstOrNull { it.item.cacheKey == current.cacheKey }
+                        val videoState = state.videoStates[current.cacheKey] ?: VideoVrState.NORMAL
+                        Text(
+                            text = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  FPS ${job?.fps ?: 30}",
+                            color = androidx.compose.ui.graphics.Color.White,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    } else {
+                        Text(
+                            text = imagePrefetchSummary(state, pagerState.currentPage, lang),
+                            color = androidx.compose.ui.graphics.Color.White,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                 }
                 state.modelProgress?.let {
                     Text(lang.pickMixed(state.modelStatus), color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.bodySmall)
@@ -1882,9 +2520,9 @@ private fun StatusOverlay(state: VrState, lang: AppLanguage, onRetry: () -> Unit
             Spacer(Modifier.height(12.dp))
             Text(state.label(lang), color = androidx.compose.ui.graphics.Color.White)
         } else if (state == VrState.FAILED) {
-            Text(lang.t("生成失败", "Generation failed"), color = androidx.compose.ui.graphics.Color.White)
+            Text(lang.t("鐢熸垚澶辫触", "Generation failed"), color = androidx.compose.ui.graphics.Color.White)
             Spacer(Modifier.height(12.dp))
-            Button(onClick = onRetry) { Text(lang.t("重试", "Retry")) }
+            Button(onClick = onRetry) { Text(lang.t("閲嶈瘯", "Retry")) }
         }
     }
 }
@@ -1901,6 +2539,9 @@ private fun DebugScreen(
     val entry = photo?.let { state.entries[it.cacheKey] }
     val vrState = photo?.let { state.states[it.cacheKey] } ?: VrState.NORMAL
     val job = photo?.let { p -> state.jobs.firstOrNull { it.photoItem.cacheKey == p.cacheKey } }
+    val isVideo = photo?.kind == MediaKind.VIDEO
+    val videoEntry = photo?.let { state.videoEntries[it.cacheKey] }
+    val videoJob = photo?.let { p -> state.videoJobs.firstOrNull { it.item.cacheKey == p.cacheKey } }
 
     Column(
         modifier = Modifier
@@ -1909,16 +2550,16 @@ private fun DebugScreen(
             .padding(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
+            OutlinedButton(onClick = onBack) { Text(lang.t("杩斿洖", "Back")) }
             Spacer(Modifier.width(8.dp))
             Text(
-                text = lang.t("调试", "Debug"),
+                text = lang.t("璋冭瘯", "Debug"),
                 color = androidx.compose.ui.graphics.Color.White,
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.weight(1f),
             )
-            Button(onClick = onShare, enabled = entry != null) { Text(lang.t("分享调试包", "Share debug package")) }
+            Button(onClick = onShare, enabled = !isVideo && entry != null) { Text(lang.t("分享调试包", "Share debug package")) }
         }
         Spacer(Modifier.height(8.dp))
         Text(
@@ -1929,10 +2570,22 @@ private fun DebugScreen(
             overflow = TextOverflow.Ellipsis,
         )
         Spacer(Modifier.height(8.dp))
-        Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            DebugImagePanel(lang.t("原图", "Source"), photo?.uri, Modifier.weight(1f), lang)
-            DebugImagePanel(lang.t("深度图", "Depth"), entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f), lang)
-            DebugImagePanel("VR SBS", entry?.let { Uri.fromFile(File(it.outputPath)) }, Modifier.weight(1f), lang)
+        if (isVideo) {
+            Column(Modifier.weight(1f).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0xff202326)).padding(10.dp)) {
+                Text("视频队列 / Video queue", color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
+                Text("State: ${photo?.let { state.videoStates[it.cacheKey] } ?: VideoVrState.NORMAL}", color = androidx.compose.ui.graphics.Color.White)
+                Text("Frame: ${videoJob?.currentFrame ?: 0}/${videoJob?.totalFrames ?: 0}", color = androidx.compose.ui.graphics.Color.White)
+                Text("FPS: ${videoJob?.fps ?: videoEntry?.fps ?: 30}", color = androidx.compose.ui.graphics.Color.White)
+                Text("Progress: ${((videoJob?.progress ?: 0f) * 100f).roundToInt()}%", color = androidx.compose.ui.graphics.Color.White)
+                Text("Output: ${videoEntry?.outputPath ?: "-"}", color = androidx.compose.ui.graphics.Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text("Error: ${videoJob?.error ?: "-"}", color = androidx.compose.ui.graphics.Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+        } else {
+            Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                DebugImagePanel(lang.t("鍘熷浘", "Source"), photo?.uri, Modifier.weight(1f), lang)
+                DebugImagePanel(lang.t("深度图", "Depth"), entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f), lang)
+                DebugImagePanel("VR SBS", entry?.let { Uri.fromFile(File(it.outputPath)) }, Modifier.weight(1f), lang)
+            }
         }
         Spacer(Modifier.height(8.dp))
         Column(
@@ -1942,12 +2595,12 @@ private fun DebugScreen(
                 .background(androidx.compose.ui.graphics.Color(0xff202326))
                 .padding(8.dp),
         ) {
-            Text(lang.t("日志", "Logs"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
-            Text("${lang.t("模型", "Model")}: ${lang.pickMixed(state.modelStatus)}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
+            Text(lang.t("鏃ュ織", "Logs"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
+            Text("${lang.t("妯″瀷", "Model")}: ${lang.pickMixed(state.modelStatus)}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
             job?.let {
                 Text("Job: ${it.state} progress=${(it.progress * 100f).roundToInt()}% error=${it.error.orEmpty()}", color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
             }
-            Text(lang.t("队列", "Queue"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+            Text(lang.t("闃熷垪", "Queue"), color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
             state.jobs.take(5).forEach {
                 Text(
                     "${it.state.label(lang)} ${(it.progress * 100f).roundToInt()}%  ${it.photoItem.displayName}",
@@ -1974,7 +2627,7 @@ private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modif
                 modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xff202326)),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(lang.t("暂无", "None"), color = androidx.compose.ui.graphics.Color.White)
+                Text(lang.t("鏆傛棤", "None"), color = androidx.compose.ui.graphics.Color.White)
             }
         } else {
             AsyncBitmapImage(uri, 2048, ContentScale.Fit, Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black))
@@ -2126,12 +2779,103 @@ private fun AsyncBitmapImage(uri: Uri, maxSide: Int, contentScale: ContentScale,
     }
 }
 
+@Composable
+private fun AsyncMediaThumbnail(kind: MediaKind, uri: Uri, maxSide: Int, contentScale: ContentScale, modifier: Modifier = Modifier) {
+    if (kind == MediaKind.IMAGE) {
+        AsyncBitmapImage(uri, maxSide, contentScale, modifier)
+        return
+    }
+    val context = LocalContext.current
+    var bitmap by remember(uri, maxSide) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(uri, maxSide) {
+        bitmap = withContext(Dispatchers.IO) {
+            runCatching {
+                if (Build.VERSION.SDK_INT >= 29) {
+                    context.contentResolver.loadThumbnail(uri, Size(maxSide, maxSide), null)
+                } else {
+                    val retriever = MediaMetadataRetriever()
+                    retriever.setDataSource(context, uri)
+                    val frame = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    retriever.release()
+                    frame
+                }
+            }.getOrNull()
+        }
+    }
+    if (bitmap == null) {
+        Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(Modifier.size(26.dp))
+        }
+    } else {
+        Image(bitmap!!.asImageBitmap(), contentDescription = null, modifier = modifier, contentScale = contentScale)
+    }
+}
+
+@Composable
+private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    var videoView by remember { mutableStateOf<VideoView?>(null) }
+    Box(modifier.background(androidx.compose.ui.graphics.Color.Black)) {
+        AndroidView(
+            factory = {
+                VideoView(context).apply {
+                    setVideoURI(uri)
+                    setOnPreparedListener { player ->
+                        player.isLooping = true
+                        start()
+                    }
+                    videoView = this
+                }
+            },
+            update = { view ->
+                if (view.tag != uri) {
+                    view.tag = uri
+                    view.setVideoURI(uri)
+                    view.start()
+                }
+                videoView = view
+            },
+            modifier = Modifier.fillMaxSize(),
+        )
+        Box(
+            Modifier
+                .fillMaxSize()
+                .pointerInput(uri) {
+                    detectTapGestures(
+                        onDoubleTap = {
+                            videoView?.let { it.seekTo(it.currentPosition + 10_000) }
+                        },
+                        onLongPress = {
+                            videoView?.let { it.seekTo(it.currentPosition + 30_000) }
+                        },
+                    )
+                },
+        )
+    }
+}
+
 private fun hasImagePermission(context: Context): Boolean {
     return ContextCompat.checkSelfPermission(context, imagePermission()) == PackageManager.PERMISSION_GRANTED
 }
 
+private fun hasVideoPermission(context: Context): Boolean {
+    return ContextCompat.checkSelfPermission(context, videoPermission()) == PackageManager.PERMISSION_GRANTED
+}
+
 private fun imagePermission(): String {
     return if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
+}
+
+private fun videoPermission(): String {
+    return if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO else Manifest.permission.READ_EXTERNAL_STORAGE
+}
+
+private fun mediaPermissions(): Array<String> {
+    return if (Build.VERSION.SDK_INT >= 33) {
+        arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+    } else {
+        arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+    }
 }
 
 private fun decodeScaledBitmap(context: Context, uri: Uri, maxLongEdge: Int): Bitmap {
@@ -2177,6 +2921,34 @@ private fun saveImageToGallery(context: Context, source: File, displayName: Stri
         } ?: error("Unable to open gallery output")
         if (Build.VERSION.SDK_INT >= 29) {
             resolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
+        }
+    }.onFailure { error ->
+        resolver.delete(uri, null, null)
+        throw error
+    }
+    return uri
+}
+
+private fun saveVideoToGallery(context: Context, source: File, displayName: String): Uri {
+    val safeName = displayName.ifBlank { "parallel_vr_${System.currentTimeMillis()}.mp4" }
+    val values = ContentValues().apply {
+        put(MediaStore.Video.Media.DISPLAY_NAME, safeName)
+        put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+        put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis() / 1000L)
+        put(MediaStore.Video.Media.DATE_MODIFIED, System.currentTimeMillis() / 1000L)
+        if (Build.VERSION.SDK_INT >= 29) {
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ParallelVrGallery")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+    }
+    val resolver = context.contentResolver
+    val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: error("MediaStore insert failed")
+    runCatching {
+        resolver.openOutputStream(uri)?.use { output ->
+            source.inputStream().use { input -> input.copyTo(output) }
+        } ?: error("Unable to open video output")
+        if (Build.VERSION.SDK_INT >= 29) {
+            resolver.update(uri, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
         }
     }.onFailure { error ->
         resolver.delete(uri, null, null)
