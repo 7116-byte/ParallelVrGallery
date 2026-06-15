@@ -195,6 +195,7 @@ enum class VideoVrState {
     NORMAL,
     QUEUED,
     GENERATING,
+    PAUSED,
     READY,
     FAILED,
 }
@@ -285,11 +286,19 @@ data class ModelSpec(
 private val AvailableModels = listOf(
     ModelSpec(
         id = "depth_anything_v2_small_tflite",
-        displayName = "Depth Anything V2 - Small",
+        displayName = "Depth Anything V2 Small TFLite 518（稳定）",
         inputSize = 518,
         fileName = "depth_anything_v2.tflite",
         url = "https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite",
         sha256 = "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",
+    ),
+    ModelSpec(
+        id = "qualcomm_depth_anything_v2_tflite",
+        displayName = "Qualcomm Depth Anything V2 TFLite 518（实验）",
+        inputSize = 518,
+        fileName = "qualcomm_depth_anything_v2.tflite",
+        url = "https://huggingface.co/qualcomm/Depth-Anything-V2/resolve/main/Depth-Anything-V2.tflite?download=true",
+        sha256 = "727E025EAB1DB3650C6FED86AA8D7932B994D8746E41A7A5773E663DE740859F",
     ),
 )
 
@@ -403,6 +412,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val currentPending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
     private val videoPending = PriorityQueue<VideoQueuedJob>(compareBy<VideoQueuedJob> { it.sequence })
     private val paused = linkedMapOf<String, QueuedJob>()
+    private val pausedVideos = mutableSetOf<String>()
     private var sequence = 0L
     private var videoSequence = 0L
     private val workers = mutableListOf<Job>()
@@ -540,7 +550,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.13"
+                    val current = "v1.14"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -577,7 +587,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun requestVr(index: Int) {
         val item = _uiState.value.photos.getOrNull(index) ?: return
         if (item.kind == MediaKind.VIDEO) {
-            enqueueVideo(item)
+            when (_uiState.value.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) {
+                VideoVrState.QUEUED,
+                VideoVrState.GENERATING -> pauseVideo(item)
+                VideoVrState.PAUSED -> enqueueVideo(item, force = true)
+                VideoVrState.FAILED -> enqueueVideo(item, force = true)
+                else -> enqueueVideo(item)
+            }
             return
         }
         if (_uiState.value.vrMode) {
@@ -840,6 +856,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun enqueueVideo(item: GalleryItem, force: Boolean = false) {
         if (item.kind != MediaKind.VIDEO) return
+        synchronized(pausedVideos) { pausedVideos.remove(item.cacheKey) }
         if (!force && videoCache.findEntry(item) != null) {
             _uiState.update { it.copy(videoStates = it.videoStates + (item.cacheKey to VideoVrState.READY)) }
             return
@@ -854,6 +871,22 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(videoStates = it.videoStates + (item.cacheKey to VideoVrState.QUEUED), message = "视频已加入 VR 队列：${item.displayName}") }
         addLog("video queued ${item.displayName}")
         startVideoWorkers()
+    }
+
+    private fun pauseVideo(item: GalleryItem) {
+        if (item.kind != MediaKind.VIDEO) return
+        synchronized(videoPending) {
+            videoPending.removeAll { it.item.cacheKey == item.cacheKey }
+        }
+        synchronized(pausedVideos) { pausedVideos.add(item.cacheKey) }
+        _uiState.update {
+            it.copy(
+                videoStates = it.videoStates + (item.cacheKey to VideoVrState.PAUSED),
+                message = "视频已暂停生成：${item.displayName}",
+            )
+        }
+        upsertVideoJob(item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }?.progress ?: 0f)
+        addLog("video paused ${item.displayName}")
     }
 
     private fun startVideoWorkers() {
@@ -874,8 +907,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f)
         videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
         val started = System.currentTimeMillis()
-        val firstFrameTimes = mutableListOf<Long>()
-        var lastFrameAt = System.currentTimeMillis()
+        val recentFrameTimes = mutableListOf<Long>()
+        var lastFrameAt: Long? = null
         val result = runCatching {
             videoGenerator.generate(
                 next.item,
@@ -889,10 +922,18 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     }
                 },
             ) { progress, frame, total, fps ->
+                if (synchronized(pausedVideos) { pausedVideos.contains(next.item.cacheKey) }) {
+                    throw VideoPausedException()
+                }
                 val now = System.currentTimeMillis()
-                if (frame > 0 && firstFrameTimes.size < 3) firstFrameTimes += (now - lastFrameAt).coerceAtLeast(0L)
+                lastFrameAt?.let { previous ->
+                    if (frame > 1) {
+                        recentFrameTimes += (now - previous).coerceAtLeast(0L)
+                        if (recentFrameTimes.size > 3) recentFrameTimes.removeAt(0)
+                    }
+                }
                 lastFrameAt = now
-                val avgFrameMs = if (firstFrameTimes.isNotEmpty()) firstFrameTimes.average().roundToInt().toLong() else 0L
+                val avgFrameMs = if (recentFrameTimes.isNotEmpty()) recentFrameTimes.average().roundToInt().toLong() else 0L
                 upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, avgFrameMs = avgFrameMs)
                 videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
             }
@@ -912,10 +953,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             videoNotifier.show(next.item, 1, 1, indeterminate = false, status = "已完成")
             addLog("video ready ${next.item.displayName} ${entry.width}x${entry.height} ${elapsed}ms")
         }.onFailure { error ->
-            _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
-            upsertVideoJob(next.item, VideoVrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
-            videoNotifier.failed(next.item, error.message ?: "生成失败")
-            addLog("video failed ${next.item.displayName}: ${error.message}")
+            if (error is VideoPausedException) {
+                _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.PAUSED), modelProgress = null) }
+                upsertVideoJob(next.item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f)
+                addLog("video paused ${next.item.displayName}")
+            } else {
+                _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
+                upsertVideoJob(next.item, VideoVrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
+                videoNotifier.failed(next.item, error.message ?: "生成失败")
+                addLog("video failed ${next.item.displayName}: ${error.message}")
+            }
         }
     }
 
@@ -1049,16 +1096,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         error: String? = null,
     ) {
         _uiState.update { current ->
+            val previous = current.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
             val existing = current.videoJobs.filterNot { it.item.cacheKey == item.cacheKey }
             val job = VideoVrJob(
                 item = item,
                 state = state,
                 progress = progress,
-                currentFrame = currentFrame,
-                totalFrames = totalFrames,
-                fps = fps,
-                avgFrameMs = avgFrameMs,
-                startedAt = current.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }?.startedAt ?: System.currentTimeMillis(),
+                currentFrame = currentFrame.takeIf { it > 0 } ?: previous?.currentFrame ?: 0,
+                totalFrames = totalFrames.takeIf { it > 0 } ?: previous?.totalFrames ?: 0,
+                fps = fps.takeIf { it > 0 } ?: previous?.fps ?: 30,
+                avgFrameMs = avgFrameMs.takeIf { it > 0L } ?: previous?.avgFrameMs ?: 0L,
+                startedAt = previous?.startedAt ?: System.currentTimeMillis(),
                 finishedAt = finishedAt,
                 error = error,
             )
@@ -1075,6 +1123,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long)
 
 private data class VideoQueuedJob(val item: GalleryItem, val sequence: Long)
+
+private class VideoPausedException : RuntimeException("Video generation paused")
 
 private fun AppLanguage.t(zh: String, en: String): String = if (this == AppLanguage.ZH) zh else en
 
@@ -1098,6 +1148,7 @@ private fun VideoVrState.label(lang: AppLanguage): String = when (this) {
     VideoVrState.NORMAL -> lang.t("未生成", "Normal")
     VideoVrState.QUEUED -> lang.t("队列中", "Queued")
     VideoVrState.GENERATING -> lang.t("生成中", "Generating")
+    VideoVrState.PAUSED -> lang.t("已暂停", "Paused")
     VideoVrState.READY -> lang.t("已生成", "Ready")
     VideoVrState.FAILED -> lang.t("失败", "Failed")
 }
@@ -2549,16 +2600,28 @@ private fun SettingsScreen(
 
         Text(lang.t("模型选择", "Model selection"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
-        SingleChoiceSegmentedButtonRow {
-            AvailableModels.forEachIndexed { index, spec ->
-                SegmentedButton(
-                    selected = settings.modelId == spec.id,
-                    onClick = { onChange(settings.copy(modelId = spec.id, depthResolution = spec.inputSize)) },
-                    shape = SegmentedButtonDefaults.itemShape(index, AvailableModels.size),
-                ) { Text(spec.displayName) }
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            AvailableModels.forEach { spec ->
+                val selected = settings.modelId == spec.id
+                val buttonModifier = Modifier.fillMaxWidth()
+                if (selected) {
+                    Button(
+                        onClick = { onChange(settings.copy(modelId = spec.id, depthResolution = spec.inputSize)) },
+                        modifier = buttonModifier,
+                    ) {
+                        Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                } else {
+                    OutlinedButton(
+                        onClick = { onChange(settings.copy(modelId = spec.id, depthResolution = spec.inputSize)) },
+                        modifier = buttonModifier,
+                    ) {
+                        Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                }
             }
         }
-        Text(lang.t("目前只内置已验证模型；新增模型时会出现在这里。", "Only the verified model is available now; additional models will appear here."), style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("实验模型首次使用会单独下载；如果模型输入输出不兼容，会在日志里显示失败原因。", "Experimental models download separately on first use. Shape incompatibility is reported in logs."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(16.dp))
 
         Text(lang.t("预加载", "Prefetch"), fontWeight = FontWeight.Bold)
@@ -2725,10 +2788,19 @@ private fun ViewerScreen(
                 val vrState = state.states[photo.cacheKey] ?: VrState.NORMAL
                 if (state.vrMode && entry != null) {
                     SyncSbsZoomImage(Uri.fromFile(File(entry.outputPath)), Modifier.fillMaxSize()) {
-                        controlsVisible = true
+                        controlsVisible = !controlsVisible
                     }
                 } else {
-                    AsyncBitmapImage(photo.uri, 4096, ContentScale.Fit, Modifier.fillMaxSize())
+                    AsyncBitmapImage(
+                        photo.uri,
+                        4096,
+                        ContentScale.Fit,
+                        Modifier
+                            .fillMaxSize()
+                            .pointerInput(photo.uri) {
+                                detectTapGestures(onTap = { controlsVisible = !controlsVisible })
+                            },
+                    )
                     if (state.vrMode && vrState != VrState.READY) {
                         StatusOverlay(vrState, lang, onRetry = { onRetry(page) })
                     }
@@ -2755,8 +2827,9 @@ private fun ViewerScreen(
                         if (currentItem?.kind == MediaKind.VIDEO) {
                             when (state.videoStates[currentItem.cacheKey] ?: VideoVrState.NORMAL) {
                                 VideoVrState.NORMAL -> lang.t("加入 VR 队列", "Add to VR queue")
-                                VideoVrState.QUEUED -> lang.t("已在队列", "Queued")
-                                VideoVrState.GENERATING -> lang.t("生成中", "Generating")
+                                VideoVrState.QUEUED -> lang.t("暂停生成", "Pause")
+                                VideoVrState.GENERATING -> lang.t("暂停生成", "Pause")
+                                VideoVrState.PAUSED -> lang.t("继续生成", "Resume")
                                 VideoVrState.READY -> lang.t("已生成", "Ready")
                                 VideoVrState.FAILED -> lang.t("重试视频 VR", "Retry video VR")
                             }
