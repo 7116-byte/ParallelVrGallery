@@ -554,7 +554,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.16"
+                    val current = "v1.17"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -711,32 +711,83 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun saveGeneratedVideo(context: Context, index: Int) {
-        val item = _uiState.value.photos.getOrNull(index) ?: return
-        val entry = _uiState.value.videoEntries[item.cacheKey] ?: return
+        saveGeneratedVideos(context, listOf(index))
+    }
+
+    fun saveGeneratedVideos(context: Context, indexes: List<Int>) {
+        val lang = _uiState.value.settings.language
+        _uiState.update { it.copy(blockingMessage = lang.t("保存中", "Saving")) }
         viewModelScope.launch {
             val message = withContext(Dispatchers.IO) {
-                runCatching {
-                    saveVideoToGallery(context, File(entry.outputPath), "${GENERATED_VR_PREFIX}${item.cacheKey}_${item.displayName}")
-                    "视频已保存到系统相册 / Video saved to system gallery"
-                }.getOrElse { "视频保存失败：${it.message} / Video save failed" }
+                var saved = 0
+                var failed = 0
+                indexes.distinct().forEach { index ->
+                    val item = _uiState.value.photos.getOrNull(index) ?: return@forEach
+                    val entry = _uiState.value.videoEntries[item.cacheKey] ?: videoCache.findEntry(item) ?: return@forEach
+                    runCatching {
+                        saveVideoToGallery(context, File(entry.outputPath), "${GENERATED_VR_PREFIX}${item.cacheKey}_${item.displayName}")
+                        saved++
+                    }.onFailure { failed++ }
+                }
+                when {
+                    saved == 0 -> lang.t("没有可保存的已生成 VR 视频", "No generated VR videos to save")
+                    failed == 0 -> lang.t("已保存 $saved 个视频到系统相册", "Saved $saved videos")
+                    else -> lang.t("已保存 $saved 个视频，失败 $failed 个", "Saved $saved videos, failed $failed")
+                }
             }
-            _uiState.update { it.copy(message = message) }
+            _uiState.update { it.copy(blockingMessage = null, message = message) }
         }
     }
 
     fun deleteGeneratedVideo(index: Int) {
-        val item = _uiState.value.photos.getOrNull(index) ?: return
+        deleteGeneratedVideos(listOf(index))
+    }
+
+    fun deleteGeneratedVideos(indexes: List<Int>) {
+        val items = indexes.distinct().mapNotNull { _uiState.value.photos.getOrNull(it) }.filter { it.kind == MediaKind.VIDEO }
         viewModelScope.launch(Dispatchers.IO) {
-            videoCache.delete(item)
+            items.forEach { videoCache.delete(it) }
             _uiState.update {
+                val keys = items.map { item -> item.cacheKey }.toSet()
                 it.copy(
-                    videoEntries = it.videoEntries - item.cacheKey,
-                    videoStates = it.videoStates + (item.cacheKey to VideoVrState.NORMAL),
-                    videoJobs = it.videoJobs.filterNot { job -> job.item.cacheKey == item.cacheKey },
-                    message = "已删除视频 VR 缓存：${item.displayName}",
+                    videoEntries = it.videoEntries - keys,
+                    videoStates = it.videoStates + keys.associateWith { VideoVrState.NORMAL },
+                    videoJobs = it.videoJobs.filterNot { job -> job.item.cacheKey in keys },
+                    message = "已删除 ${items.size} 个视频 VR 缓存",
                 )
             }
         }
+    }
+
+    fun deleteGeneratedImageEntries(entries: List<ManagedCacheItem>) {
+        viewModelScope.launch(Dispatchers.IO) {
+            entries.forEach { cache.deleteEntry(it.entry) }
+            val photos = _uiState.value.photos
+            val currentEntries = photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey }
+            _uiState.update {
+                it.copy(
+                    entries = currentEntries,
+                    states = photos.associate { photo -> photo.cacheKey to if (currentEntries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
+                    cacheVersions = cache.summaries(),
+                    managedCacheItems = cache.allEntries(photos),
+                    message = "已删除 ${entries.size} 张图片 VR 缓存",
+                )
+            }
+        }
+    }
+
+    fun regenerateImages(indexes: List<Int>) {
+        val unique = indexes.distinct()
+        if (unique.isEmpty()) return
+        _uiState.update { it.copy(vrMode = true, message = "已加入 ${unique.size} 张图片重新生成队列") }
+        unique.forEachIndexed { order, index -> enqueuePhoto(index, priority = order + 1, force = true, current = false) }
+        startWorker()
+    }
+
+    fun regenerateVideos(indexes: List<Int>) {
+        val unique = indexes.distinct()
+        unique.forEach { index -> _uiState.value.photos.getOrNull(index)?.let { enqueueVideo(it, force = true) } }
+        _uiState.update { it.copy(message = "已加入 ${unique.size} 个视频重新生成队列") }
     }
 
     fun replaceOriginalWithGenerated(context: Context, index: Int) {
@@ -1464,6 +1515,17 @@ private class VrCacheManager(private val context: Context) {
             } else {
                 File(photoDir, version).deleteRecursively()
             }
+        }
+    }
+
+    fun deleteEntry(entry: VrCacheEntry) {
+        val photoDir = File(root, entry.photoKey)
+        if (entry.version == DEFAULT_VERSION) {
+            listOf("vr_sbs.jpg", "depth.png", "params.json", "job.log", "source_preview.jpg").forEach {
+                File(photoDir, it).delete()
+            }
+        } else {
+            File(photoDir, entry.version).deleteRecursively()
         }
     }
 
@@ -2228,10 +2290,15 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
                 onSaveVideo = { viewModel.saveGeneratedVideo(context, it) },
                 onDeleteVideo = viewModel::deleteGeneratedVideo,
+                onSaveVideos = { viewModel.saveGeneratedVideos(context, it) },
+                onDeleteVideos = viewModel::deleteGeneratedVideos,
+                onRegenerateVideos = viewModel::regenerateVideos,
+                onSaveImages = { viewModel.saveGeneratedCopies(context, it) },
+                onDeleteImages = viewModel::deleteGeneratedImageEntries,
+                onRegenerateImages = viewModel::regenerateImages,
             )
             AppScreen.Settings -> SettingsScreen(
                 settings = state.settings,
-                modelStatus = state.modelStatus,
                 updateStatus = state.updateStatus,
                 updateUrl = state.updateUrl,
                 updateAvailable = state.updateAvailable,
@@ -2470,6 +2537,7 @@ private fun PhotoTile(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ManageScreen(
     state: UiState,
@@ -2479,9 +2547,17 @@ private fun ManageScreen(
     onOpenGeneratedVideo: (Int) -> Unit,
     onSaveVideo: (Int) -> Unit,
     onDeleteVideo: (Int) -> Unit,
+    onSaveVideos: (List<Int>) -> Unit,
+    onDeleteVideos: (List<Int>) -> Unit,
+    onRegenerateVideos: (List<Int>) -> Unit,
+    onSaveImages: (List<Int>) -> Unit,
+    onDeleteImages: (List<ManagedCacheItem>) -> Unit,
+    onRegenerateImages: (List<Int>) -> Unit,
 ) {
     val lang = state.settings.language
     var tab by remember { mutableStateOf("images") }
+    var selectedImageKeys by remember { mutableStateOf(setOf<String>()) }
+    var selectedVideoKeys by remember { mutableStateOf(setOf<String>()) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -2511,6 +2587,18 @@ private fun ManageScreen(
                         state.videoEntries.containsKey(item.cacheKey) ||
                         state.videoJobs.any { it.item.cacheKey == item.cacheKey })
             }
+            if (selectedVideoKeys.isNotEmpty()) {
+                val selectedIndexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedVideoKeys } }
+                ManageSelectionActions(
+                    count = selectedVideoKeys.size,
+                    lang = lang,
+                    onClear = { selectedVideoKeys = emptySet() },
+                    onSave = { onSaveVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                    onRegenerate = { onRegenerateVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                    onDelete = { onDeleteVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                )
+                Spacer(Modifier.height(8.dp))
+            }
             if (videos.isEmpty()) {
                 Text(lang.t("暂无生成中或已生成的视频", "No generating or generated videos"))
             } else {
@@ -2533,9 +2621,20 @@ private fun ManageScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .aspectRatio(1f)
-                                    .clickable(enabled = index >= 0) { onOpenGeneratedVideo(index) },
+                                    .combinedClickable(
+                                        enabled = index >= 0,
+                                        onClick = {
+                                            if (selectedVideoKeys.isNotEmpty()) {
+                                                selectedVideoKeys = if (item.cacheKey in selectedVideoKeys) selectedVideoKeys - item.cacheKey else selectedVideoKeys + item.cacheKey
+                                            } else {
+                                                onOpenGeneratedVideo(index)
+                                            }
+                                        },
+                                        onLongClick = { selectedVideoKeys = selectedVideoKeys + item.cacheKey },
+                                    ),
                             ) {
                                 AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+                                if (item.cacheKey in selectedVideoKeys) SelectionBadge()
                                 Text(
                                     text = "${videoState.label(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}%",
                                     color = androidx.compose.ui.graphics.Color.White,
@@ -2556,6 +2655,19 @@ private fun ManageScreen(
                 }
             }
         } else {
+            if (selectedImageKeys.isNotEmpty()) {
+                val selectedItems = state.managedCacheItems.filter { "${it.entry.photoKey}|${it.entry.version}" in selectedImageKeys }
+                val selectedIndexes = selectedItems.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }.takeIf { it >= 0 } }.distinct()
+                ManageSelectionActions(
+                    count = selectedImageKeys.size,
+                    lang = lang,
+                    onClear = { selectedImageKeys = emptySet() },
+                    onSave = { onSaveImages(selectedIndexes); selectedImageKeys = emptySet() },
+                    onRegenerate = { onRegenerateImages(selectedIndexes); selectedImageKeys = emptySet() },
+                    onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
+                )
+                Spacer(Modifier.height(8.dp))
+            }
             if (state.cacheVersions.isEmpty()) {
                 Text(lang.t("暂无已生成图片", "No generated images yet"))
             } else {
@@ -2581,14 +2693,26 @@ private fun ManageScreen(
                             ) {
                                 items(items, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
                                     val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
+                                    val selectionKey = "${item.entry.photoKey}|${item.entry.version}"
                                     Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .aspectRatio(1f)
                                             .background(androidx.compose.ui.graphics.Color(0xff16191c))
-                                            .clickable(enabled = index >= 0) { onOpenGenerated(index, item.entry) },
+                                            .combinedClickable(
+                                                enabled = index >= 0,
+                                                onClick = {
+                                                    if (selectedImageKeys.isNotEmpty()) {
+                                                        selectedImageKeys = if (selectionKey in selectedImageKeys) selectedImageKeys - selectionKey else selectedImageKeys + selectionKey
+                                                    } else {
+                                                        onOpenGenerated(index, item.entry)
+                                                    }
+                                                },
+                                                onLongClick = { selectedImageKeys = selectedImageKeys + selectionKey },
+                                            ),
                                     ) {
                                         AsyncBitmapImage(Uri.fromFile(File(item.entry.outputPath)), 360, ContentScale.Crop, Modifier.fillMaxSize())
+                                        if (selectionKey in selectedImageKeys) SelectionBadge()
                                     }
                                 }
                             }
@@ -2601,9 +2725,42 @@ private fun ManageScreen(
 }
 
 @Composable
+private fun ManageSelectionActions(
+    count: Int,
+    lang: AppLanguage,
+    onClear: () -> Unit,
+    onSave: () -> Unit,
+    onRegenerate: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().background(androidx.compose.ui.graphics.Color.White).padding(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(lang.t("已选 $count", "$count selected"), modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold)
+        OutlinedButton(onClick = onClear) { Text(lang.t("取消", "Cancel")) }
+        OutlinedButton(onClick = onSave) { Text(lang.t("保存", "Save")) }
+        OutlinedButton(onClick = onRegenerate) { Text(lang.t("重新生成", "Regenerate")) }
+        Button(onClick = onDelete) { Text(lang.t("删除", "Delete")) }
+    }
+}
+
+@Composable
+private fun SelectionBadge() {
+    Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0x6638d8b4))) {
+        Text(
+            text = "✓",
+            color = androidx.compose.ui.graphics.Color.White,
+            style = MaterialTheme.typography.titleLarge,
+            modifier = Modifier.align(Alignment.TopEnd).background(androidx.compose.ui.graphics.Color(0xcc111315)).padding(horizontal = 8.dp, vertical = 2.dp),
+        )
+    }
+}
+
+@Composable
 private fun SettingsScreen(
     settings: AppSettings,
-    modelStatus: String,
     updateStatus: String?,
     updateUrl: String?,
     updateAvailable: Boolean,
@@ -2641,10 +2798,6 @@ private fun SettingsScreen(
         }
         Spacer(Modifier.height(16.dp))
 
-        Text(lang.t("模型", "Model"), fontWeight = FontWeight.Bold)
-        Text(lang.pickMixed(modelStatus), style = MaterialTheme.typography.bodySmall)
-        Text(lang.t("覆盖安装更新会保留已下载模型；卸载后重装通常需要重新下载。", "Updating over the existing app keeps the downloaded model; uninstalling usually removes it."), style = MaterialTheme.typography.bodySmall)
-        Spacer(Modifier.height(10.dp))
         OutlinedButton(onClick = onCheckUpdate) {
             Text(lang.t("检查更新", "Check for updates"))
         }
@@ -2659,6 +2812,20 @@ private fun SettingsScreen(
             }
         }
         Spacer(Modifier.height(16.dp))
+
+        SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
+            onChange(settings.copy(depthScale = it))
+        }
+        SettingInt(lang.t("深度平滑", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
+            onChange(settings.copy(blurRadius = it))
+        }
+        SettingInt(lang.t("边缘填充", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
+            onChange(settings.copy(fillRadius = it))
+        }
+        SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
+            onChange(settings.copy(maxLongEdge = it))
+        }
+        Spacer(Modifier.height(12.dp))
 
         SettingsSectionTitle(lang.t("图片生成设置", "Image generation"))
         ModelPicker(
@@ -2687,18 +2854,6 @@ private fun SettingsScreen(
             }
         }
         Spacer(Modifier.height(14.dp))
-        SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
-            onChange(settings.copy(depthScale = it))
-        }
-        SettingInt(lang.t("深度平滑", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
-            onChange(settings.copy(blurRadius = it))
-        }
-        SettingInt(lang.t("边缘填充", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
-            onChange(settings.copy(fillRadius = it))
-        }
-        SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
-            onChange(settings.copy(maxLongEdge = it))
-        }
         SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) {
             onChange(settings.copy(generationWorkers = it))
         }
@@ -2716,8 +2871,6 @@ private fun SettingsScreen(
         Spacer(Modifier.height(12.dp))
 
         SettingsSectionTitle(lang.t("视频生成设置", "Video generation"))
-        Text(lang.t("视频生成优化", "Video generation tuning"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
         ModelPicker(
             title = lang.t("视频模型选择", "Video model"),
             selectedModelId = settings.videoModelId,
@@ -2755,7 +2908,7 @@ private fun SettingsScreen(
 @Composable
 private fun SettingsSectionTitle(title: String) {
     HorizontalDivider(Modifier.padding(vertical = 10.dp))
-    Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
     Spacer(Modifier.height(10.dp))
 }
 
@@ -2766,7 +2919,7 @@ private fun ModelPicker(
     lang: AppLanguage,
     onSelect: (ModelSpec) -> Unit,
 ) {
-    Text(title, fontWeight = FontWeight.Bold)
+    Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
     Spacer(Modifier.height(6.dp))
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         AvailableModels.forEach { spec ->
