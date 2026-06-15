@@ -77,6 +77,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -414,6 +415,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val videoPending = PriorityQueue<VideoQueuedJob>(compareBy<VideoQueuedJob> { it.sequence })
     private val paused = linkedMapOf<String, QueuedJob>()
     private val pausedVideos = mutableSetOf<String>()
+    private val pausedVideoParams = mutableMapOf<String, VideoGenerationParams>()
+    private val activeVideoParams = mutableMapOf<String, VideoGenerationParams>()
     private var sequence = 0L
     private var videoSequence = 0L
     private val workers = mutableListOf<Job>()
@@ -551,7 +554,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.15"
+                    val current = "v1.16"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -857,19 +860,19 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun enqueueVideo(item: GalleryItem, force: Boolean = false) {
         if (item.kind != MediaKind.VIDEO) return
+        val params = synchronized(pausedVideoParams) {
+            if (force) pausedVideoParams.remove(item.cacheKey) else null
+        } ?: _uiState.value.settings.toVideoParams()
         synchronized(pausedVideos) { pausedVideos.remove(item.cacheKey) }
         if (!force && videoCache.findEntry(item) != null) {
             _uiState.update { it.copy(videoStates = it.videoStates + (item.cacheKey to VideoVrState.READY)) }
             return
         }
         val existing = _uiState.value.videoStates[item.cacheKey]
-        if (force && existing == VideoVrState.PAUSED) {
-            videoCache.clearFrameCache(item)
-        }
         if (!force && (existing == VideoVrState.QUEUED || existing == VideoVrState.GENERATING)) return
         synchronized(videoPending) {
             videoPending.removeAll { it.item.cacheKey == item.cacheKey }
-            videoPending.add(VideoQueuedJob(item, videoSequence++))
+            videoPending.add(VideoQueuedJob(item, params, videoSequence++))
         }
         upsertVideoJob(item, VideoVrState.QUEUED, 0f)
         _uiState.update { it.copy(videoStates = it.videoStates + (item.cacheKey to VideoVrState.QUEUED), message = "视频已加入 VR 队列：${item.displayName}") }
@@ -883,6 +886,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             videoPending.removeAll { it.item.cacheKey == item.cacheKey }
         }
         synchronized(pausedVideos) { pausedVideos.add(item.cacheKey) }
+        synchronized(pausedVideoParams) {
+            activeVideoParams[item.cacheKey]?.let { pausedVideoParams[item.cacheKey] = it }
+        }
         _uiState.update {
             it.copy(
                 videoStates = it.videoStates + (item.cacheKey to VideoVrState.PAUSED),
@@ -907,6 +913,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun processVideoJob(next: VideoQueuedJob) {
+        synchronized(pausedVideoParams) { activeVideoParams[next.item.cacheKey] = next.params }
         _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.GENERATING)) }
         upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f)
         videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
@@ -916,7 +923,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val result = runCatching {
             videoGenerator.generate(
                 next.item,
-                _uiState.value.settings.toVideoParams(),
+                next.params,
                 onModelProgress = { progress ->
                     _uiState.update {
                         it.copy(
@@ -954,15 +961,24 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
             upsertVideoJob(next.item, VideoVrState.READY, 1f, finishedAt = System.currentTimeMillis())
+            synchronized(pausedVideoParams) {
+                pausedVideoParams.remove(next.item.cacheKey)
+                activeVideoParams.remove(next.item.cacheKey)
+            }
             videoNotifier.show(next.item, 1, 1, indeterminate = false, status = "已完成")
             addLog("video ready ${next.item.displayName} ${entry.width}x${entry.height} ${elapsed}ms")
         }.onFailure { error ->
             if (error is VideoPausedException) {
                 _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.PAUSED), modelProgress = null) }
+                synchronized(pausedVideoParams) {
+                    pausedVideoParams[next.item.cacheKey] = next.params
+                    activeVideoParams.remove(next.item.cacheKey)
+                }
                 upsertVideoJob(next.item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f)
                 addLog("video paused ${next.item.displayName}")
             } else {
                 _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
+                synchronized(pausedVideoParams) { activeVideoParams.remove(next.item.cacheKey) }
                 upsertVideoJob(next.item, VideoVrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
                 videoNotifier.failed(next.item, error.message ?: "生成失败")
                 addLog("video failed ${next.item.displayName}: ${error.message}")
@@ -1134,7 +1150,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
 private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long)
 
-private data class VideoQueuedJob(val item: GalleryItem, val sequence: Long)
+private data class VideoQueuedJob(val item: GalleryItem, val params: VideoGenerationParams, val sequence: Long)
 
 private class VideoPausedException : RuntimeException("Video generation paused")
 
@@ -1482,7 +1498,17 @@ private class VideoVrCacheManager(private val context: Context) {
 
     fun entryDir(item: GalleryItem): File = File(root, item.cacheKey).also { it.mkdirs() }
 
-    fun findEntry(item: GalleryItem): VideoCacheEntry? = readEntry(item.cacheKey, entryDir(item))
+    fun entryDir(item: GalleryItem, version: String): File = File(entryDir(item), version).also { it.mkdirs() }
+
+    fun findEntry(item: GalleryItem): VideoCacheEntry? {
+        val base = entryDir(item)
+        val entries = mutableListOf<VideoCacheEntry>()
+        readEntry(item.cacheKey, base)?.let { entries += it }
+        base.listFiles()?.filter { it.isDirectory }?.forEach { dir ->
+            readEntry(item.cacheKey, dir)?.let { entries += it }
+        }
+        return entries.maxByOrNull { it.createdAt }
+    }
 
     fun allEntries(items: List<GalleryItem>): List<Pair<GalleryItem, VideoCacheEntry>> {
         return items.filter { it.kind == MediaKind.VIDEO }.mapNotNull { item ->
@@ -1492,10 +1518,6 @@ private class VideoVrCacheManager(private val context: Context) {
 
     fun delete(item: GalleryItem) {
         File(root, item.cacheKey).deleteRecursively()
-    }
-
-    fun clearFrameCache(item: GalleryItem) {
-        File(entryDir(item), "frames").deleteRecursively()
     }
 
     private fun readEntry(videoKey: String, dir: File): VideoCacheEntry? {
@@ -1578,7 +1600,7 @@ private class ModelManager(private val context: Context) {
     fun statusText(modelId: String = AvailableModels.first().id): String {
         val spec = modelSpec(modelId)
         val modelFile = File(modelsDir, spec.fileName)
-        return if (modelFile.exists() && modelFile.sha256().equals(spec.sha256, ignoreCase = true)) {
+        return if (modelFile.exists()) {
             "模型已就绪 / Model ready"
         } else {
             "模型未下载 / Model not downloaded"
@@ -1663,7 +1685,9 @@ private class VrGenerator(
         onProgress(0.25f)
 
         val depthStart = System.currentTimeMillis()
-        val rawDepth = runDepthModel(original, modelFile, params.modelThreads, params.useGpu)
+        val rawDepth = runDepthModel(original, modelFile, params.modelThreads, params.useGpu) { runtime ->
+            mark(runtime)
+        }
         val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
         mark("depth model ${System.currentTimeMillis() - depthStart}ms")
         onProgress(0.55f)
@@ -1717,7 +1741,13 @@ private class VrGenerator(
         return makeParallelSbs(working, depthSmall, params.depthScale, params.fillRadius)
     }
 
-    private fun runDepthModel(bitmap: Bitmap, modelFile: File, modelThreads: Int, useGpu: Boolean): FloatArray {
+    private fun runDepthModel(
+        bitmap: Bitmap,
+        modelFile: File,
+        modelThreads: Int,
+        useGpu: Boolean,
+        onRuntimeInfo: ((String) -> Unit)? = null,
+    ): FloatArray {
         val inputSize = 518
         val model = loadModelFile(modelFile)
         var gpuDelegate: GpuDelegate? = null
@@ -1731,11 +1761,16 @@ private class VrGenerator(
                 gpuDelegate = null
             }
         }
-        val interpreter = runCatching { Interpreter(model, options) }.getOrElse {
+        var delegateActive = false
+        val interpreter = runCatching { Interpreter(model, options) }.onSuccess {
+            delegateActive = gpuDelegate != null
+        }.getOrElse {
             gpuDelegate?.close()
             gpuDelegate = null
+            onRuntimeInfo?.invoke("tflite gpu delegate fallback: ${it.message}")
             Interpreter(model, Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8)))
         }
+        onRuntimeInfo?.invoke("tflite runtime threads=${modelThreads.coerceIn(1, 8)} requestedGpu=$useGpu delegateActive=$delegateActive")
         val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
         val pixels = IntArray(inputSize * inputSize)
@@ -1869,7 +1904,8 @@ private class VideoVrGenerator(
         onProgress: (Float, Int, Int, Int) -> Unit,
     ): VideoCacheEntry {
         val vrParams = params.toVrParams()
-        val dir = cache.entryDir(item)
+        val version = vrParams.cacheVersion()
+        val dir = cache.entryDir(item, version)
         val framesDir = File(dir, "frames").also { it.mkdirs() }
         val output = File(dir, "vr_sbs.mp4")
         val logPath = File(dir, "job.log")
@@ -1887,7 +1923,7 @@ private class VideoVrGenerator(
         val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()?.coerceAtLeast(1L) ?: 1L
         val fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()?.roundToInt()?.coerceIn(1, 60) ?: 30
         val totalFrames = ((durationMs / 1000f) * fps).roundToInt().coerceAtLeast(1)
-        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames")
+        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} useGpu=${vrParams.useGpu}")
 
         val first = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST) ?: error("Unable to decode first video frame")
         val firstFrameCache = File(framesDir, "frame_000000.jpg")
@@ -1928,6 +1964,9 @@ private class VideoVrGenerator(
                 "fps=$fps",
                 "source=${item.displayName}",
                 "depthModel=${vrParams.depthModel}",
+                "cacheVersion=$version",
+                "modelThreads=${vrParams.modelThreads}",
+                "useGpu=${vrParams.useGpu}",
                 "maxLongEdge=${vrParams.maxLongEdge}",
             ).joinToString("\n"),
             Charsets.UTF_8,
@@ -2587,6 +2626,8 @@ private fun SettingsScreen(
             Text(lang.t("设置", "Settings"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(16.dp))
+
+        SettingsSectionTitle(lang.t("公共设置", "General"))
         Text(lang.t("语言", "Language"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow {
@@ -2619,6 +2660,7 @@ private fun SettingsScreen(
         }
         Spacer(Modifier.height(16.dp))
 
+        SettingsSectionTitle(lang.t("图片生成设置", "Image generation"))
         ModelPicker(
             title = lang.t("图片模型选择", "Image model"),
             selectedModelId = settings.imageModelId,
@@ -2672,6 +2714,8 @@ private fun SettingsScreen(
         }
         Text(lang.t("GPU 会尝试使用 TFLite GPU Delegate；不兼容时自动回退 CPU。", "GPU uses TFLite GPU Delegate when compatible and falls back to CPU if needed."), style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(12.dp))
+
+        SettingsSectionTitle(lang.t("视频生成设置", "Video generation"))
         Text(lang.t("视频生成优化", "Video generation tuning"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         ModelPicker(
@@ -2706,6 +2750,13 @@ private fun SettingsScreen(
             Text(lang.t("反转深度", "Invert depth"))
         }
     }
+}
+
+@Composable
+private fun SettingsSectionTitle(title: String) {
+    HorizontalDivider(Modifier.padding(vertical = 10.dp))
+    Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(10.dp))
 }
 
 @Composable
@@ -3582,7 +3633,8 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: 
 private fun VrGenerationParams.cacheVersion(): String {
     val scale = depthScale.roundToInt()
     val invert = if (invertDepth) "inv1" else "inv0"
-    return "${depthModel}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}"
+    val gpu = if (useGpu) "gpu1" else "gpu0"
+    return "${depthModel}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_$gpu"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 
