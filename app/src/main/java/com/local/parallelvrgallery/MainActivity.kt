@@ -375,6 +375,7 @@ data class UiState(
     val hasNotificationPermission: Boolean = false,
     val photos: List<PhotoItem> = emptyList(),
     val selectedIndex: Int? = null,
+    val viewerReturnToManage: Boolean = false,
     val galleryAnchorIndex: Int = 0,
     val galleryScrollIndex: Int = 0,
     val galleryScrollOffset: Int = 0,
@@ -487,6 +488,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryScrollOffset = firstVisibleOffset,
                 galleryAnchorSlot = (index - firstVisibleIndex).coerceAtLeast(0),
                 vrMode = true,
+                viewerReturnToManage = false,
                 message = null,
             )
         }
@@ -502,6 +504,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
                 vrMode = true,
                 manageOpen = false,
+                viewerReturnToManage = true,
                 entries = if (photo != null && entry != null) it.entries + (photo.cacheKey to entry) else it.entries,
                 message = null,
             )
@@ -516,6 +519,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
                 vrMode = true,
                 manageOpen = false,
+                viewerReturnToManage = true,
                 message = null,
             )
         }
@@ -527,6 +531,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             it.copy(
                 selectedIndex = null,
                 debugIndex = null,
+                manageOpen = it.viewerReturnToManage,
+                viewerReturnToManage = false,
                 galleryAnchorIndex = currentIndex,
                 galleryScrollIndex = max(0, currentIndex - it.galleryAnchorSlot),
             )
@@ -560,7 +566,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.18"
+                    val current = "v1.19"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -785,15 +791,48 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun regenerateImages(indexes: List<Int>) {
         val unique = indexes.distinct()
         if (unique.isEmpty()) return
-        _uiState.update { it.copy(vrMode = true, message = "已加入 ${unique.size} 张图片重新生成队列") }
-        unique.forEachIndexed { order, index -> enqueuePhoto(index, priority = order + 1, force = true, current = false) }
-        startWorker()
+        viewModelScope.launch(Dispatchers.IO) {
+            val photos = unique.mapNotNull { _uiState.value.photos.getOrNull(it) }.filter { it.kind == MediaKind.IMAGE }
+            photos.forEach { cache.deletePhoto(it) }
+            _uiState.update {
+                val keys = photos.map { photo -> photo.cacheKey }.toSet()
+                it.copy(
+                    vrMode = true,
+                    entries = it.entries - keys,
+                    states = it.states + keys.associateWith { VrState.NORMAL },
+                    cacheVersions = cache.summaries(),
+                    managedCacheItems = cache.allEntries(it.photos),
+                    message = "已清理缓存并加入 ${photos.size} 张图片重新生成队列",
+                )
+            }
+            unique.forEachIndexed { order, index -> enqueuePhoto(index, priority = order + 1, force = true, current = false) }
+            startWorker()
+        }
     }
 
     fun regenerateVideos(indexes: List<Int>) {
         val unique = indexes.distinct()
-        unique.forEach { index -> _uiState.value.photos.getOrNull(index)?.let { enqueueVideo(it, force = true) } }
-        _uiState.update { it.copy(message = "已加入 ${unique.size} 个视频重新生成队列") }
+        viewModelScope.launch(Dispatchers.IO) {
+            val videos = unique.mapNotNull { _uiState.value.photos.getOrNull(it) }.filter { it.kind == MediaKind.VIDEO }
+            videos.forEach {
+                videoCache.delete(it)
+                synchronized(pausedVideoParams) {
+                    pausedVideoParams.remove(it.cacheKey)
+                    activeVideoParams.remove(it.cacheKey)
+                }
+                synchronized(pausedVideos) { pausedVideos.remove(it.cacheKey) }
+            }
+            _uiState.update {
+                val keys = videos.map { video -> video.cacheKey }.toSet()
+                it.copy(
+                    videoEntries = it.videoEntries - keys,
+                    videoStates = it.videoStates + keys.associateWith { VideoVrState.NORMAL },
+                    videoJobs = it.videoJobs.filterNot { job -> job.item.cacheKey in keys },
+                    message = "已清理缓存并加入 ${videos.size} 个视频重新生成队列",
+                )
+            }
+            unique.forEach { index -> _uiState.value.photos.getOrNull(index)?.let { enqueueVideo(it, force = true) } }
+        }
     }
 
     fun replaceOriginalWithGenerated(context: Context, index: Int) {
@@ -978,7 +1017,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
         videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
         val started = System.currentTimeMillis()
-        val recentFrameTimes = mutableListOf<Long>()
+        var totalFrameTimeMs = 0L
+        var measuredFrameCount = 0
         var lastFrameAt: Long? = null
         val result = runCatching {
             videoGenerator.generate(
@@ -1006,12 +1046,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 val now = System.currentTimeMillis()
                 lastFrameAt?.let { previous ->
                     if (frame > 1) {
-                        recentFrameTimes += (now - previous).coerceAtLeast(0L)
-                        if (recentFrameTimes.size > 3) recentFrameTimes.removeAt(0)
+                        totalFrameTimeMs += (now - previous).coerceAtLeast(0L)
+                        measuredFrameCount++
                     }
                 }
                 lastFrameAt = now
-                val avgFrameMs = if (recentFrameTimes.isNotEmpty()) recentFrameTimes.average().roundToInt().toLong() else 0L
+                val avgFrameMs = if (measuredFrameCount > 0) totalFrameTimeMs / measuredFrameCount else 0L
                 upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
                 videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
             }
@@ -1553,6 +1593,10 @@ private class VrCacheManager(private val context: Context) {
         } else {
             File(photoDir, entry.version).deleteRecursively()
         }
+    }
+
+    fun deletePhoto(photo: PhotoItem) {
+        File(root, photo.cacheKey).deleteRecursively()
     }
 
     private fun readEntry(photoKey: String, version: String, dir: File): VrCacheEntry? {
@@ -3064,7 +3108,7 @@ private fun ViewerScreen(
                     uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
                     modifier = Modifier.fillMaxSize(),
                     controlsVisible = controlsVisible,
-                    statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  帧生成${job?.avgFrameMs ?: 0}ms",
+                    statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  平均帧${job?.avgFrameMs ?: 0}ms",
                     onSingleTap = { controlsVisible = !controlsVisible },
                 )
             } else {
