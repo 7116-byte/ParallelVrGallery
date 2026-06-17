@@ -376,6 +376,7 @@ data class UiState(
     val photos: List<PhotoItem> = emptyList(),
     val selectedIndex: Int? = null,
     val viewerReturnToManage: Boolean = false,
+    val manageViewerKeys: Set<String> = emptySet(),
     val galleryAnchorIndex: Int = 0,
     val galleryScrollIndex: Int = 0,
     val galleryScrollOffset: Int = 0,
@@ -489,6 +490,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryAnchorSlot = (index - firstVisibleIndex).coerceAtLeast(0),
                 vrMode = true,
                 viewerReturnToManage = false,
+                manageViewerKeys = emptySet(),
                 message = null,
             )
         }
@@ -498,6 +500,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun openGeneratedPhoto(index: Int, entry: VrCacheEntry? = null) {
         val photo = _uiState.value.photos.getOrNull(index)
         _uiState.update {
+            val keys = it.managedCacheItems.map { item -> item.photoItem.cacheKey }.toSet()
             it.copy(
                 selectedIndex = index,
                 galleryAnchorIndex = index,
@@ -505,6 +508,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 vrMode = true,
                 manageOpen = false,
                 viewerReturnToManage = true,
+                manageViewerKeys = keys + listOfNotNull(photo?.cacheKey),
                 entries = if (photo != null && entry != null) it.entries + (photo.cacheKey to entry) else it.entries,
                 message = null,
             )
@@ -513,6 +517,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun openGeneratedVideo(index: Int) {
         _uiState.update {
+            val keys = it.photos.filter { item ->
+                item.kind == MediaKind.VIDEO &&
+                    ((it.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) != VideoVrState.NORMAL ||
+                        it.videoEntries.containsKey(item.cacheKey) ||
+                        it.videoJobs.any { job -> job.item.cacheKey == item.cacheKey })
+            }.map { item -> item.cacheKey }.toSet()
             it.copy(
                 selectedIndex = index,
                 galleryAnchorIndex = index,
@@ -520,6 +530,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 vrMode = true,
                 manageOpen = false,
                 viewerReturnToManage = true,
+                manageViewerKeys = keys,
                 message = null,
             )
         }
@@ -533,6 +544,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 debugIndex = null,
                 manageOpen = it.viewerReturnToManage,
                 viewerReturnToManage = false,
+                manageViewerKeys = emptySet(),
                 galleryAnchorIndex = currentIndex,
                 galleryScrollIndex = max(0, currentIndex - it.galleryAnchorSlot),
             )
@@ -566,7 +578,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.19"
+                    val current = "v1.20"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3081,9 +3093,19 @@ private fun ViewerScreen(
         }
     }
 
-    val pagerState = rememberPagerState(initialPage = startIndex) { state.photos.size }
+    val viewerItems = remember(state.photos, state.viewerReturnToManage, state.manageViewerKeys, startIndex) {
+        val indexed = state.photos.mapIndexed { index, item -> index to item }
+        if (state.viewerReturnToManage && state.manageViewerKeys.isNotEmpty()) {
+            indexed.filter { (_, item) -> item.cacheKey in state.manageViewerKeys }
+                .ifEmpty { indexed.filter { it.first == startIndex } }
+        } else {
+            indexed
+        }
+    }
+    val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
+    val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
     LaunchedEffect(pagerState.currentPage) {
-        onIndexChanged(pagerState.currentPage)
+        viewerItems.getOrNull(pagerState.currentPage)?.first?.let(onIndexChanged)
     }
     var controlsVisible by remember { mutableStateOf(true) }
     LaunchedEffect(controlsVisible, state.vrMode, pagerState.currentPage) {
@@ -3099,7 +3121,7 @@ private fun ViewerScreen(
             .background(androidx.compose.ui.graphics.Color.Black),
     ) {
         HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
-            val photo = state.photos[page]
+            val (sourceIndex, photo) = viewerItems.getOrNull(page) ?: return@HorizontalPager
             if (photo.kind == MediaKind.VIDEO) {
                 val generated = state.videoEntries[photo.cacheKey]
                 val job = state.videoJobs.firstOrNull { it.item.cacheKey == photo.cacheKey }
@@ -3130,7 +3152,7 @@ private fun ViewerScreen(
                             },
                     )
                     if (state.vrMode && vrState != VrState.READY) {
-                        StatusOverlay(vrState, lang, onRetry = { onRetry(page) })
+                        StatusOverlay(vrState, lang, onRetry = { onRetry(sourceIndex) })
                     }
                 }
             }
@@ -3142,7 +3164,9 @@ private fun ViewerScreen(
             ) {
                 OutlinedButton(onClick = onClose) { Text(lang.t("返回", "Back")) }
                 Spacer(Modifier.width(8.dp))
-                val currentItem = state.photos.getOrNull(pagerState.currentPage)
+                val currentPair = viewerItems.getOrNull(pagerState.currentPage)
+                val currentIndex = currentPair?.first ?: startIndex
+                val currentItem = currentPair?.second
                 Text(
                     text = currentItem?.displayName.orEmpty(),
                     color = androidx.compose.ui.graphics.Color.White,
@@ -3150,7 +3174,7 @@ private fun ViewerScreen(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
-                Button(onClick = { onVr(pagerState.currentPage) }) {
+                Button(onClick = { onVr(currentIndex) }) {
                     Text(
                         if (currentItem?.kind == MediaKind.VIDEO) {
                             when (state.videoStates[currentItem.cacheKey] ?: VideoVrState.NORMAL) {
@@ -3169,20 +3193,20 @@ private fun ViewerScreen(
                     )
                 }
                 Spacer(Modifier.width(8.dp))
-                OutlinedButton(onClick = { onOpenDebug(pagerState.currentPage) }) { Text(lang.t("调试", "Debug")) }
+                OutlinedButton(onClick = { onOpenDebug(currentIndex) }) { Text(lang.t("调试", "Debug")) }
             }
-            val current = state.photos.getOrNull(pagerState.currentPage)
+            val current = viewerItems.getOrNull(pagerState.currentPage)?.second
             if (current?.kind != MediaKind.VIDEO) Column(
                 modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
             ) {
                 if (current != null) {
                     Text(
-                        text = imageLoadedLine(state, pagerState.currentPage, lang),
+                        text = imageLoadedLine(state, viewerItems.getOrNull(pagerState.currentPage)?.first ?: startIndex, lang),
                         color = androidx.compose.ui.graphics.Color.White,
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Text(
-                        text = imageQueueLine(state, pagerState.currentPage, lang),
+                        text = imageQueueLine(state, viewerItems.getOrNull(pagerState.currentPage)?.first ?: startIndex, lang),
                         color = androidx.compose.ui.graphics.Color.White,
                         style = MaterialTheme.typography.bodySmall,
                     )
