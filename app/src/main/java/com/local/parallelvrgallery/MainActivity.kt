@@ -67,12 +67,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -177,12 +179,25 @@ data class PhotoItem(
     val size: Long,
     val modifiedTime: Long,
     val kind: MediaKind = MediaKind.IMAGE,
+    val bucketId: String = "",
+    val bucketName: String = "",
+    val relativePath: String = "",
 ) {
     val cacheKey: String
         get() = if (kind == MediaKind.IMAGE) "${id}_${size}_${modifiedTime}" else "VIDEO_${id}_${size}_${modifiedTime}"
 }
 
 typealias GalleryItem = PhotoItem
+
+data class AlbumItem(
+    val bucketId: String,
+    val name: String,
+    val relativePath: String,
+    val coverUri: Uri,
+    val coverKind: MediaKind,
+    val count: Int,
+    val latestModified: Long,
+)
 
 enum class VrState {
     NORMAL,
@@ -377,12 +392,16 @@ data class UiState(
     val selectedIndex: Int? = null,
     val viewerReturnToManage: Boolean = false,
     val manageViewerKeys: Set<String> = emptySet(),
+    val viewerScopeKeys: Set<String> = emptySet(),
     val galleryAnchorIndex: Int = 0,
     val galleryScrollIndex: Int = 0,
     val galleryScrollOffset: Int = 0,
     val galleryAnchorSlot: Int = 0,
     val settingsOpen: Boolean = false,
     val manageOpen: Boolean = false,
+    val homeTab: String = "all",
+    val selectedAlbumId: String? = null,
+    val albums: List<AlbumItem> = emptyList(),
     val vrMode: Boolean = false,
     val settings: AppSettings = AppSettings(),
     val activePrefetchWindow: Int = 2,
@@ -459,12 +478,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             val photos = withContext(Dispatchers.IO) { repository.loadMedia() }
             val imageItems = photos.filter { it.kind == MediaKind.IMAGE }
             val videoItems = photos.filter { it.kind == MediaKind.VIDEO }
+            val albums = buildAlbums(photos)
             val entries = withContext(Dispatchers.IO) { imageItems.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey } }
             val managedItems = withContext(Dispatchers.IO) { cache.allEntries(imageItems) }
             val videoEntries = withContext(Dispatchers.IO) { videoItems.mapNotNull { videoCache.findEntry(it) }.associateBy { it.videoKey } }
             _uiState.update {
                 it.copy(
                     photos = photos,
+                    albums = albums,
                     entries = entries,
                     states = imageItems.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
                     videoStates = videoItems.associate { item -> item.cacheKey to if (videoEntries.containsKey(item.cacheKey)) VideoVrState.READY else VideoVrState.NORMAL },
@@ -480,6 +501,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun openPhoto(index: Int, firstVisibleIndex: Int = index, firstVisibleOffset: Int = 0) {
+        openPhoto(index, firstVisibleIndex, firstVisibleOffset, emptySet())
+    }
+
+    fun openScopedPhoto(index: Int, scopeKeys: Set<String>, firstVisibleIndex: Int = index, firstVisibleOffset: Int = 0) {
+        openPhoto(index, firstVisibleIndex, firstVisibleOffset, scopeKeys)
+    }
+
+    private fun openPhoto(index: Int, firstVisibleIndex: Int, firstVisibleOffset: Int, scopeKeys: Set<String>) {
         val item = _uiState.value.photos.getOrNull(index)
         _uiState.update {
             it.copy(
@@ -491,6 +520,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 vrMode = true,
                 viewerReturnToManage = false,
                 manageViewerKeys = emptySet(),
+                viewerScopeKeys = scopeKeys,
                 message = null,
             )
         }
@@ -509,6 +539,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageOpen = false,
                 viewerReturnToManage = true,
                 manageViewerKeys = keys + listOfNotNull(photo?.cacheKey),
+                viewerScopeKeys = keys + listOfNotNull(photo?.cacheKey),
                 entries = if (photo != null && entry != null) it.entries + (photo.cacheKey to entry) else it.entries,
                 message = null,
             )
@@ -531,6 +562,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageOpen = false,
                 viewerReturnToManage = true,
                 manageViewerKeys = keys,
+                viewerScopeKeys = keys,
                 message = null,
             )
         }
@@ -545,11 +577,33 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageOpen = it.viewerReturnToManage,
                 viewerReturnToManage = false,
                 manageViewerKeys = emptySet(),
+                viewerScopeKeys = emptySet(),
                 galleryAnchorIndex = currentIndex,
                 galleryScrollIndex = max(0, currentIndex - it.galleryAnchorSlot),
             )
         }
         enqueueWindow(_uiState.value.galleryAnchorIndex, includeCurrent = false)
+    }
+
+    fun setHomeTab(tab: String) {
+        _uiState.update {
+            val imageItems = it.photos.filter { item -> item.kind == MediaKind.IMAGE }
+            it.copy(
+                homeTab = tab,
+                selectedAlbumId = if (tab == "albums") it.selectedAlbumId else null,
+                manageOpen = false,
+                cacheVersions = if (tab == "generated") cache.summaries() else it.cacheVersions,
+                managedCacheItems = if (tab == "generated") cache.allEntries(imageItems) else it.managedCacheItems,
+            )
+        }
+    }
+
+    fun openAlbum(bucketId: String) {
+        _uiState.update { it.copy(homeTab = "albums", selectedAlbumId = bucketId, manageOpen = false) }
+    }
+
+    fun closeAlbum() {
+        _uiState.update { it.copy(selectedAlbumId = null) }
     }
 
     fun openSettings() {
@@ -578,7 +632,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.20"
+                    val current = "v1.21"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1357,6 +1411,40 @@ private fun imageWindowCount(state: UiState, index: Int, offsetStep: Int, states
     return count
 }
 
+private fun buildAlbums(items: List<GalleryItem>): List<AlbumItem> {
+    return items.groupBy { item ->
+        item.bucketId.ifBlank { item.relativePath.ifBlank { "bucket_${item.displayName.substringBeforeLast('.', item.displayName)}" } }
+    }.mapNotNull { (bucketId, albumItems) ->
+        val latest = albumItems.maxByOrNull { it.modifiedTime } ?: return@mapNotNull null
+        AlbumItem(
+            bucketId = bucketId,
+            name = latest.bucketName.ifBlank {
+                latest.relativePath.trim('/').substringAfterLast('/').ifBlank { "未命名相册" }
+            },
+            relativePath = latest.relativePath,
+            coverUri = latest.uri,
+            coverKind = latest.kind,
+            count = albumItems.size,
+            latestModified = latest.modifiedTime,
+        )
+    }.sortedByDescending { it.latestModified }
+}
+
+private fun dateGroupLabel(modifiedTimeSeconds: Long, lang: AppLanguage): String {
+    val now = java.util.Calendar.getInstance()
+    val target = java.util.Calendar.getInstance().apply { timeInMillis = modifiedTimeSeconds * 1000L }
+    val todayYear = now.get(java.util.Calendar.YEAR)
+    val todayDay = now.get(java.util.Calendar.DAY_OF_YEAR)
+    val targetYear = target.get(java.util.Calendar.YEAR)
+    val targetDay = target.get(java.util.Calendar.DAY_OF_YEAR)
+    return when {
+        todayYear == targetYear && todayDay == targetDay -> lang.t("今天", "Today")
+        todayYear == targetYear && todayDay - targetDay == 1 -> lang.t("昨天", "Yesterday")
+        lang == AppLanguage.ZH -> SimpleDateFormat("M月d日", Locale.CHINA).format(Date(modifiedTimeSeconds * 1000L))
+        else -> SimpleDateFormat("MMM d", Locale.US).format(Date(modifiedTimeSeconds * 1000L))
+    }
+}
+
 private fun imageRecentGenerationLines(state: UiState, lang: AppLanguage): List<String> {
     return state.recentGenerations.take(3).map {
         val side = when {
@@ -1475,6 +1563,9 @@ private class PhotoRepository(private val context: Context) {
                 heightColumn = MediaStore.Images.Media.HEIGHT,
                 sizeColumn = MediaStore.Images.Media.SIZE,
                 modifiedColumn = MediaStore.Images.Media.DATE_MODIFIED,
+                bucketIdColumn = MediaStore.Images.Media.BUCKET_ID,
+                bucketNameColumn = MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+                relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Images.Media.RELATIVE_PATH else null,
                 kind = MediaKind.IMAGE,
             )
         }
@@ -1487,6 +1578,9 @@ private class PhotoRepository(private val context: Context) {
                 heightColumn = MediaStore.Video.Media.HEIGHT,
                 sizeColumn = MediaStore.Video.Media.SIZE,
                 modifiedColumn = MediaStore.Video.Media.DATE_MODIFIED,
+                bucketIdColumn = MediaStore.Video.Media.BUCKET_ID,
+                bucketNameColumn = MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
+                relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Video.Media.RELATIVE_PATH else null,
                 kind = MediaKind.VIDEO,
             )
         }
@@ -1501,9 +1595,12 @@ private class PhotoRepository(private val context: Context) {
         heightColumn: String,
         sizeColumn: String,
         modifiedColumn: String,
+        bucketIdColumn: String,
+        bucketNameColumn: String,
+        relativePathColumn: String?,
         kind: MediaKind,
     ): List<GalleryItem> {
-        val projection = arrayOf(idColumn, nameColumn, widthColumn, heightColumn, sizeColumn, modifiedColumn)
+        val projection = listOfNotNull(idColumn, nameColumn, widthColumn, heightColumn, sizeColumn, modifiedColumn, bucketIdColumn, bucketNameColumn, relativePathColumn).toTypedArray()
         val result = mutableListOf<GalleryItem>()
         context.contentResolver.query(collection, projection, null, null, "$modifiedColumn DESC")?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(idColumn)
@@ -1512,10 +1609,16 @@ private class PhotoRepository(private val context: Context) {
             val heightCol = cursor.getColumnIndexOrThrow(heightColumn)
             val sizeCol = cursor.getColumnIndexOrThrow(sizeColumn)
             val modifiedCol = cursor.getColumnIndexOrThrow(modifiedColumn)
+            val bucketIdCol = cursor.getColumnIndex(bucketIdColumn)
+            val bucketNameCol = cursor.getColumnIndex(bucketNameColumn)
+            val relativePathCol = relativePathColumn?.let { cursor.getColumnIndex(it) } ?: -1
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
                 val displayName = cursor.getString(nameCol) ?: "${kind.name.lowercase(Locale.US)}-$id"
                 if (kind == MediaKind.IMAGE && (displayName.startsWith(GENERATED_VR_PREFIX) || displayName.startsWith("VR_"))) continue
+                val bucketId = if (bucketIdCol >= 0) cursor.getString(bucketIdCol).orEmpty() else ""
+                val bucketName = if (bucketNameCol >= 0) cursor.getString(bucketNameCol).orEmpty() else ""
+                val relativePath = if (relativePathCol >= 0) cursor.getString(relativePathCol).orEmpty() else ""
                 result += GalleryItem(
                     id = id,
                     uri = ContentUris.withAppendedId(collection, id),
@@ -1525,6 +1628,9 @@ private class PhotoRepository(private val context: Context) {
                     size = cursor.getLong(sizeCol),
                     modifiedTime = cursor.getLong(modifiedCol),
                     kind = kind,
+                    bucketId = bucketId,
+                    bucketName = bucketName,
+                    relativePath = relativePath,
                 )
             }
         }
@@ -2421,8 +2527,11 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 state = state,
                 onRefresh = viewModel::loadPhotos,
                 onOpen = viewModel::openPhoto,
+                onOpenScoped = viewModel::openScopedPhoto,
                 onSettings = viewModel::openSettings,
-                onManage = viewModel::openManage,
+                onSetTab = viewModel::setHomeTab,
+                onOpenAlbum = viewModel::openAlbum,
+                onCloseAlbum = viewModel::closeAlbum,
                 onSaveGenerated = { viewModel.saveGeneratedCopies(context, it) },
                 onReplaceOriginal = { indexes ->
                     if (Build.VERSION.SDK_INT >= 30) {
@@ -2436,6 +2545,17 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                         viewModel.replaceOriginalsWithGenerated(context, indexes)
                     }
                 },
+                onDeleteVersion = viewModel::deleteCacheVersion,
+                onOpenGenerated = viewModel::openGeneratedPhoto,
+                onOpenGeneratedVideo = viewModel::openGeneratedVideo,
+                onSaveVideo = { viewModel.saveGeneratedVideo(context, it) },
+                onDeleteVideo = viewModel::deleteGeneratedVideo,
+                onSaveVideos = { viewModel.saveGeneratedVideos(context, it) },
+                onDeleteVideos = viewModel::deleteGeneratedVideos,
+                onRegenerateVideos = viewModel::regenerateVideos,
+                onSaveImages = { viewModel.saveGeneratedCopies(context, it) },
+                onDeleteImages = viewModel::deleteGeneratedImageEntries,
+                onRegenerateImages = viewModel::regenerateImages,
             )
         }
     }
@@ -2462,17 +2582,40 @@ private fun GalleryScreen(
     state: UiState,
     onRefresh: () -> Unit,
     onOpen: (Int, Int, Int) -> Unit,
+    onOpenScoped: (Int, Set<String>, Int, Int) -> Unit,
     onSettings: () -> Unit,
-    onManage: () -> Unit,
+    onSetTab: (String) -> Unit,
+    onOpenAlbum: (String) -> Unit,
+    onCloseAlbum: () -> Unit,
     onSaveGenerated: (List<Int>) -> Unit,
     onReplaceOriginal: (List<Int>) -> Unit,
+    onDeleteVersion: (String) -> Unit,
+    onOpenGenerated: (Int, VrCacheEntry) -> Unit,
+    onOpenGeneratedVideo: (Int) -> Unit,
+    onSaveVideo: (Int) -> Unit,
+    onDeleteVideo: (Int) -> Unit,
+    onSaveVideos: (List<Int>) -> Unit,
+    onDeleteVideos: (List<Int>) -> Unit,
+    onRegenerateVideos: (List<Int>) -> Unit,
+    onSaveImages: (List<Int>) -> Unit,
+    onDeleteImages: (List<ManagedCacheItem>) -> Unit,
+    onRegenerateImages: (List<Int>) -> Unit,
 ) {
     val lang = state.settings.language
     var tileSize by rememberSaveable { mutableStateOf(112f) }
     var lastPinchAt by remember { mutableStateOf(0L) }
     var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
-    val selectedIndexes = remember(selectedKeys, state.photos) {
-        state.photos.mapIndexedNotNull { index, photo -> if (photo.cacheKey in selectedKeys) index else null }
+    val albumItems = remember(state.photos, state.selectedAlbumId) {
+        state.selectedAlbumId?.let { bucketId -> state.photos.filter { it.bucketId == bucketId } } ?: emptyList()
+    }
+    val visibleItems = remember(state.photos, albumItems, state.homeTab, state.selectedAlbumId) {
+        if (state.homeTab == "albums" && state.selectedAlbumId != null) albumItems else state.photos
+    }
+    val visibleScopeKeys = remember(visibleItems) { visibleItems.map { it.cacheKey }.toSet() }
+    val selectedIndexes = remember(selectedKeys, visibleItems, state.photos) {
+        visibleItems.mapNotNull { item ->
+            state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedKeys }
+        }
     }
     val gridState = rememberLazyGridState(
         initialFirstVisibleItemIndex = state.galleryScrollIndex.coerceAtLeast(0),
@@ -2484,14 +2627,23 @@ private fun GalleryScreen(
         }
     }
 
-    Scaffold(
-        topBar = {
-            Column(Modifier.fillMaxWidth().padding(16.dp)) {
+    Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
+        Scaffold(
+            topBar = {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selectedKeys.isEmpty()) {
-                        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        OutlinedButton(onClick = onManage) { Text(lang.t("管理", "Manage")) }
-                        Spacer(Modifier.width(8.dp))
+                        val title = when {
+                            state.homeTab == "albums" && state.selectedAlbumId != null -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Album")
+                            state.homeTab == "albums" -> lang.t("相册", "Albums")
+                            state.homeTab == "generated" -> lang.t("生成", "Generated")
+                            else -> lang.t("全部", "All")
+                        }
+                        if (state.homeTab == "albums" && state.selectedAlbumId != null) {
+                            OutlinedButton(onClick = onCloseAlbum) { Text(lang.t("返回", "Back")) }
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                         OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
                         Spacer(Modifier.width(8.dp))
                         OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
@@ -2518,65 +2670,198 @@ private fun GalleryScreen(
                     Text(lang.pickMixed(it), style = MaterialTheme.typography.bodySmall)
                 }
             }
-        },
-    ) { padding ->
-        if (state.loading) {
-            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
-            }
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Adaptive(tileSize.dp),
-                state = gridState,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding)
-                    .pointerInput(Unit) {
-                        awaitPointerEventScope {
-                            while (true) {
-                                val event = awaitPointerEvent()
-                                val pressed = event.changes.filter { it.pressed }
-                                if (pressed.size >= 2) {
-                                    val centroid = pressed.centroid()
-                                    val previousCentroid = pressed.previousCentroid()
-                                    val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
-                                    val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
-                                    if (abs(zoom - 1f) > 0.01f) {
-                                        lastPinchAt = System.currentTimeMillis()
-                                        tileSize = (tileSize * zoom).coerceIn(72f, 220f)
-                                        event.changes.forEach { it.consume() }
-                                    }
+            },
+        ) { padding ->
+            if (state.loading) {
+                Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else if (state.homeTab == "generated") {
+                Box(Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp)) {
+                    ManageScreen(
+                        state = state,
+                        embedded = true,
+                        onBack = {},
+                        onDeleteVersion = onDeleteVersion,
+                        onOpenGenerated = onOpenGenerated,
+                        onOpenGeneratedVideo = onOpenGeneratedVideo,
+                        onSaveVideo = onSaveVideo,
+                        onDeleteVideo = onDeleteVideo,
+                        onSaveVideos = onSaveVideos,
+                        onDeleteVideos = onDeleteVideos,
+                        onRegenerateVideos = onRegenerateVideos,
+                        onSaveImages = onSaveImages,
+                        onDeleteImages = onDeleteImages,
+                        onRegenerateImages = onRegenerateImages,
+                    )
+                }
+            } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(168.dp),
+                    modifier = Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    items(state.albums, key = { it.bucketId }) { album ->
+                        AlbumTile(album = album, lang = lang, onClick = { onOpenAlbum(album.bucketId) })
+                    }
+                }
+            } else {
+                TimelineGrid(
+                    items = visibleItems,
+                    state = state,
+                    lang = lang,
+                    gridState = gridState,
+                    tileSize = tileSize,
+                    selectedKeys = selectedKeys,
+                    onPinch = { zoom ->
+                        lastPinchAt = System.currentTimeMillis()
+                        tileSize = (tileSize * zoom).coerceIn(72f, 220f)
+                    },
+                    onItemClick = { photo ->
+                        if (selectedKeys.isNotEmpty()) {
+                            selectedKeys = if (photo.cacheKey in selectedKeys) selectedKeys - photo.cacheKey else selectedKeys + photo.cacheKey
+                        } else {
+                            val index = state.photos.indexOfFirst { it.cacheKey == photo.cacheKey }
+                            if (index >= 0) {
+                                if (state.homeTab == "albums") {
+                                    onOpenScoped(index, visibleScopeKeys, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
+                                } else {
+                                    onOpen(index, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
                                 }
                             }
                         }
                     },
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(state.photos, key = { it.cacheKey }) { photo ->
-                    val index = state.photos.indexOf(photo)
-                    PhotoTile(
-                        photo = photo,
-                        state = state.states[photo.cacheKey] ?: VrState.NORMAL,
-                        entry = state.entries[photo.cacheKey],
-                        lang = lang,
-                        selected = photo.cacheKey in selectedKeys,
-                        onClick = {
-                            if (selectedKeys.isNotEmpty()) {
-                                selectedKeys = if (photo.cacheKey in selectedKeys) selectedKeys - photo.cacheKey else selectedKeys + photo.cacheKey
-                            } else {
-                                onOpen(index, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
-                            }
-                        },
-                        onLongClick = {
-                            if (System.currentTimeMillis() - lastPinchAt > 700L) {
-                                selectedKeys = selectedKeys + photo.cacheKey
-                            }
-                        },
-                    )
+                    onItemLongClick = { photo ->
+                        if (System.currentTimeMillis() - lastPinchAt > 700L) {
+                            selectedKeys = selectedKeys + photo.cacheKey
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp),
+                )
+            }
+        }
+        HomeBottomNav(
+            current = state.homeTab,
+            lang = lang,
+            onSelect = {
+                selectedKeys = emptySet()
+                onSetTab(it)
+            },
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 18.dp),
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun TimelineGrid(
+    items: List<PhotoItem>,
+    state: UiState,
+    lang: AppLanguage,
+    gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
+    tileSize: Float,
+    selectedKeys: Set<String>,
+    onPinch: (Float) -> Unit,
+    onItemClick: (PhotoItem) -> Unit,
+    onItemLongClick: (PhotoItem) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val grouped = remember(items, lang) { items.groupBy { dateGroupLabel(it.modifiedTime, lang) } }
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(tileSize.dp),
+        state = gridState,
+        modifier = modifier.pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) {
+                    val event = awaitPointerEvent()
+                    val pressed = event.changes.filter { it.pressed }
+                    if (pressed.size >= 2) {
+                        val centroid = pressed.centroid()
+                        val previousCentroid = pressed.previousCentroid()
+                        val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
+                        val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
+                        if (abs(zoom - 1f) > 0.01f) {
+                            onPinch(zoom)
+                            event.changes.forEach { it.consume() }
+                        }
+                    }
                 }
             }
+        },
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        grouped.forEach { (label, groupItems) ->
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 12.dp),
+                )
+            }
+            items(groupItems, key = { it.cacheKey }) { photo ->
+                PhotoTile(
+                    photo = photo,
+                    state = state.states[photo.cacheKey] ?: VrState.NORMAL,
+                    entry = state.entries[photo.cacheKey],
+                    lang = lang,
+                    selected = photo.cacheKey in selectedKeys,
+                    onClick = { onItemClick(photo) },
+                    onLongClick = { onItemLongClick(photo) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AlbumTile(album: AlbumItem, lang: AppLanguage, onClick: () -> Unit) {
+    Column(Modifier.fillMaxWidth().clickable(onClick = onClick)) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(1.25f)
+                .background(androidx.compose.ui.graphics.Color(0xffe8eaed), RoundedCornerShape(18.dp)),
+        ) {
+            AsyncMediaThumbnail(album.coverKind, album.coverUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(album.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold)
+        Text(lang.t("${album.count} 项", "${album.count} items"), color = androidx.compose.ui.graphics.Color(0xff777777), style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun HomeBottomNav(current: String, lang: AppLanguage, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .background(androidx.compose.ui.graphics.Color.White, RoundedCornerShape(34.dp))
+            .padding(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        listOf(
+            "all" to lang.t("全部", "All"),
+            "albums" to lang.t("相册", "Albums"),
+            "generated" to lang.t("生成", "Generated"),
+        ).forEach { (key, label) ->
+            val selected = key == current
+            Text(
+                text = label,
+                color = if (selected) androidx.compose.ui.graphics.Color.White else androidx.compose.ui.graphics.Color(0xff333333),
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                modifier = Modifier
+                    .background(
+                        if (selected) androidx.compose.ui.graphics.Color(0xff6650a4) else androidx.compose.ui.graphics.Color.Transparent,
+                        RoundedCornerShape(28.dp),
+                    )
+                    .clickable { onSelect(key) }
+                    .padding(horizontal = 22.dp, vertical = 12.dp),
+            )
         }
     }
 }
@@ -2634,6 +2919,7 @@ private fun PhotoTile(
 @Composable
 private fun ManageScreen(
     state: UiState,
+    embedded: Boolean = false,
     onBack: () -> Unit,
     onDeleteVersion: (String) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
@@ -2655,14 +2941,16 @@ private fun ManageScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
-            .padding(16.dp),
+            .padding(if (embedded) 0.dp else 16.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
-            Spacer(Modifier.width(12.dp))
-            Text(lang.t("生成管理", "Generated Manager"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        if (!embedded) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
+                Spacer(Modifier.width(12.dp))
+                Text(lang.t("生成管理", "Generated Manager"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(16.dp))
         }
-        Spacer(Modifier.height(16.dp))
         SingleChoiceSegmentedButtonRow {
             listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")).forEachIndexed { index, option ->
                 SegmentedButton(
@@ -3093,10 +3381,10 @@ private fun ViewerScreen(
         }
     }
 
-    val viewerItems = remember(state.photos, state.viewerReturnToManage, state.manageViewerKeys, startIndex) {
+    val viewerItems = remember(state.photos, state.viewerScopeKeys, startIndex) {
         val indexed = state.photos.mapIndexed { index, item -> index to item }
-        if (state.viewerReturnToManage && state.manageViewerKeys.isNotEmpty()) {
-            indexed.filter { (_, item) -> item.cacheKey in state.manageViewerKeys }
+        if (state.viewerScopeKeys.isNotEmpty()) {
+            indexed.filter { (_, item) -> item.cacheKey in state.viewerScopeKeys }
                 .ifEmpty { indexed.filter { it.first == startIndex } }
         } else {
             indexed
