@@ -427,6 +427,22 @@ data class UiState(
     val updateAvailable: Boolean = false,
 )
 
+private data class MediaSnapshot(
+    val photos: List<PhotoItem>,
+    val imageCount: Int,
+    val videoCount: Int,
+    val albums: List<AlbumItem>,
+    val entries: Map<String, VrCacheEntry>,
+    val managedItems: List<ManagedCacheItem>,
+    val videoEntries: Map<String, VideoCacheEntry>,
+    val cacheVersions: List<CacheVersionSummary>,
+)
+
+private sealed class TimelineCell {
+    data class Header(val label: String) : TimelineCell()
+    data class Media(val item: PhotoItem) : TimelineCell()
+}
+
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application
     private val repository = PhotoRepository(app)
@@ -475,25 +491,40 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun loadPhotos() {
         viewModelScope.launch {
             _uiState.update { it.copy(loading = true, message = null) }
-            val photos = withContext(Dispatchers.IO) { repository.loadMedia() }
-            val imageItems = photos.filter { it.kind == MediaKind.IMAGE }
-            val videoItems = photos.filter { it.kind == MediaKind.VIDEO }
-            val albums = buildAlbums(photos)
-            val entries = withContext(Dispatchers.IO) { imageItems.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey } }
-            val managedItems = withContext(Dispatchers.IO) { cache.allEntries(imageItems) }
-            val videoEntries = withContext(Dispatchers.IO) { videoItems.mapNotNull { videoCache.findEntry(it) }.associateBy { it.videoKey } }
+            val snapshot = withContext(Dispatchers.IO) {
+                val photos = repository.loadMedia()
+                val imageItems = photos.filter { it.kind == MediaKind.IMAGE }
+                val videoItems = photos.filter { it.kind == MediaKind.VIDEO }
+                val photoByKey = imageItems.associateBy { it.cacheKey }
+                val videoByKey = videoItems.associateBy { it.cacheKey }
+                val managedItems = cache.allEntriesByKey(photoByKey)
+                val entries = managedItems
+                    .groupBy { it.entry.photoKey }
+                    .mapValues { (_, items) -> items.maxBy { it.entry.createdAt }.entry }
+                val videoEntries = videoCache.allEntriesByKey(videoByKey).associate { it.first.cacheKey to it.second }
+                MediaSnapshot(
+                    photos = photos,
+                    imageCount = imageItems.size,
+                    videoCount = videoItems.size,
+                    albums = buildAlbums(photos),
+                    entries = entries,
+                    managedItems = managedItems,
+                    videoEntries = videoEntries,
+                    cacheVersions = cache.summaries(),
+                )
+            }
             _uiState.update {
                 it.copy(
-                    photos = photos,
-                    albums = albums,
-                    entries = entries,
-                    states = imageItems.associate { photo -> photo.cacheKey to if (entries.containsKey(photo.cacheKey)) VrState.READY else VrState.NORMAL },
-                    videoStates = videoItems.associate { item -> item.cacheKey to if (videoEntries.containsKey(item.cacheKey)) VideoVrState.READY else VideoVrState.NORMAL },
-                    videoEntries = videoEntries,
+                    photos = snapshot.photos,
+                    albums = snapshot.albums,
+                    entries = snapshot.entries,
+                    states = snapshot.entries.keys.associateWith { VrState.READY },
+                    videoStates = snapshot.videoEntries.keys.associateWith { VideoVrState.READY },
+                    videoEntries = snapshot.videoEntries,
                     loading = false,
-                    message = "已加载 ${imageItems.size} 张图片、${videoItems.size} 个视频 / ${imageItems.size} images, ${videoItems.size} videos loaded",
-                    cacheVersions = cache.summaries(),
-                    managedCacheItems = managedItems,
+                    message = "已加载 ${snapshot.imageCount} 张图片、${snapshot.videoCount} 个视频 / ${snapshot.imageCount} images, ${snapshot.videoCount} videos loaded",
+                    cacheVersions = snapshot.cacheVersions,
+                    managedCacheItems = snapshot.managedItems,
                     modelStatus = modelStatusText(it.settings),
                 )
             }
@@ -587,13 +618,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun setHomeTab(tab: String) {
         _uiState.update {
-            val imageItems = it.photos.filter { item -> item.kind == MediaKind.IMAGE }
             it.copy(
                 homeTab = tab,
                 selectedAlbumId = if (tab == "albums") it.selectedAlbumId else null,
                 manageOpen = false,
-                cacheVersions = if (tab == "generated") cache.summaries() else it.cacheVersions,
-                managedCacheItems = if (tab == "generated") cache.allEntries(imageItems) else it.managedCacheItems,
             )
         }
     }
@@ -632,7 +660,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.21"
+                    val current = "v1.22"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1680,6 +1708,27 @@ private class VrCacheManager(private val context: Context) {
     }
 
     fun allEntries(photos: List<PhotoItem>): List<ManagedCacheItem> {
+        return allEntriesByKey(photos.associateBy { it.cacheKey })
+    }
+
+    fun allEntriesByKey(photoByKey: Map<String, PhotoItem>): List<ManagedCacheItem> {
+        return root.listFiles()?.asSequence()
+            ?.filter { it.isDirectory }
+            ?.flatMap { photoDir ->
+                val photo = photoByKey[photoDir.name] ?: return@flatMap emptySequence()
+                val entries = mutableListOf<VrCacheEntry>()
+                readEntry(photo.cacheKey, DEFAULT_VERSION, entryDir(photo, DEFAULT_VERSION))?.let { entries += it }
+                photoDir.listFiles()?.filter { it.isDirectory }?.forEach { versionDir ->
+                    readEntry(photo.cacheKey, versionDir.name, versionDir)?.let { entries += it }
+                }
+                entries.asSequence().map { ManagedCacheItem(photo, it) }
+            }
+            ?.sortedByDescending { it.entry.createdAt }
+            ?.toList()
+            ?: emptyList()
+    }
+
+    fun allEntriesSlow(photos: List<PhotoItem>): List<ManagedCacheItem> {
         return photos.flatMap { photo ->
             val entries = mutableListOf<VrCacheEntry>()
             readEntry(photo.cacheKey, DEFAULT_VERSION, entryDir(photo, DEFAULT_VERSION))?.let { entries += it }
@@ -1761,9 +1810,24 @@ private class VideoVrCacheManager(private val context: Context) {
     }
 
     fun allEntries(items: List<GalleryItem>): List<Pair<GalleryItem, VideoCacheEntry>> {
-        return items.filter { it.kind == MediaKind.VIDEO }.mapNotNull { item ->
-            findEntry(item)?.let { item to it }
-        }.sortedByDescending { it.second.createdAt }
+        return allEntriesByKey(items.filter { it.kind == MediaKind.VIDEO }.associateBy { it.cacheKey })
+    }
+
+    fun allEntriesByKey(videoByKey: Map<String, GalleryItem>): List<Pair<GalleryItem, VideoCacheEntry>> {
+        return root.listFiles()?.asSequence()
+            ?.filter { it.isDirectory }
+            ?.mapNotNull { videoDir ->
+                val item = videoByKey[videoDir.name] ?: return@mapNotNull null
+                val entries = mutableListOf<VideoCacheEntry>()
+                readEntry(item.cacheKey, videoDir)?.let { entries += it }
+                videoDir.listFiles()?.filter { it.isDirectory }?.forEach { dir ->
+                    readEntry(item.cacheKey, dir)?.let { entries += it }
+                }
+                entries.maxByOrNull { it.createdAt }?.let { item to it }
+            }
+            ?.sortedByDescending { it.second.createdAt }
+            ?.toList()
+            ?: emptyList()
     }
 
     fun delete(item: GalleryItem) {
@@ -2617,12 +2681,14 @@ private fun GalleryScreen(
             state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedKeys }
         }
     }
+    val initialGridIndex = if (state.homeTab == "albums" && state.selectedAlbumId != null) 0 else state.galleryScrollIndex.coerceAtLeast(0)
     val gridState = rememberLazyGridState(
-        initialFirstVisibleItemIndex = state.galleryScrollIndex.coerceAtLeast(0),
+        initialFirstVisibleItemIndex = initialGridIndex,
         initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
     )
-    LaunchedEffect(state.galleryScrollIndex, state.galleryScrollOffset, state.photos.size) {
-        if (state.galleryScrollIndex in state.photos.indices) {
+    LaunchedEffect(state.galleryScrollIndex, state.galleryScrollOffset, visibleItems.size, state.homeTab, state.selectedAlbumId) {
+        if (state.homeTab == "albums" && state.selectedAlbumId != null) return@LaunchedEffect
+        if (state.galleryScrollIndex in visibleItems.indices) {
             gridState.scrollToItem(state.galleryScrollIndex, state.galleryScrollOffset)
         }
     }
@@ -2768,7 +2834,19 @@ private fun TimelineGrid(
     onItemLongClick: (PhotoItem) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val grouped = remember(items, lang) { items.groupBy { dateGroupLabel(it.modifiedTime, lang) } }
+    val cells = remember(items, lang) {
+        val result = mutableListOf<TimelineCell>()
+        var lastLabel: String? = null
+        items.forEach { item ->
+            val label = dateGroupLabel(item.modifiedTime, lang)
+            if (label != lastLabel) {
+                result += TimelineCell.Header(label)
+                lastLabel = label
+            }
+            result += TimelineCell.Media(item)
+        }
+        result
+    }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(tileSize.dp),
         state = gridState,
@@ -2794,25 +2872,30 @@ private fun TimelineGrid(
         verticalArrangement = Arrangement.spacedBy(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        grouped.forEach { (label, groupItems) ->
-            item(span = { GridItemSpan(maxLineSpan) }) {
-                Text(
-                    text = label,
+        items(
+            items = cells,
+            key = { cell -> if (cell is TimelineCell.Header) "header_${cell.label}" else (cell as TimelineCell.Media).item.cacheKey },
+            span = { cell -> if (cell is TimelineCell.Header) GridItemSpan(maxLineSpan) else GridItemSpan(1) },
+        ) { cell ->
+            when (cell) {
+                is TimelineCell.Header -> Text(
+                    text = cell.label,
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 12.dp),
                 )
-            }
-            items(groupItems, key = { it.cacheKey }) { photo ->
-                PhotoTile(
-                    photo = photo,
-                    state = state.states[photo.cacheKey] ?: VrState.NORMAL,
-                    entry = state.entries[photo.cacheKey],
-                    lang = lang,
-                    selected = photo.cacheKey in selectedKeys,
-                    onClick = { onItemClick(photo) },
-                    onLongClick = { onItemLongClick(photo) },
-                )
+                is TimelineCell.Media -> {
+                    val photo = cell.item
+                    PhotoTile(
+                        photo = photo,
+                        state = state.states[photo.cacheKey] ?: VrState.NORMAL,
+                        entry = state.entries[photo.cacheKey],
+                        lang = lang,
+                        selected = photo.cacheKey in selectedKeys,
+                        onClick = { onItemClick(photo) },
+                        onLongClick = { onItemLongClick(photo) },
+                    )
+                }
             }
         }
     }
