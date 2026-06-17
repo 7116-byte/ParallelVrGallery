@@ -99,6 +99,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -182,9 +183,11 @@ data class PhotoItem(
     val bucketId: String = "",
     val bucketName: String = "",
     val relativePath: String = "",
+    val forcedCacheKey: String? = null,
+    val generatedVirtual: Boolean = false,
 ) {
     val cacheKey: String
-        get() = if (kind == MediaKind.IMAGE) "${id}_${size}_${modifiedTime}" else "VIDEO_${id}_${size}_${modifiedTime}"
+        get() = forcedCacheKey ?: if (kind == MediaKind.IMAGE) "${id}_${size}_${modifiedTime}" else "VIDEO_${id}_${size}_${modifiedTime}"
 }
 
 typealias GalleryItem = PhotoItem
@@ -321,6 +324,7 @@ private val AvailableModels = listOf(
 )
 
 private const val GENERATED_VR_PREFIX = "PVG_VR_"
+private const val INITIAL_MEDIA_LIMIT = 1800
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -441,6 +445,7 @@ private data class MediaSnapshot(
 private sealed class TimelineCell {
     data class Header(val label: String) : TimelineCell()
     data class Media(val item: PhotoItem) : TimelineCell()
+    data class Footer(val loaded: Int, val total: Int) : TimelineCell()
 }
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
@@ -492,21 +497,26 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _uiState.update { it.copy(loading = true, message = null) }
             val snapshot = withContext(Dispatchers.IO) {
-                val photos = repository.loadMedia()
-                val imageItems = photos.filter { it.kind == MediaKind.IMAGE }
-                val videoItems = photos.filter { it.kind == MediaKind.VIDEO }
+                val systemPhotos = repository.loadMedia(INITIAL_MEDIA_LIMIT)
+                val imageItems = systemPhotos.filter { it.kind == MediaKind.IMAGE }
+                val videoItems = systemPhotos.filter { it.kind == MediaKind.VIDEO }
                 val photoByKey = imageItems.associateBy { it.cacheKey }
                 val videoByKey = videoItems.associateBy { it.cacheKey }
                 val managedItems = cache.allEntriesByKey(photoByKey)
                 val entries = managedItems
                     .groupBy { it.entry.photoKey }
                     .mapValues { (_, items) -> items.maxBy { it.entry.createdAt }.entry }
-                val videoEntries = videoCache.allEntriesByKey(videoByKey).associate { it.first.cacheKey to it.second }
+                val videoPairs = videoCache.allEntriesByKey(videoByKey)
+                val videoEntries = videoPairs.associate { it.first.cacheKey to it.second }
+                val virtualItems = (managedItems.map { it.photoItem } + videoPairs.map { it.first })
+                    .filter { it.generatedVirtual }
+                    .distinctBy { it.cacheKey }
+                val photos = systemPhotos + virtualItems
                 MediaSnapshot(
                     photos = photos,
                     imageCount = imageItems.size,
                     videoCount = videoItems.size,
-                    albums = buildAlbums(photos),
+                    albums = buildAlbums(systemPhotos),
                     entries = entries,
                     managedItems = managedItems,
                     videoEntries = videoEntries,
@@ -522,7 +532,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     videoStates = snapshot.videoEntries.keys.associateWith { VideoVrState.READY },
                     videoEntries = snapshot.videoEntries,
                     loading = false,
-                    message = "已加载 ${snapshot.imageCount} 张图片、${snapshot.videoCount} 个视频 / ${snapshot.imageCount} images, ${snapshot.videoCount} videos loaded",
+                    message = "已加载最近 ${snapshot.photos.count { !it.generatedVirtual }} 项媒体，生成库 ${snapshot.managedItems.size + snapshot.videoEntries.size} 项 / Loaded recent media and generated cache",
                     cacheVersions = snapshot.cacheVersions,
                     managedCacheItems = snapshot.managedItems,
                     modelStatus = modelStatusText(it.settings),
@@ -660,7 +670,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.22"
+                    val current = "v1.23"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1473,6 +1483,22 @@ private fun dateGroupLabel(modifiedTimeSeconds: Long, lang: AppLanguage): String
     }
 }
 
+private fun jsonStringValue(text: String, key: String): String? {
+    return Regex("\"${Regex.escape(key)}\"\\s*:\\s*\"([^\"]*)\"")
+        .find(text)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.replace("\\\"", "\"")
+}
+
+private fun jsonIntValue(text: String, key: String): Int? {
+    return Regex("\"${Regex.escape(key)}\"\\s*:\\s*(\\d+)")
+        .find(text)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toIntOrNull()
+}
+
 private fun imageRecentGenerationLines(state: UiState, lang: AppLanguage): List<String> {
     return state.recentGenerations.take(3).map {
         val side = when {
@@ -1578,10 +1604,11 @@ private class SettingsStore(context: Context) {
 }
 
 private class PhotoRepository(private val context: Context) {
-    fun loadImages(): List<PhotoItem> = loadMedia()
+    fun loadImages(): List<PhotoItem> = loadMedia(INITIAL_MEDIA_LIMIT).filter { it.kind == MediaKind.IMAGE }
 
-    fun loadMedia(): List<GalleryItem> {
+    fun loadMedia(limit: Int? = null): List<GalleryItem> {
         val result = mutableListOf<PhotoItem>()
+        val perKindLimit = limit?.coerceAtLeast(1)
         if (hasImagePermission(context)) {
             result += queryMedia(
                 collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
@@ -1595,6 +1622,7 @@ private class PhotoRepository(private val context: Context) {
                 bucketNameColumn = MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
                 relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Images.Media.RELATIVE_PATH else null,
                 kind = MediaKind.IMAGE,
+                limit = perKindLimit,
             )
         }
         if (hasVideoPermission(context)) {
@@ -1610,9 +1638,12 @@ private class PhotoRepository(private val context: Context) {
                 bucketNameColumn = MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
                 relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Video.Media.RELATIVE_PATH else null,
                 kind = MediaKind.VIDEO,
+                limit = perKindLimit,
             )
         }
-        return result.sortedByDescending { it.modifiedTime }
+        return result.sortedByDescending { it.modifiedTime }.let { sorted ->
+            if (limit == null) sorted else sorted.take(limit)
+        }
     }
 
     private fun queryMedia(
@@ -1627,10 +1658,15 @@ private class PhotoRepository(private val context: Context) {
         bucketNameColumn: String,
         relativePathColumn: String?,
         kind: MediaKind,
+        limit: Int?,
     ): List<GalleryItem> {
         val projection = listOfNotNull(idColumn, nameColumn, widthColumn, heightColumn, sizeColumn, modifiedColumn, bucketIdColumn, bucketNameColumn, relativePathColumn).toTypedArray()
         val result = mutableListOf<GalleryItem>()
-        context.contentResolver.query(collection, projection, null, null, "$modifiedColumn DESC")?.use { cursor ->
+        val limitedSortOrder = if (limit != null) "$modifiedColumn DESC LIMIT $limit" else "$modifiedColumn DESC"
+        val cursorResult = runCatching {
+            context.contentResolver.query(collection, projection, null, null, limitedSortOrder)
+        }.getOrNull() ?: context.contentResolver.query(collection, projection, null, null, "$modifiedColumn DESC")
+        cursorResult?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(idColumn)
             val nameCol = cursor.getColumnIndexOrThrow(nameColumn)
             val widthCol = cursor.getColumnIndexOrThrow(widthColumn)
@@ -1641,6 +1677,7 @@ private class PhotoRepository(private val context: Context) {
             val bucketNameCol = cursor.getColumnIndex(bucketNameColumn)
             val relativePathCol = relativePathColumn?.let { cursor.getColumnIndex(it) } ?: -1
             while (cursor.moveToNext()) {
+                if (limit != null && result.size >= limit) break
                 val id = cursor.getLong(idCol)
                 val displayName = cursor.getString(nameCol) ?: "${kind.name.lowercase(Locale.US)}-$id"
                 if (kind == MediaKind.IMAGE && (displayName.startsWith(GENERATED_VR_PREFIX) || displayName.startsWith("VR_"))) continue
@@ -1715,12 +1752,13 @@ private class VrCacheManager(private val context: Context) {
         return root.listFiles()?.asSequence()
             ?.filter { it.isDirectory }
             ?.flatMap { photoDir ->
-                val photo = photoByKey[photoDir.name] ?: return@flatMap emptySequence()
                 val entries = mutableListOf<VrCacheEntry>()
-                readEntry(photo.cacheKey, DEFAULT_VERSION, entryDir(photo, DEFAULT_VERSION))?.let { entries += it }
+                readEntry(photoDir.name, DEFAULT_VERSION, photoDir)?.let { entries += it }
                 photoDir.listFiles()?.filter { it.isDirectory }?.forEach { versionDir ->
-                    readEntry(photo.cacheKey, versionDir.name, versionDir)?.let { entries += it }
+                    readEntry(photoDir.name, versionDir.name, versionDir)?.let { entries += it }
                 }
+                val latest = entries.maxByOrNull { it.createdAt } ?: return@flatMap emptySequence()
+                val photo = photoByKey[photoDir.name] ?: virtualPhotoItem(photoDir.name, latest)
                 entries.asSequence().map { ManagedCacheItem(photo, it) }
             }
             ?.sortedByDescending { it.entry.createdAt }
@@ -1787,6 +1825,31 @@ private class VrCacheManager(private val context: Context) {
         )
     }
 
+    private fun virtualPhotoItem(photoKey: String, entry: VrCacheEntry): PhotoItem {
+        val paramsText = runCatching { File(entry.paramsPath).readText(Charsets.UTF_8) }.getOrDefault("")
+        val displayName = jsonStringValue(paramsText, "displayName") ?: "generated_$photoKey.jpg"
+        val sourceWidth = jsonIntValue(paramsText, "sourceWidth") ?: max(1, entry.width / 2)
+        val sourceHeight = jsonIntValue(paramsText, "sourceHeight") ?: entry.height
+        val parts = photoKey.split("_")
+        val id = parts.getOrNull(0)?.toLongOrNull() ?: abs(photoKey.hashCode()).toLong()
+        val size = parts.getOrNull(1)?.toLongOrNull() ?: 0L
+        val modified = parts.getOrNull(2)?.toLongOrNull() ?: (entry.createdAt / 1000L)
+        val uri = parts.getOrNull(0)?.toLongOrNull()?.let { ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, it) }
+            ?: Uri.fromFile(File(entry.outputPath))
+        return PhotoItem(
+            id = id,
+            uri = uri,
+            displayName = displayName,
+            width = sourceWidth,
+            height = sourceHeight,
+            size = size,
+            modifiedTime = modified,
+            kind = MediaKind.IMAGE,
+            forcedCacheKey = photoKey,
+            generatedVirtual = true,
+        )
+    }
+
     companion object {
         const val DEFAULT_VERSION = "default"
     }
@@ -1817,13 +1880,14 @@ private class VideoVrCacheManager(private val context: Context) {
         return root.listFiles()?.asSequence()
             ?.filter { it.isDirectory }
             ?.mapNotNull { videoDir ->
-                val item = videoByKey[videoDir.name] ?: return@mapNotNull null
                 val entries = mutableListOf<VideoCacheEntry>()
-                readEntry(item.cacheKey, videoDir)?.let { entries += it }
+                readEntry(videoDir.name, videoDir)?.let { entries += it }
                 videoDir.listFiles()?.filter { it.isDirectory }?.forEach { dir ->
-                    readEntry(item.cacheKey, dir)?.let { entries += it }
+                    readEntry(videoDir.name, dir)?.let { entries += it }
                 }
-                entries.maxByOrNull { it.createdAt }?.let { item to it }
+                val latest = entries.maxByOrNull { it.createdAt } ?: return@mapNotNull null
+                val item = videoByKey[videoDir.name] ?: virtualVideoItem(videoDir.name, latest)
+                item to latest
             }
             ?.sortedByDescending { it.second.createdAt }
             ?.toList()
@@ -1852,6 +1916,35 @@ private class VideoVrCacheManager(private val context: Context) {
             durationMs = values["durationMs"]?.toLongOrNull() ?: 0L,
             fps = values["fps"]?.toIntOrNull() ?: 30,
             createdAt = output.lastModified(),
+        )
+    }
+
+    private fun virtualVideoItem(videoKey: String, entry: VideoCacheEntry): GalleryItem {
+        val values = runCatching {
+            File(entry.logPath).parentFile?.let { File(it, "video_params.txt") }?.readLines(Charsets.UTF_8)?.associate { line ->
+                val parts = line.split("=", limit = 2)
+                parts.first() to parts.getOrElse(1) { "" }
+            }
+        }.getOrNull().orEmpty()
+        val displayName = values["source"]?.takeIf { it.isNotBlank() } ?: "generated_$videoKey.mp4"
+        val rawKey = videoKey.removePrefix("VIDEO_")
+        val parts = rawKey.split("_")
+        val id = parts.getOrNull(0)?.toLongOrNull() ?: abs(videoKey.hashCode()).toLong()
+        val size = parts.getOrNull(1)?.toLongOrNull() ?: 0L
+        val modified = parts.getOrNull(2)?.toLongOrNull() ?: (entry.createdAt / 1000L)
+        val uri = parts.getOrNull(0)?.toLongOrNull()?.let { ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, it) }
+            ?: Uri.fromFile(File(entry.outputPath))
+        return GalleryItem(
+            id = id,
+            uri = uri,
+            displayName = displayName,
+            width = entry.width,
+            height = entry.height,
+            size = size,
+            modifiedTime = modified,
+            kind = MediaKind.VIDEO,
+            forcedCacheKey = videoKey,
+            generatedVirtual = true,
         )
     }
 }
@@ -2669,17 +2762,19 @@ private fun GalleryScreen(
     var tileSize by rememberSaveable { mutableStateOf(112f) }
     var lastPinchAt by remember { mutableStateOf(0L) }
     var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
-    val albumItems = remember(state.photos, state.selectedAlbumId) {
-        state.selectedAlbumId?.let { bucketId -> state.photos.filter { it.bucketId == bucketId } } ?: emptyList()
+    val systemItems = remember(state.photos) { state.photos.filterNot { it.generatedVirtual } }
+    val albumItems = remember(systemItems, state.selectedAlbumId) {
+        state.selectedAlbumId?.let { bucketId -> systemItems.filter { it.bucketId == bucketId } } ?: emptyList()
     }
-    val visibleItems = remember(state.photos, albumItems, state.homeTab, state.selectedAlbumId) {
-        if (state.homeTab == "albums" && state.selectedAlbumId != null) albumItems else state.photos
+    val visibleItems = remember(systemItems, albumItems, state.homeTab, state.selectedAlbumId) {
+        if (state.homeTab == "albums" && state.selectedAlbumId != null) albumItems else systemItems
     }
-    val visibleScopeKeys = remember(visibleItems) { visibleItems.map { it.cacheKey }.toSet() }
-    val selectedIndexes = remember(selectedKeys, visibleItems, state.photos) {
-        visibleItems.mapNotNull { item ->
-            state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedKeys }
-        }
+    val photoIndexByKey = remember(state.photos) { state.photos.mapIndexed { index, item -> item.cacheKey to index }.toMap() }
+    val visibleScopeKeys = remember(visibleItems, state.homeTab, state.selectedAlbumId) {
+        if (state.homeTab == "albums" && state.selectedAlbumId != null) visibleItems.map { it.cacheKey }.toSet() else emptySet()
+    }
+    val selectedIndexes = remember(selectedKeys, photoIndexByKey) {
+        if (selectedKeys.isEmpty()) emptyList() else selectedKeys.mapNotNull { photoIndexByKey[it] }
     }
     val initialGridIndex = if (state.homeTab == "albums" && state.selectedAlbumId != null) 0 else state.galleryScrollIndex.coerceAtLeast(0)
     val gridState = rememberLazyGridState(
@@ -2834,16 +2929,30 @@ private fun TimelineGrid(
     onItemLongClick: (PhotoItem) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val cells = remember(items, lang) {
+    var renderLimit by remember(items) { mutableStateOf(min(1200, items.size)) }
+    LaunchedEffect(items.size, gridState) {
+        snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }
+            .collect { lastVisible ->
+                if (lastVisible > renderLimit - 80 && renderLimit < items.size) {
+                    renderLimit = min(items.size, renderLimit + 1200)
+                }
+            }
+    }
+    val renderedItems = remember(items, renderLimit) { items.take(renderLimit) }
+    val cells = remember(renderedItems, lang, renderLimit, items.size) {
         val result = mutableListOf<TimelineCell>()
-        var lastLabel: String? = null
-        items.forEach { item ->
-            val label = dateGroupLabel(item.modifiedTime, lang)
-            if (label != lastLabel) {
+        var lastDay = Long.MIN_VALUE
+        renderedItems.forEach { item ->
+            val day = item.modifiedTime / 86400L
+            if (day != lastDay) {
+                val label = dateGroupLabel(item.modifiedTime, lang)
                 result += TimelineCell.Header(label)
-                lastLabel = label
+                lastDay = day
             }
             result += TimelineCell.Media(item)
+        }
+        if (renderLimit < items.size) {
+            result += TimelineCell.Footer(renderLimit, items.size)
         }
         result
     }
@@ -2874,8 +2983,14 @@ private fun TimelineGrid(
     ) {
         items(
             items = cells,
-            key = { cell -> if (cell is TimelineCell.Header) "header_${cell.label}" else (cell as TimelineCell.Media).item.cacheKey },
-            span = { cell -> if (cell is TimelineCell.Header) GridItemSpan(maxLineSpan) else GridItemSpan(1) },
+            key = { cell ->
+                when (cell) {
+                    is TimelineCell.Header -> "header_${cell.label}"
+                    is TimelineCell.Media -> cell.item.cacheKey
+                    is TimelineCell.Footer -> "footer_${cell.loaded}_${cell.total}"
+                }
+            },
+            span = { cell -> if (cell is TimelineCell.Media) GridItemSpan(1) else GridItemSpan(maxLineSpan) },
         ) { cell ->
             when (cell) {
                 is TimelineCell.Header -> Text(
@@ -2896,6 +3011,12 @@ private fun TimelineGrid(
                         onLongClick = { onItemLongClick(photo) },
                     )
                 }
+                is TimelineCell.Footer -> Text(
+                    text = lang.t("已显示 ${cell.loaded}/${cell.total}，继续下滑自动加载更多", "Showing ${cell.loaded}/${cell.total}; keep scrolling to load more"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = androidx.compose.ui.graphics.Color(0xff777777),
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                )
             }
         }
     }
