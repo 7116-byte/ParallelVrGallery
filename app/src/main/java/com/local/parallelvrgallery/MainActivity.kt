@@ -153,6 +153,7 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -665,7 +666,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageViewerKeys = emptySet(),
                 viewerScopeKeys = emptySet(),
                 galleryAnchorIndex = currentIndex,
-                galleryScrollIndex = max(0, currentIndex - it.galleryAnchorSlot),
             )
         }
     }
@@ -749,7 +749,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.3"
+                    val current = "v2.4"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -2259,10 +2259,14 @@ private class VrGenerator(
         mark("model ready path=${modelFile.absolutePath} sha256=${modelFile.sha256()}")
         onProgress(0.12f)
 
-        val original = decodeScaledBitmap(context, photo.uri, params.maxLongEdge)
+        val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge)
+        if (decodeMaxLongEdge < params.maxLongEdge) {
+            mark("memory capped maxLongEdge ${params.maxLongEdge} -> $decodeMaxLongEdge")
+        }
+        var original = decodeScaledBitmap(context, photo.uri, decodeMaxLongEdge)
         mark("decoded ${original.width}x${original.height}")
-        if (max(photo.width, photo.height) > params.maxLongEdge) {
-            mark("downsampled source because original long edge exceeded ${params.maxLongEdge}")
+        if (max(photo.width, photo.height) > decodeMaxLongEdge) {
+            mark("downsampled source because original long edge exceeded $decodeMaxLongEdge")
         }
         onProgress(0.25f)
 
@@ -2281,17 +2285,38 @@ private class VrGenerator(
         onProgress(0.7f)
 
         val sbsStart = System.currentTimeMillis()
-        val vr = makeParallelSbs(original, depthSmall, params.depthScale, params.fillRadius)
+        val vr = runCatching {
+            makeParallelSbs(original, depthSmall, params.depthScale, params.fillRadius)
+        }.getOrElse { error ->
+            if (error !is OutOfMemoryError || max(original.width, original.height) <= 960) throw error
+            val retryLongEdge = max(960, (max(original.width, original.height) * 0.72f).roundToInt())
+            val scale = retryLongEdge.toFloat() / max(original.width, original.height).toFloat()
+            mark("sbs oom retry maxLongEdge=$retryLongEdge error=${error.message}")
+            val reduced = Bitmap.createScaledBitmap(
+                original,
+                max(1, (original.width * scale).roundToInt()),
+                max(1, (original.height * scale).roundToInt()),
+                true,
+            )
+            original.recycle()
+            original = reduced
+            makeParallelSbs(original, depthSmall, params.depthScale, params.fillRadius)
+        }
         mark("sbs ${System.currentTimeMillis() - sbsStart}ms output=${vr.width}x${vr.height}")
         val vrPath = File(dir, "vr_sbs.jpg")
         FileOutputStream(vrPath).use { vr.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
         onProgress(0.9f)
+        val outputWidth = vr.width
+        val outputHeight = vr.height
 
         val paramsPath = File(dir, "params.json")
         paramsPath.writeText(params.toJson(photo, original, vr), Charsets.UTF_8)
         val logPath = File(dir, "job.log")
         mark("done total=${System.currentTimeMillis() - start}ms")
         logPath.writeText(log.toString(), Charsets.UTF_8)
+        depthBitmap.recycle()
+        original.recycle()
+        vr.recycle()
 
         return VrCacheEntry(
             photoKey = photo.cacheKey,
@@ -2300,8 +2325,8 @@ private class VrGenerator(
             depthPath = depthPath.absolutePath,
             paramsPath = paramsPath.absolutePath,
             logPath = logPath.absolutePath,
-            width = vr.width,
-            height = vr.height,
+            width = outputWidth,
+            height = outputHeight,
             createdAt = System.currentTimeMillis(),
         )
     }
@@ -2313,8 +2338,9 @@ private class VrGenerator(
         onRuntimeInfo: (String) -> Unit = {},
     ): Bitmap {
         val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress)
-        val working = if (max(source.width, source.height) > params.maxLongEdge) {
-            val scale = params.maxLongEdge.toFloat() / max(source.width, source.height).toFloat()
+        val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge)
+        val working = if (max(source.width, source.height) > safeMaxLongEdge) {
+            val scale = safeMaxLongEdge.toFloat() / max(source.width, source.height).toFloat()
             Bitmap.createScaledBitmap(source, max(1, (source.width * scale).roundToInt()), max(1, (source.height * scale).roundToInt()), true)
         } else {
             source
@@ -2322,6 +2348,21 @@ private class VrGenerator(
         val rawDepth = runDepthModel(working, modelFile, params.modelThreads, params.useGpu, onRuntimeInfo)
         val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
         return makeParallelSbs(working, depthSmall, params.depthScale, params.fillRadius)
+    }
+
+    private fun memorySafeMaxLongEdge(width: Int, height: Int, requested: Int): Int {
+        val longEdge = max(width, height).takeIf { it > 0 } ?: requested
+        val shortEdge = min(width, height).takeIf { it > 0 } ?: longEdge
+        val ratio = shortEdge.toFloat() / longEdge.toFloat()
+        val heap = Runtime.getRuntime()
+        val heapAvailable = heap.maxMemory() - (heap.totalMemory() - heap.freeMemory())
+        val budget = min(160L * 1024L * 1024L, max(48L * 1024L * 1024L, (heapAvailable * 55L) / 100L))
+        val bytesPerSourcePixel = 40f
+        val requestedPixels = requested.toFloat() * requested.toFloat() * ratio
+        val requestedBytes = requestedPixels * bytesPerSourcePixel
+        if (requestedBytes <= budget) return requested
+        val safe = sqrt(budget.toDouble() / (ratio.toDouble() * bytesPerSourcePixel.toDouble())).roundToInt()
+        return safe.coerceIn(768, requested)
     }
 
     private fun runDepthModel(
@@ -2963,7 +3004,10 @@ private fun GalleryScreen(
         initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
     )
     val albumListGridState = rememberLazyGridState()
-    val albumDetailGridState = rememberLazyGridState()
+    val albumDetailGridState = rememberLazyGridState(
+        initialFirstVisibleItemIndex = state.galleryScrollIndex.coerceAtLeast(0),
+        initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
+    )
     val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
 
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
@@ -3869,6 +3913,7 @@ private fun ViewerScreen(
                 VideoPlayer(
                     uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
                     modifier = Modifier.fillMaxSize(),
+                    active = page == pagerState.currentPage,
                     controlsVisible = controlsVisible,
                     statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  平均帧${job?.avgFrameMs ?: 0}ms",
                     onSingleTap = { controlsVisible = !controlsVisible },
@@ -4329,6 +4374,7 @@ private fun AsyncMediaThumbnail(kind: MediaKind, uri: Uri, maxSide: Int, content
 private fun VideoPlayer(
     uri: Uri,
     modifier: Modifier = Modifier,
+    active: Boolean,
     controlsVisible: Boolean,
     statusText: String,
     onSingleTap: () -> Unit,
@@ -4344,7 +4390,7 @@ private fun VideoPlayer(
     var hint by remember(uri) { mutableStateOf<String?>(null) }
     var isPlaying by remember(uri) { mutableStateOf(false) }
 
-    LaunchedEffect(uri, videoView) {
+    LaunchedEffect(uri, videoView, active) {
         while (true) {
             val view = videoView
             val duration = view?.duration?.takeIf { it > 0 } ?: 0
@@ -4353,6 +4399,15 @@ private fun VideoPlayer(
             progress = if (duration > 0) (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else 0f
             positionText = "${formatDuration(position)} / ${formatDuration(duration)}"
             delay(350)
+        }
+    }
+
+    LaunchedEffect(uri, videoView, active) {
+        val view = videoView ?: return@LaunchedEffect
+        if (active) {
+            if (!view.isPlaying) view.start()
+        } else {
+            if (view.isPlaying) view.pause()
         }
     }
 
@@ -4371,8 +4426,13 @@ private fun VideoPlayer(
                     setOnPreparedListener { player ->
                         mediaPlayer = player
                         player.isLooping = true
-                        start()
-                        isPlaying = true
+                        if (active) {
+                            start()
+                            isPlaying = true
+                        } else {
+                            pause()
+                            isPlaying = false
+                        }
                     }
                     videoView = this
                 }
@@ -4381,12 +4441,20 @@ private fun VideoPlayer(
                 if (view.tag != uri) {
                     view.tag = uri
                     view.setVideoURI(uri)
-                    view.start()
+                } else if (!active) {
+                    if (view.isPlaying) view.pause()
                 }
                 videoView = view
             },
             modifier = Modifier.fillMaxSize(),
         )
+        DisposableEffect(uri) {
+            onDispose {
+                runCatching { videoView?.stopPlayback() }
+                mediaPlayer = null
+                videoView = null
+            }
+        }
         Box(
             Modifier
                 .fillMaxSize()
