@@ -674,7 +674,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update {
             it.copy(
                 homeTab = tab,
-                selectedAlbumId = if (tab == "albums") it.selectedAlbumId else null,
                 manageOpen = false,
             )
         }
@@ -750,7 +749,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.2"
+                    val current = "v2.3"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -2805,6 +2804,9 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     BackHandler(enabled = screen is AppScreen.Viewer) { viewModel.closeViewer() }
     BackHandler(enabled = screen is AppScreen.Manage) { viewModel.closeManage() }
     BackHandler(enabled = screen is AppScreen.Settings) { viewModel.closeSettings() }
+    BackHandler(enabled = screen is AppScreen.Gallery && state.homeTab == "albums" && state.selectedAlbumId != null) {
+        viewModel.closeAlbum()
+    }
 
     AnimatedContent(
         targetState = screen,
@@ -2963,12 +2965,6 @@ private fun GalleryScreen(
     val albumListGridState = rememberLazyGridState()
     val albumDetailGridState = rememberLazyGridState()
     val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
-    LaunchedEffect(state.galleryScrollIndex, state.galleryScrollOffset, visibleItems.size, state.homeTab, state.selectedAlbumId) {
-        if (state.homeTab == "albums" && state.selectedAlbumId != null) return@LaunchedEffect
-        if (state.homeTab == "all" && state.galleryScrollIndex in visibleItems.indices) {
-            allGridState.scrollToItem(state.galleryScrollIndex, state.galleryScrollOffset)
-        }
-    }
 
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
@@ -3344,8 +3340,7 @@ private fun PhotoTile(
                 onLongClick = onLongClick,
             ),
     ) {
-        val displayUri = if (photo.kind == MediaKind.IMAGE) entry?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri else photo.uri
-        AsyncMediaThumbnail(photo.kind, displayUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+        AsyncMediaThumbnail(photo.kind, photo.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
         if (photo.kind == MediaKind.VIDEO) {
             Text(
                 text = "▶",
