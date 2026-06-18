@@ -477,6 +477,15 @@ private enum class QueueSource {
 
 private data class QueueContext(val source: QueueSource, val albumId: String?)
 
+private data class QueueTag(
+    val photoKey: String,
+    val source: QueueSource,
+    val albumId: String?,
+    val priority: Int,
+    val state: VrState,
+    val updatedAt: Long,
+)
+
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application
     private val repository = PhotoRepository(app)
@@ -487,6 +496,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val generator = VrGenerator(app, cache, modelManager)
     private val videoGenerator = VideoVrGenerator(app, videoCache, generator)
     private val settingsStore = SettingsStore(app)
+    private val queueTags = QueueTagStore(app)
     private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
     private val currentPending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
     private val videoPending = PriorityQueue<VideoQueuedJob>(compareBy<VideoQueuedJob> { it.sequence })
@@ -496,6 +506,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val activeVideoParams = mutableMapOf<String, VideoGenerationParams>()
     private var sequence = 0L
     private var videoSequence = 0L
+    private var restoredQueueTags = false
     private val workers = mutableListOf<Job>()
     private val videoWorkers = mutableListOf<Job>()
     private var currentWorker: Job? = null
@@ -568,6 +579,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     managedCacheItems = snapshot.managedItems,
                     modelStatus = modelStatusText(it.settings),
                 )
+            }
+            if (!restoredQueueTags) {
+                restoredQueueTags = true
+                withContext(Dispatchers.IO) { restoreQueueTags() }
             }
             viewModelScope.launch {
                 val fullAlbums = withContext(Dispatchers.IO) { repository.loadAlbums() }
@@ -768,7 +783,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.6"
+                    val current = "v2.7"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -826,6 +841,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         synchronized(pending) { pending.clear() }
         synchronized(currentPending) { currentPending.clear() }
         synchronized(paused) { paused.clear() }
+        queueTags.clearActive()
         _uiState.update { it.copy(vrMode = false, modelProgress = null) }
         addLog("vr stopped; generated caches kept")
     }
@@ -1107,6 +1123,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             pending.removeAll(toPause.toSet())
             toPause.forEach { job ->
                 paused[job.photo.cacheKey] = job
+                queueTags.upsert(job, VrState.PAUSED)
                 markState(job.photo.cacheKey, VrState.PAUSED)
                 upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
             }
@@ -1140,6 +1157,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         } else {
             synchronized(pending) { pending.add(job) }
         }
+        queueTags.upsert(job, VrState.QUEUED)
         markState(photo.cacheKey, VrState.QUEUED)
         addLog("${if (current) "current" else "queued"} ${photo.displayName} p=$priority source=${queueContext.source}${queueContext.albumId?.let { ":$it" } ?: ""}")
     }
@@ -1191,6 +1209,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             synchronized(paused) {
                 disallowed.forEach { job ->
                     paused[job.photo.cacheKey] = job
+                    queueTags.upsert(job, VrState.PAUSED)
                     markState(job.photo.cacheKey, VrState.PAUSED)
                     upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
                 }
@@ -1204,10 +1223,55 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (restored.isNotEmpty()) {
             synchronized(pending) { restored.forEach { pending.add(it) } }
             restored.forEach { job ->
+                queueTags.upsert(job, VrState.QUEUED)
                 markState(job.photo.cacheKey, VrState.QUEUED)
                 upsertJob(job.photo, job.priority, VrState.QUEUED, 0f)
             }
         }
+    }
+
+    private fun restoreQueueTags() {
+        val state = _uiState.value
+        val photoByKey = state.photos.filter { it.kind == MediaKind.IMAGE }.associateBy { it.cacheKey }
+        val restoredStates = mutableMapOf<String, VrState>()
+        val pendingJobs = mutableListOf<QueuedJob>()
+        val pausedJobs = mutableListOf<QueuedJob>()
+        queueTags.load().forEach { tag ->
+            val photo = photoByKey[tag.photoKey] ?: return@forEach
+            if (cache.findEntry(photo, state.settings.toParams().cacheVersion()) != null) {
+                queueTags.remove(tag.photoKey)
+                restoredStates[tag.photoKey] = VrState.READY
+                return@forEach
+            }
+            val restoredState = when (tag.state) {
+                VrState.READY -> VrState.READY
+                VrState.FAILED -> VrState.FAILED
+                VrState.GENERATING -> VrState.QUEUED
+                VrState.QUEUED -> VrState.QUEUED
+                VrState.PAUSED -> VrState.PAUSED
+                VrState.NORMAL -> VrState.QUEUED
+            }
+            restoredStates[tag.photoKey] = restoredState
+            if (restoredState == VrState.FAILED || restoredState == VrState.READY) return@forEach
+            val job = QueuedJob(photo, tag.priority, sequence++, tag.source, tag.albumId)
+            if (jobAllowedInCurrentContext(job, state) && restoredState != VrState.PAUSED) {
+                pendingJobs += job
+            } else {
+                pausedJobs += job
+            }
+        }
+        synchronized(pending) { pendingJobs.forEach { pending.add(it) } }
+        synchronized(paused) { pausedJobs.forEach { paused[it.photo.cacheKey] = it } }
+        if (restoredStates.isNotEmpty()) {
+            _uiState.update {
+                it.copy(
+                    states = it.states + restoredStates,
+                    message = it.settings.language.t("已恢复 ${restoredStates.size} 条生成标签", "Restored ${restoredStates.size} generation tags"),
+                )
+            }
+            addLog("restored ${restoredStates.size} queue tags")
+        }
+        if (pendingJobs.isNotEmpty() && _uiState.value.vrMode) startWorker()
     }
 
     private fun startCurrentWorker() {
@@ -1386,6 +1450,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun processJob(next: QueuedJob) {
         activeKey = next.photo.cacheKey
+        queueTags.upsert(next, VrState.GENERATING)
         markState(next.photo.cacheKey, VrState.GENERATING)
         upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f)
         val started = System.currentTimeMillis()
@@ -1410,6 +1475,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
         }
         result.onSuccess { entry ->
+            queueTags.remove(next.photo.cacheKey)
             markReady(next.photo.cacheKey, entry)
             upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis())
             addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
@@ -1426,6 +1492,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
         }.onFailure { error ->
+            queueTags.upsert(next, VrState.FAILED)
             markState(next.photo.cacheKey, VrState.FAILED)
             upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
             addLog("failed ${next.photo.displayName}: ${error.message}")
@@ -1637,6 +1704,7 @@ private fun buildAlbums(items: List<GalleryItem>): List<AlbumItem> {
 }
 
 private fun dateGroupLabel(modifiedTimeSeconds: Long, lang: AppLanguage): String {
+    if (modifiedTimeSeconds <= 0L) return lang.t("未知日期", "Unknown date")
     val now = java.util.Calendar.getInstance()
     val target = java.util.Calendar.getInstance().apply { timeInMillis = modifiedTimeSeconds * 1000L }
     val todayYear = now.get(java.util.Calendar.YEAR)
@@ -1649,6 +1717,14 @@ private fun dateGroupLabel(modifiedTimeSeconds: Long, lang: AppLanguage): String
         lang == AppLanguage.ZH -> SimpleDateFormat("M月d日", Locale.CHINA).format(Date(modifiedTimeSeconds * 1000L))
         else -> SimpleDateFormat("MMM d", Locale.US).format(Date(modifiedTimeSeconds * 1000L))
     }
+}
+
+private fun localEpochDay(modifiedTimeSeconds: Long): Long {
+    if (modifiedTimeSeconds <= 0L) return Long.MIN_VALUE
+    val calendar = java.util.Calendar.getInstance().apply { timeInMillis = modifiedTimeSeconds * 1000L }
+    val year = calendar.get(java.util.Calendar.YEAR)
+    val day = calendar.get(java.util.Calendar.DAY_OF_YEAR)
+    return year.toLong() * 400L + day.toLong()
 }
 
 private fun jsonStringValue(text: String, key: String): String? {
@@ -1945,6 +2021,78 @@ private class PhotoRepository(private val context: Context) {
         }
         return result
     }
+}
+
+private class QueueTagStore(context: Context) {
+    private val root = File(context.getExternalFilesDir(null), "queue_index").also { it.mkdirs() }
+    private val file = File(root, "image_queue.tsv")
+
+    @Synchronized
+    fun load(): List<QueueTag> {
+        if (!file.exists()) return emptyList()
+        return file.readLines(Charsets.UTF_8).mapNotNull { line ->
+            val parts = line.split('\t')
+            if (parts.size < 6) return@mapNotNull null
+            val source = runCatching { QueueSource.valueOf(parts[1]) }.getOrNull() ?: return@mapNotNull null
+            val state = runCatching { VrState.valueOf(parts[4]) }.getOrNull() ?: VrState.QUEUED
+            QueueTag(
+                photoKey = parts[0],
+                source = source,
+                albumId = parts[2].takeIf { it.isNotBlank() },
+                priority = parts[3].toIntOrNull() ?: 99,
+                state = state,
+                updatedAt = parts[5].toLongOrNull() ?: 0L,
+            )
+        }.distinctBy { it.photoKey }
+    }
+
+    @Synchronized
+    fun upsert(job: QueuedJob, state: VrState) {
+        val next = load()
+            .filterNot { it.photoKey == job.photo.cacheKey }
+            .toMutableList()
+        next += QueueTag(
+            photoKey = job.photo.cacheKey,
+            source = job.source,
+            albumId = job.albumId,
+            priority = job.priority,
+            state = state,
+            updatedAt = System.currentTimeMillis(),
+        )
+        write(next)
+    }
+
+    @Synchronized
+    fun remove(photoKey: String) {
+        write(load().filterNot { it.photoKey == photoKey })
+    }
+
+    @Synchronized
+    fun clearActive() {
+        write(load().filter { it.state == VrState.FAILED })
+    }
+
+    private fun write(tags: List<QueueTag>) {
+        if (tags.isEmpty()) {
+            if (file.exists()) file.delete()
+            return
+        }
+        file.writeText(
+            tags.joinToString("\n") { tag ->
+                listOf(
+                    tag.photoKey.safeQueueField(),
+                    tag.source.name,
+                    tag.albumId.orEmpty().safeQueueField(),
+                    tag.priority.toString(),
+                    tag.state.name,
+                    tag.updatedAt.toString(),
+                ).joinToString("\t")
+            },
+            Charsets.UTF_8,
+        )
+    }
+
+    private fun String.safeQueueField(): String = replace('\t', '_').replace('\n', '_').replace('\r', '_')
 }
 
 private class VrCacheManager(private val context: Context) {
@@ -3254,7 +3402,10 @@ private fun TimelineGrid(
     footerText: String?,
     modifier: Modifier = Modifier,
 ) {
-    var renderLimit by remember(items) { mutableStateOf(min(1200, items.size)) }
+    var renderLimit by remember { mutableStateOf(min(1200, items.size)) }
+    LaunchedEffect(items.size) {
+        renderLimit = renderLimit.coerceAtLeast(min(1200, items.size)).coerceAtMost(items.size)
+    }
     LaunchedEffect(items.size, gridState) {
         snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }
             .collect { lastVisible ->
@@ -3271,7 +3422,7 @@ private fun TimelineGrid(
         val result = mutableListOf<TimelineCell>()
         var lastDay = Long.MIN_VALUE
         renderedItems.forEach { item ->
-            val day = item.modifiedTime / 86400L
+            val day = localEpochDay(item.modifiedTime)
             if (day != lastDay) {
                 val label = dateGroupLabel(item.modifiedTime, lang)
                 result += TimelineCell.Header(day, label)
