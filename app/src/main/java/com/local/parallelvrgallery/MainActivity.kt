@@ -61,6 +61,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -301,6 +302,7 @@ data class ModelSpec(
     val inputSize: Int,
     val fileName: String,
     val url: String,
+    val mirrors: List<String> = emptyList(),
     val sha256: String,
 )
 
@@ -311,6 +313,10 @@ private val AvailableModels = listOf(
         inputSize = 518,
         fileName = "depth_anything_v2.tflite",
         url = "https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite",
+        mirrors = listOf(
+            "https://gh-proxy.com/https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite",
+            "https://ghproxy.net/https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite",
+        ),
         sha256 = "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",
     ),
     ModelSpec(
@@ -319,6 +325,9 @@ private val AvailableModels = listOf(
         inputSize = 518,
         fileName = "qualcomm_depth_anything_v2.tflite",
         url = "https://huggingface.co/qualcomm/Depth-Anything-V2/resolve/main/Depth-Anything-V2.tflite?download=true",
+        mirrors = listOf(
+            "https://hf-mirror.com/qualcomm/Depth-Anything-V2/resolve/main/Depth-Anything-V2.tflite?download=true",
+        ),
         sha256 = "727E025EAB1DB3650C6FED86AA8D7932B994D8746E41A7A5773E663DE740859F",
     ),
 )
@@ -741,7 +750,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.1"
+                    val current = "v2.2"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -2178,39 +2187,51 @@ private class ModelManager(private val context: Context) {
         }
 
         val tmp = File(modelsDir, "${spec.fileName}.download")
-        if (tmp.exists()) tmp.delete()
-        val connection = (URL(spec.url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 15000
-            readTimeout = 30000
-            requestMethod = "GET"
-        }
-        connection.connect()
-        if (connection.responseCode !in 200..299) {
-            error("Model download failed: HTTP ${connection.responseCode}")
-        }
-        val total = connection.contentLengthLong.coerceAtLeast(1L)
-        var readTotal = 0L
-        connection.inputStream.use { input ->
-            FileOutputStream(tmp).use { output ->
-                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read <= 0) break
-                    output.write(buffer, 0, read)
-                    readTotal += read
-                    onProgress((readTotal.toFloat() / total.toFloat()).coerceIn(0f, 0.99f))
+        val urls = (listOf(spec.url) + spec.mirrors).distinct()
+        val errors = mutableListOf<String>()
+        for ((urlIndex, modelUrl) in urls.withIndex()) {
+            if (tmp.exists()) tmp.delete()
+            runCatching {
+                val connection = (URL(modelUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15000
+                    readTimeout = 30000
+                    requestMethod = "GET"
                 }
+                connection.connect()
+                if (connection.responseCode !in 200..299) {
+                    error("HTTP ${connection.responseCode}")
+                }
+                val total = connection.contentLengthLong.coerceAtLeast(1L)
+                var readTotal = 0L
+                connection.inputStream.use { input ->
+                    FileOutputStream(tmp).use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            output.write(buffer, 0, read)
+                            readTotal += read
+                            val sourceBase = urlIndex.toFloat() / urls.size.toFloat()
+                            val sourceSpan = 1f / urls.size.toFloat()
+                            onProgress((sourceBase + (readTotal.toFloat() / total.toFloat()) * sourceSpan).coerceIn(0f, 0.99f))
+                        }
+                    }
+                }
+                val hash = tmp.sha256()
+                if (!hash.equals(spec.sha256, ignoreCase = true)) {
+                    tmp.delete()
+                    error("SHA-256 mismatch: $hash")
+                }
+                if (modelFile.exists()) modelFile.delete()
+                tmp.renameTo(modelFile)
+                onProgress(1f)
+                return modelFile
+            }.onFailure { error ->
+                errors += "${modelUrl.substringBefore("?")}: ${error.message}"
             }
         }
-        val hash = tmp.sha256()
-        if (!hash.equals(spec.sha256, ignoreCase = true)) {
-            tmp.delete()
-            error("Model SHA-256 mismatch: $hash")
-        }
-        if (modelFile.exists()) modelFile.delete()
-        tmp.renameTo(modelFile)
-        onProgress(1f)
-        return modelFile
+        if (tmp.exists()) tmp.delete()
+        error("模型下载失败，所有下载源均不可用 / Model download failed: ${errors.joinToString(" | ")}")
     }
 }
 
@@ -2935,15 +2956,17 @@ private fun GalleryScreen(
     val selectedIndexes = remember(selectedKeys, photoIndexByKey) {
         if (selectedKeys.isEmpty()) emptyList() else selectedKeys.mapNotNull { photoIndexByKey[it] }
     }
-    val initialGridIndex = if (state.homeTab == "albums" && state.selectedAlbumId != null) 0 else state.galleryScrollIndex.coerceAtLeast(0)
-    val gridState = rememberLazyGridState(
-        initialFirstVisibleItemIndex = initialGridIndex,
+    val allGridState = rememberLazyGridState(
+        initialFirstVisibleItemIndex = state.galleryScrollIndex.coerceAtLeast(0),
         initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
     )
+    val albumListGridState = rememberLazyGridState()
+    val albumDetailGridState = rememberLazyGridState()
+    val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
     LaunchedEffect(state.galleryScrollIndex, state.galleryScrollOffset, visibleItems.size, state.homeTab, state.selectedAlbumId) {
         if (state.homeTab == "albums" && state.selectedAlbumId != null) return@LaunchedEffect
-        if (state.galleryScrollIndex in visibleItems.indices) {
-            gridState.scrollToItem(state.galleryScrollIndex, state.galleryScrollOffset)
+        if (state.homeTab == "all" && state.galleryScrollIndex in visibleItems.indices) {
+            allGridState.scrollToItem(state.galleryScrollIndex, state.galleryScrollOffset)
         }
     }
 
@@ -3016,16 +3039,20 @@ private fun GalleryScreen(
                     )
                 }
             } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(168.dp),
-                    modifier = Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    items(state.albums, key = { it.bucketId }) { album ->
-                        AlbumTile(album = album, lang = lang, onClick = { onOpenAlbum(album.bucketId) })
+                Box(Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp)) {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(168.dp),
+                        state = albumListGridState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        items(state.albums, key = { it.bucketId }) { album ->
+                            AlbumTile(album = album, lang = lang, onClick = { onOpenAlbum(album.bucketId) })
+                        }
                     }
+                    GridScrollbar(albumListGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
                 }
             } else {
                 TimelineGrid(
@@ -3143,69 +3170,72 @@ private fun TimelineGrid(
         }
         result
     }
-    LazyVerticalGrid(
-        columns = GridCells.Adaptive(tileSize.dp),
-        state = gridState,
-        modifier = modifier.pointerInput(Unit) {
-            awaitPointerEventScope {
-                while (true) {
-                    val event = awaitPointerEvent()
-                    val pressed = event.changes.filter { it.pressed }
-                    if (pressed.size >= 2) {
-                        val centroid = pressed.centroid()
-                        val previousCentroid = pressed.previousCentroid()
-                        val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
-                        val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
-                        if (abs(zoom - 1f) > 0.01f) {
-                            onPinch(zoom)
-                            event.changes.forEach { it.consume() }
+    Box(modifier) {
+        LazyVerticalGrid(
+            columns = GridCells.Adaptive(tileSize.dp),
+            state = gridState,
+            modifier = Modifier.fillMaxSize().pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val pressed = event.changes.filter { it.pressed }
+                        if (pressed.size >= 2) {
+                            val centroid = pressed.centroid()
+                            val previousCentroid = pressed.previousCentroid()
+                            val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
+                            val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
+                            if (abs(zoom - 1f) > 0.01f) {
+                                onPinch(zoom)
+                                event.changes.forEach { it.consume() }
+                            }
                         }
                     }
                 }
-            }
-        },
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
-        verticalArrangement = Arrangement.spacedBy(3.dp),
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
-    ) {
-        items(
-            items = cells,
-            key = { cell ->
-                when (cell) {
-                    is TimelineCell.Header -> "header_${cell.day}"
-                    is TimelineCell.Media -> cell.item.cacheKey
-                is TimelineCell.Footer -> "footer_${cell.loaded}_${cell.total}_${cell.text.orEmpty()}"
-                }
             },
-            span = { cell -> if (cell is TimelineCell.Media) GridItemSpan(1) else GridItemSpan(maxLineSpan) },
-        ) { cell ->
-            when (cell) {
-                is TimelineCell.Header -> Text(
-                    text = cell.label,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 12.dp),
-                )
-                is TimelineCell.Media -> {
-                    val photo = cell.item
-                    PhotoTile(
-                        photo = photo,
-                        state = state.states[photo.cacheKey] ?: VrState.NORMAL,
-                        entry = state.entries[photo.cacheKey],
-                        lang = lang,
-                        selected = photo.cacheKey in selectedKeys,
-                        onClick = { onItemClick(photo) },
-                        onLongClick = { onItemLongClick(photo) },
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            items(
+                items = cells,
+                key = { cell ->
+                    when (cell) {
+                        is TimelineCell.Header -> "header_${cell.day}"
+                        is TimelineCell.Media -> cell.item.cacheKey
+                        is TimelineCell.Footer -> "footer_${cell.loaded}_${cell.total}_${cell.text.orEmpty()}"
+                    }
+                },
+                span = { cell -> if (cell is TimelineCell.Media) GridItemSpan(1) else GridItemSpan(maxLineSpan) },
+            ) { cell ->
+                when (cell) {
+                    is TimelineCell.Header -> Text(
+                        text = cell.label,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 12.dp),
+                    )
+                    is TimelineCell.Media -> {
+                        val photo = cell.item
+                        PhotoTile(
+                            photo = photo,
+                            state = state.states[photo.cacheKey] ?: VrState.NORMAL,
+                            entry = state.entries[photo.cacheKey],
+                            lang = lang,
+                            selected = photo.cacheKey in selectedKeys,
+                            onClick = { onItemClick(photo) },
+                            onLongClick = { onItemLongClick(photo) },
+                        )
+                    }
+                    is TimelineCell.Footer -> Text(
+                        text = cell.text ?: lang.t("已显示 ${cell.loaded}/${cell.total}，继续下滑自动加载更多", "Showing ${cell.loaded}/${cell.total}; keep scrolling to load more"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = androidx.compose.ui.graphics.Color(0xff777777),
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
                     )
                 }
-                is TimelineCell.Footer -> Text(
-                    text = cell.text ?: lang.t("已显示 ${cell.loaded}/${cell.total}，继续下滑自动加载更多", "Showing ${cell.loaded}/${cell.total}; keep scrolling to load more"),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = androidx.compose.ui.graphics.Color(0xff777777),
-                    modifier = Modifier.fillMaxWidth().padding(14.dp),
-                )
             }
         }
+        GridScrollbar(gridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
     }
 }
 
@@ -3223,6 +3253,42 @@ private fun AlbumTile(album: AlbumItem, lang: AppLanguage, onClick: () -> Unit) 
         Spacer(Modifier.height(8.dp))
         Text(album.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold)
         Text(lang.t("${album.count} 项", "${album.count} items"), color = androidx.compose.ui.graphics.Color(0xff777777), style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun GridScrollbar(
+    gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
+    modifier: Modifier = Modifier,
+) {
+    val layoutInfo = gridState.layoutInfo
+    val total = layoutInfo.totalItemsCount
+    val visible = layoutInfo.visibleItemsInfo
+    if (total <= 0 || visible.isEmpty()) return
+    val first = visible.first().index
+    val visibleCount = visible.size.coerceAtLeast(1)
+    val thumbFraction = (visibleCount.toFloat() / total.toFloat()).coerceIn(0.06f, 1f)
+    val topFraction = (first.toFloat() / total.toFloat()).coerceIn(0f, 1f - thumbFraction)
+    Box(
+        modifier
+            .width(4.dp)
+            .fillMaxSize()
+            .padding(vertical = 12.dp),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .fillMaxHeight()
+                .background(androidx.compose.ui.graphics.Color(0x22000000), RoundedCornerShape(3.dp)),
+        )
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(thumbFraction)
+                .align(Alignment.TopCenter)
+                .graphicsLayer { translationY = size.height * topFraction / thumbFraction }
+                .background(androidx.compose.ui.graphics.Color(0x99000000), RoundedCornerShape(3.dp)),
+        )
     }
 }
 
