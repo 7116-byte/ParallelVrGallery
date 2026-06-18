@@ -12,8 +12,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
 import android.graphics.Color
 import android.graphics.ImageDecoder
+import android.graphics.Rect
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -467,6 +469,14 @@ private sealed class TimelineCell {
     data class Footer(val loaded: Int, val total: Int, val text: String? = null) : TimelineCell()
 }
 
+private enum class QueueSource {
+    ALL,
+    ALBUM,
+    GENERATED,
+}
+
+private data class QueueContext(val source: QueueSource, val albumId: String?)
+
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application
     private val repository = PhotoRepository(app)
@@ -670,6 +680,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryAnchorIndex = currentIndex,
             )
         }
+        rebalanceQueueForActiveSource()
+        startWorker()
     }
 
     fun setHomeTab(tab: String) {
@@ -679,15 +691,20 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageOpen = false,
             )
         }
+        rebalanceQueueForActiveSource()
+        startWorker()
     }
 
     fun openAlbum(bucketId: String) {
         _uiState.update { it.copy(homeTab = "albums", selectedAlbumId = bucketId, manageOpen = false) }
         loadAlbumPage(bucketId, reset = true)
+        rebalanceQueueForActiveSource()
+        startWorker()
     }
 
     fun closeAlbum() {
         _uiState.update { it.copy(selectedAlbumId = null) }
+        rebalanceQueueForActiveSource()
     }
 
     fun loadMoreSelectedAlbum() {
@@ -751,7 +768,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.5"
+                    val current = "v2.6"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -990,7 +1007,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     message = "已清理缓存并加入 ${photos.size} 张图片重新生成队列",
                 )
             }
-            unique.forEachIndexed { order, index -> enqueuePhoto(index, priority = order + 1, force = true, current = false) }
+            unique.forEachIndexed { order, index ->
+                enqueuePhoto(index, priority = order + 1, force = true, current = false, context = QueueContext(QueueSource.GENERATED, null))
+            }
             startWorker()
         }
     }
@@ -1066,11 +1085,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val scopePosition = scopeIndices.indexOf(index)
         if (scopePosition < 0) return
         val currentVersion = state.settings.toParams().cacheVersion()
+        val queueContext = activeQueueContext(state)
         val window = state.activePrefetchWindow.coerceAtMost(8)
         val desiredCount = window * 2
         val targets = mutableListOf<Pair<Int, Int>>()
         if (includeCurrent) {
-            if (photos.getOrNull(index)?.kind == MediaKind.IMAGE) enqueuePhoto(index, priority = 0, force = false, current = true)
+            if (photos.getOrNull(index)?.kind == MediaKind.IMAGE) enqueuePhoto(index, priority = 0, force = false, current = true, context = queueContext)
         }
         var distance = 1
         while (targets.size < desiredCount && distance <= window && distance < scopeIndices.size) {
@@ -1083,7 +1103,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
         synchronized(pending) {
             val keep = targets.map { photos[it.first].cacheKey }.toSet()
-            val toPause = pending.filter { it.photo.cacheKey !in keep }
+            val toPause = pending.filter { sameQueueSource(it, queueContext) && it.photo.cacheKey !in keep }
             pending.removeAll(toPause.toSet())
             toPause.forEach { job ->
                 paused[job.photo.cacheKey] = job
@@ -1091,11 +1111,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
             }
         }
-        targets.forEach { (targetIndex, priority) -> enqueuePhoto(targetIndex, priority, force = false, current = false) }
+        targets.forEach { (targetIndex, priority) -> enqueuePhoto(targetIndex, priority, force = false, current = false, context = queueContext) }
+        rebalanceQueueForActiveSource()
         startWorker()
     }
 
-    private fun enqueuePhoto(index: Int, priority: Int, force: Boolean, current: Boolean = false) {
+    private fun enqueuePhoto(index: Int, priority: Int, force: Boolean, current: Boolean = false, context: QueueContext? = null) {
         val photo = _uiState.value.photos.getOrNull(index) ?: return
         if (photo.kind != MediaKind.IMAGE) return
         val currentVersion = _uiState.value.settings.toParams().cacheVersion()
@@ -1106,7 +1127,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val existingState = _uiState.value.states[photo.cacheKey]
         if (!force && existingState == VrState.GENERATING) return
         if (!force && !current && existingState == VrState.QUEUED) return
-        val job = QueuedJob(photo, priority, sequence++)
+        val queueContext = context ?: activeQueueContext(_uiState.value)
+        val job = QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
         synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
         synchronized(paused) { paused.remove(photo.cacheKey) }
         if (current) {
@@ -1119,7 +1141,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             synchronized(pending) { pending.add(job) }
         }
         markState(photo.cacheKey, VrState.QUEUED)
-        addLog("${if (current) "current" else "queued"} ${photo.displayName} p=$priority")
+        addLog("${if (current) "current" else "queued"} ${photo.displayName} p=$priority source=${queueContext.source}${queueContext.albumId?.let { ":$it" } ?: ""}")
     }
 
     private fun startWorker() {
@@ -1128,6 +1150,62 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         repeat((desired - workers.size).coerceAtLeast(0)) {
             workers += viewModelScope.launch(Dispatchers.IO) {
                 workerLoop()
+            }
+        }
+    }
+
+    private fun activeQueueContext(state: UiState): QueueContext = when {
+        state.homeTab == "generated" || state.manageOpen -> QueueContext(QueueSource.GENERATED, null)
+        state.homeTab == "albums" && state.selectedAlbumId != null -> QueueContext(QueueSource.ALBUM, state.selectedAlbumId)
+        else -> QueueContext(QueueSource.ALL, null)
+    }
+
+    private fun sameQueueSource(job: QueuedJob, context: QueueContext): Boolean {
+        return job.source == context.source && (job.source != QueueSource.ALBUM || job.albumId == context.albumId)
+    }
+
+    private fun jobAllowedInCurrentContext(job: QueuedJob, state: UiState): Boolean {
+        if (state.homeTab == "generated" || state.manageOpen) return true
+        return sameQueueSource(job, activeQueueContext(state))
+    }
+
+    private fun pollAllowedPendingJob(): QueuedJob? {
+        val state = _uiState.value
+        return synchronized(pending) {
+            val job = pending
+                .sortedWith(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
+                .firstOrNull { jobAllowedInCurrentContext(it, state) }
+            if (job != null) pending.remove(job)
+            job
+        }
+    }
+
+    private fun rebalanceQueueForActiveSource() {
+        val state = _uiState.value
+        val disallowed = synchronized(pending) {
+            val items = pending.filterNot { jobAllowedInCurrentContext(it, state) }
+            pending.removeAll(items.toSet())
+            items
+        }
+        if (disallowed.isNotEmpty()) {
+            synchronized(paused) {
+                disallowed.forEach { job ->
+                    paused[job.photo.cacheKey] = job
+                    markState(job.photo.cacheKey, VrState.PAUSED)
+                    upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
+                }
+            }
+        }
+        val restored = synchronized(paused) {
+            val items = paused.values.filter { jobAllowedInCurrentContext(it, state) }
+            items.forEach { paused.remove(it.photo.cacheKey) }
+            items
+        }
+        if (restored.isNotEmpty()) {
+            synchronized(pending) { restored.forEach { pending.add(it) } }
+            restored.forEach { job ->
+                markState(job.photo.cacheKey, VrState.QUEUED)
+                upsertJob(job.photo, job.priority, VrState.QUEUED, 0f)
             }
         }
     }
@@ -1292,7 +1370,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     synchronized(pending) { pending.clear() }
                     break
                 }
-                val next = synchronized(pending) { pending.poll() }
+                rebalanceQueueForActiveSource()
+                val next = pollAllowedPendingJob()
                 if (next == null) {
                     if (expandAutoPrefetchIfNeeded()) {
                         delay(50)
@@ -1365,7 +1444,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(activePrefetchWindow = next) }
         addLog("auto prefetch expanded to $next")
         enqueueWindow(selected, includeCurrent = false)
-        return synchronized(pending) { pending.isNotEmpty() }
+        return synchronized(pending) { pending.any { jobAllowedInCurrentContext(it, _uiState.value) } }
     }
 
     private fun markReady(key: String, entry: VrCacheEntry) {
@@ -1458,7 +1537,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 }
 
-private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long)
+private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long, val source: QueueSource, val albumId: String?)
 
 private data class VideoQueuedJob(val item: GalleryItem, val params: VideoGenerationParams, val sequence: Long)
 
@@ -3087,6 +3166,7 @@ private fun GalleryScreen(
                         }
                     }
                     GridScrollbar(albumListGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
+                    GridToTopButton(albumListGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
                 }
             } else {
                 TimelineGrid(
@@ -3270,6 +3350,23 @@ private fun TimelineGrid(
             }
         }
         GridScrollbar(gridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
+        GridToTopButton(gridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+    }
+}
+
+@Composable
+private fun GridToTopButton(
+    gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
+    lang: AppLanguage,
+    modifier: Modifier = Modifier,
+) {
+    if (gridState.firstVisibleItemIndex <= 18) return
+    val scope = rememberCoroutineScope()
+    Button(
+        onClick = { scope.launch { gridState.animateScrollToItem(0) } },
+        modifier = modifier,
+    ) {
+        Text(lang.t("顶部", "Top"))
     }
 }
 
@@ -3560,55 +3657,89 @@ private fun ManageScreen(
             if (state.cacheVersions.isEmpty()) {
                 Text(lang.t("暂无已生成图片", "No generated images yet"))
             } else {
-                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                    state.cacheVersions.forEach { summary ->
-                        val items = state.managedCacheItems.filter { it.entry.version == summary.version }
-                        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(lang.t("版本：${summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
-                                    Text(lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
+                val manageScroll = rememberScrollState()
+                val scope = rememberCoroutineScope()
+                Box(Modifier.fillMaxSize()) {
+                    Column(Modifier.fillMaxSize().verticalScroll(manageScroll)) {
+                        state.cacheVersions.forEach { summary ->
+                            val items = state.managedCacheItems.filter { it.entry.version == summary.version }
+                            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(lang.t("版本：${summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
+                                        Text(lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
+                                    }
+                                    OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
+                                        Text(lang.t("删除", "Delete"))
+                                    }
                                 }
-                                OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
-                                    Text(lang.t("删除", "Delete"))
-                                }
-                            }
-                            Spacer(Modifier.height(8.dp))
-                            LazyVerticalGrid(
-                                columns = GridCells.Adaptive(86.dp),
-                                modifier = Modifier.fillMaxWidth().height(260.dp).background(androidx.compose.ui.graphics.Color(0xffffffff)).padding(6.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                items(items, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
-                                    val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
-                                    val selectionKey = "${item.entry.photoKey}|${item.entry.version}"
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .aspectRatio(1f)
-                                            .background(androidx.compose.ui.graphics.Color(0xff16191c))
-                                            .combinedClickable(
-                                                enabled = index >= 0,
-                                                onClick = {
-                                                    if (selectedImageKeys.isNotEmpty()) {
-                                                        selectedImageKeys = if (selectionKey in selectedImageKeys) selectedImageKeys - selectionKey else selectedImageKeys + selectionKey
-                                                    } else {
-                                                        onOpenGenerated(index, item.entry)
-                                                    }
-                                                },
-                                                onLongClick = { selectedImageKeys = selectedImageKeys + selectionKey },
-                                            ),
-                                    ) {
-                                        AsyncBitmapImage(Uri.fromFile(File(item.entry.outputPath)), 360, ContentScale.Crop, Modifier.fillMaxSize())
-                                        if (selectionKey in selectedImageKeys) SelectionBadge()
+                                Spacer(Modifier.height(8.dp))
+                                LazyVerticalGrid(
+                                    columns = GridCells.Adaptive(86.dp),
+                                    modifier = Modifier.fillMaxWidth().height(260.dp).background(androidx.compose.ui.graphics.Color(0xffffffff)).padding(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    items(items, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
+                                        val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
+                                        val selectionKey = "${item.entry.photoKey}|${item.entry.version}"
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .aspectRatio(1f)
+                                                .background(androidx.compose.ui.graphics.Color(0xff16191c))
+                                                .combinedClickable(
+                                                    enabled = index >= 0,
+                                                    onClick = {
+                                                        if (selectedImageKeys.isNotEmpty()) {
+                                                            selectedImageKeys = if (selectionKey in selectedImageKeys) selectedImageKeys - selectionKey else selectedImageKeys + selectionKey
+                                                        } else {
+                                                            onOpenGenerated(index, item.entry)
+                                                        }
+                                                    },
+                                                    onLongClick = { selectedImageKeys = selectedImageKeys + selectionKey },
+                                                ),
+                                        ) {
+                                            GeneratedSbsThumbnail(File(item.entry.outputPath), 360, ContentScale.Crop, Modifier.fillMaxSize(), lang)
+                                            if (selectionKey in selectedImageKeys) SelectionBadge()
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    if (manageScroll.value > 600) {
+                        Button(
+                            onClick = { scope.launch { manageScroll.animateScrollTo(0) } },
+                            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                        ) {
+                            Text(lang.t("顶部", "Top"))
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun GeneratedSbsThumbnail(file: File, maxSide: Int, contentScale: ContentScale, modifier: Modifier = Modifier, lang: AppLanguage) {
+    var bitmap by remember(file.absolutePath, maxSide) { mutableStateOf<Bitmap?>(null) }
+    var failed by remember(file.absolutePath, maxSide) { mutableStateOf(false) }
+    LaunchedEffect(file.absolutePath, maxSide) {
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching { decodeSbsLeftPreview(file, maxSide) }.getOrNull()
+        }
+        bitmap = loaded
+        failed = loaded == null
+    }
+    when {
+        bitmap != null -> Image(bitmap!!.asImageBitmap(), contentDescription = null, modifier = modifier, contentScale = contentScale)
+        failed -> Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
+            Text(lang.t("暂无预览", "No preview"), color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
+        }
+        else -> Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(Modifier.size(22.dp))
         }
     }
 }
@@ -4661,6 +4792,32 @@ private fun decodeScaledBitmap(context: Context, uri: Uri, maxLongEdge: Int): Bi
     return context.contentResolver.openInputStream(uri).use { input ->
         BitmapFactory.decodeStream(input, null, decode) ?: error("Unable to decode image")
     }.copy(Bitmap.Config.ARGB_8888, false)
+}
+
+private fun decodeSbsLeftPreview(file: File, maxLongEdge: Int): Bitmap {
+    require(file.exists()) { "Generated file missing: ${file.absolutePath}" }
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    val width = bounds.outWidth
+    val height = bounds.outHeight
+    require(width > 0 && height > 0) { "Invalid generated image bounds: ${file.absolutePath}" }
+    val leftWidth = (width / 2).coerceAtLeast(1)
+    var sample = 1
+    while (max(leftWidth / sample, height / sample) > maxLongEdge.coerceAtLeast(96)) sample *= 2
+    val options = BitmapFactory.Options().apply {
+        inSampleSize = sample
+        inPreferredConfig = Bitmap.Config.RGB_565
+    }
+    FileInputStream(file).use { input ->
+        val decoder = BitmapRegionDecoder.newInstance(input, false)
+            ?: error("Unable to open generated preview decoder: ${file.absolutePath}")
+        return try {
+            decoder.decodeRegion(Rect(0, 0, leftWidth, height), options)
+                ?: error("Unable to decode generated preview: ${file.absolutePath}")
+        } finally {
+            decoder.recycle()
+        }
+    }
 }
 
 private fun saveImageToGallery(context: Context, source: File, displayName: String): Uri {
