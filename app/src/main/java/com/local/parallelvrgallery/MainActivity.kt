@@ -852,7 +852,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.13"
+                    val current = "v2.14"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3767,7 +3767,7 @@ private fun GalleryScreen(
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
                         items(state.albums, key = { it.bucketId }) { album ->
-                            AlbumTile(album = album, lang = lang, onClick = { onOpenAlbum(album.bucketId) })
+                            AlbumTile(album = album, lang = lang, columns = state.albumListColumns, onClick = { onOpenAlbum(album.bucketId) })
                         }
                     }
                     GridScrollbar(albumListGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
@@ -3972,7 +3972,20 @@ private fun GridToTopButton(
 }
 
 @Composable
-private fun AlbumTile(album: AlbumItem, lang: AppLanguage, onClick: () -> Unit) {
+private fun AlbumTile(album: AlbumItem, lang: AppLanguage, columns: Int, onClick: () -> Unit) {
+    val titleStyle = when {
+        columns >= 8 -> MaterialTheme.typography.bodySmall
+        columns == 7 -> MaterialTheme.typography.bodyMedium
+        columns == 6 -> MaterialTheme.typography.titleSmall
+        else -> MaterialTheme.typography.titleMedium
+    }
+    val countStyle = when {
+        columns >= 8 -> MaterialTheme.typography.labelSmall
+        columns == 7 -> MaterialTheme.typography.labelMedium
+        columns == 6 -> MaterialTheme.typography.labelLarge
+        else -> MaterialTheme.typography.bodySmall
+    }
+    val textGap = if (columns >= 7) 4.dp else 8.dp
     Column(Modifier.fillMaxWidth().clickable(onClick = onClick)) {
         Box(
             Modifier
@@ -3982,9 +3995,9 @@ private fun AlbumTile(album: AlbumItem, lang: AppLanguage, onClick: () -> Unit) 
         ) {
             AsyncMediaThumbnail(album.coverKind, album.coverUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
         }
-        Spacer(Modifier.height(8.dp))
-        Text(album.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold)
-        Text(lang.t("${album.count} 项", "${album.count} items"), color = androidx.compose.ui.graphics.Color(0xff777777), style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(textGap))
+        Text(album.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, style = titleStyle)
+        Text(lang.t("${album.count} 项", "${album.count} items"), color = androidx.compose.ui.graphics.Color(0xff777777), style = countStyle, maxLines = 1)
     }
 }
 
@@ -4114,7 +4127,7 @@ private fun Modifier.discreteColumnPinch(
     onColumns: (Int) -> Unit,
     onPinchActivity: () -> Unit = {},
 ): Modifier = pointerInput(columns) {
-    val stepThresholdPx = 36f
+    val stepThresholdPx = 72f
     var lastStepAt = 0L
     var baselineSpan: Float? = null
     awaitPointerEventScope {
