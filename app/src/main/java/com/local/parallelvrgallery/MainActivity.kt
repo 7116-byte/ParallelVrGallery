@@ -443,7 +443,7 @@ private data class MediaSnapshot(
 )
 
 private sealed class TimelineCell {
-    data class Header(val label: String) : TimelineCell()
+    data class Header(val day: Long, val label: String) : TimelineCell()
     data class Media(val item: PhotoItem) : TimelineCell()
     data class Footer(val loaded: Int, val total: Int) : TimelineCell()
 }
@@ -537,6 +537,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     managedCacheItems = snapshot.managedItems,
                     modelStatus = modelStatusText(it.settings),
                 )
+            }
+            viewModelScope.launch {
+                val fullAlbums = withContext(Dispatchers.IO) { repository.loadAlbums() }
+                _uiState.update { it.copy(albums = fullAlbums) }
             }
         }
     }
@@ -670,7 +674,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.23"
+                    val current = "v1.24"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1605,6 +1609,8 @@ private class SettingsStore(context: Context) {
 
 private class PhotoRepository(private val context: Context) {
     fun loadImages(): List<PhotoItem> = loadMedia(INITIAL_MEDIA_LIMIT).filter { it.kind == MediaKind.IMAGE }
+
+    fun loadAlbums(): List<AlbumItem> = buildAlbums(loadMedia(null))
 
     fun loadMedia(limit: Int? = null): List<GalleryItem> {
         val result = mutableListOf<PhotoItem>()
@@ -2946,7 +2952,7 @@ private fun TimelineGrid(
             val day = item.modifiedTime / 86400L
             if (day != lastDay) {
                 val label = dateGroupLabel(item.modifiedTime, lang)
-                result += TimelineCell.Header(label)
+                result += TimelineCell.Header(day, label)
                 lastDay = day
             }
             result += TimelineCell.Media(item)
@@ -2985,7 +2991,7 @@ private fun TimelineGrid(
             items = cells,
             key = { cell ->
                 when (cell) {
-                    is TimelineCell.Header -> "header_${cell.label}"
+                    is TimelineCell.Header -> "header_${cell.day}"
                     is TimelineCell.Media -> cell.item.cacheKey
                     is TimelineCell.Footer -> "footer_${cell.loaded}_${cell.total}"
                 }
@@ -4050,17 +4056,16 @@ private fun AsyncBitmapImage(uri: Uri, maxSide: Int, contentScale: ContentScale,
 
 @Composable
 private fun AsyncMediaThumbnail(kind: MediaKind, uri: Uri, maxSide: Int, contentScale: ContentScale, modifier: Modifier = Modifier) {
-    if (kind == MediaKind.IMAGE) {
-        AsyncBitmapImage(uri, maxSide, contentScale, modifier)
-        return
-    }
     val context = LocalContext.current
+    val safeSide = maxSide.coerceIn(96, 320)
     var bitmap by remember(uri, maxSide) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(uri, maxSide) {
         bitmap = withContext(Dispatchers.IO) {
             runCatching {
                 if (Build.VERSION.SDK_INT >= 29) {
-                    context.contentResolver.loadThumbnail(uri, Size(maxSide, maxSide), null)
+                    context.contentResolver.loadThumbnail(uri, Size(safeSide, safeSide), null)
+                } else if (kind == MediaKind.IMAGE) {
+                    decodeScaledBitmap(context, uri, safeSide)
                 } else {
                     val retriever = MediaMetadataRetriever()
                     retriever.setDataSource(context, uri)
@@ -4072,9 +4077,7 @@ private fun AsyncMediaThumbnail(kind: MediaKind, uri: Uri, maxSide: Int, content
         }
     }
     if (bitmap == null) {
-        Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(Modifier.size(26.dp))
-        }
+        Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)))
     } else {
         Image(bitmap!!.asImageBitmap(), contentDescription = null, modifier = modifier, contentScale = contentScale)
     }
