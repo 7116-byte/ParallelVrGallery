@@ -326,6 +326,7 @@ private val AvailableModels = listOf(
 private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
+private const val ALL_PAGE_SIZE = 1200
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -405,6 +406,9 @@ data class UiState(
     val settingsOpen: Boolean = false,
     val manageOpen: Boolean = false,
     val homeTab: String = "all",
+    val allOffset: Int = 0,
+    val allLoading: Boolean = false,
+    val allExhausted: Boolean = false,
     val selectedAlbumId: String? = null,
     val albumOffsets: Map<String, Int> = emptyMap(),
     val albumLoading: Boolean = false,
@@ -534,6 +538,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     states = snapshot.entries.keys.associateWith { VrState.READY },
                     videoStates = snapshot.videoEntries.keys.associateWith { VideoVrState.READY },
                     videoEntries = snapshot.videoEntries,
+                    allOffset = snapshot.photos.count { !it.generatedVirtual },
+                    allExhausted = snapshot.photos.count { !it.generatedVirtual } < INITIAL_MEDIA_LIMIT,
                     loading = false,
                     message = "已加载最近 ${snapshot.photos.count { !it.generatedVirtual }} 项媒体，生成库 ${snapshot.managedItems.size + snapshot.videoEntries.size} 项 / Loaded recent media and generated cache",
                     cacheVersions = snapshot.cacheVersions,
@@ -544,6 +550,29 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             viewModelScope.launch {
                 val fullAlbums = withContext(Dispatchers.IO) { repository.loadAlbums() }
                 _uiState.update { it.copy(albums = fullAlbums) }
+            }
+        }
+    }
+
+    fun loadMoreAllMedia() {
+        val state = _uiState.value
+        if (state.allLoading || state.allExhausted) return
+        viewModelScope.launch {
+            val offset = _uiState.value.allOffset
+            _uiState.update { it.copy(allLoading = true) }
+            val page = withContext(Dispatchers.IO) { repository.loadMedia(ALL_PAGE_SIZE, offset) }
+            _uiState.update { current ->
+                val virtualItems = current.photos.filter { it.generatedVirtual }
+                val systemItems = (current.photos.filterNot { it.generatedVirtual } + page)
+                    .distinctBy { it.cacheKey }
+                    .sortedByDescending { it.modifiedTime }
+                current.copy(
+                    photos = systemItems + virtualItems,
+                    allOffset = offset + page.size,
+                    allLoading = false,
+                    allExhausted = page.size < ALL_PAGE_SIZE,
+                    message = current.settings.language.t("全部页已加载 ${systemItems.size} 项", "All page loaded ${systemItems.size} items"),
+                )
             }
         }
     }
@@ -630,7 +659,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryScrollIndex = max(0, currentIndex - it.galleryAnchorSlot),
             )
         }
-        enqueueWindow(_uiState.value.galleryAnchorIndex, includeCurrent = false)
     }
 
     fun setHomeTab(tab: String) {
@@ -713,7 +741,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.0"
+                    val current = "v2.1"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1016,22 +1044,30 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun enqueueWindow(index: Int, includeCurrent: Boolean) {
-        val photos = _uiState.value.photos
-        if (!_uiState.value.vrMode) return
+        val state = _uiState.value
+        val photos = state.photos
+        if (!state.vrMode) return
         if (photos.isEmpty()) return
-        val currentVersion = _uiState.value.settings.toParams().cacheVersion()
-        val window = _uiState.value.activePrefetchWindow.coerceAtMost(8)
+        val scopeIndices = if (state.viewerScopeKeys.isNotEmpty()) {
+            photos.mapIndexedNotNull { photoIndex, item -> if (item.cacheKey in state.viewerScopeKeys) photoIndex else null }
+        } else {
+            photos.indices.toList()
+        }
+        val scopePosition = scopeIndices.indexOf(index)
+        if (scopePosition < 0) return
+        val currentVersion = state.settings.toParams().cacheVersion()
+        val window = state.activePrefetchWindow.coerceAtMost(8)
         val desiredCount = window * 2
         val targets = mutableListOf<Pair<Int, Int>>()
         if (includeCurrent) {
             if (photos.getOrNull(index)?.kind == MediaKind.IMAGE) enqueuePhoto(index, priority = 0, force = false, current = true)
         }
         var distance = 1
-        while (targets.size < desiredCount && distance <= window && distance < photos.size) {
-            val next = index + distance
-            val prev = index - distance
-            if (next in photos.indices && photos[next].kind == MediaKind.IMAGE && cache.findEntry(photos[next], currentVersion) == null) targets += next to distance * 2 - 1
-            if (targets.size < desiredCount && prev in photos.indices && photos[prev].kind == MediaKind.IMAGE && cache.findEntry(photos[prev], currentVersion) == null) targets += prev to distance * 2
+        while (targets.size < desiredCount && distance <= window && distance < scopeIndices.size) {
+            val next = scopeIndices.getOrNull(scopePosition + distance)
+            val prev = scopeIndices.getOrNull(scopePosition - distance)
+            if (next != null && photos[next].kind == MediaKind.IMAGE && cache.findEntry(photos[next], currentVersion) == null) targets += next to distance * 2 - 1
+            if (targets.size < desiredCount && prev != null && photos[prev].kind == MediaKind.IMAGE && cache.findEntry(photos[prev], currentVersion) == null) targets += prev to distance * 2
             distance++
         }
 
@@ -1652,88 +1688,105 @@ private class PhotoRepository(private val context: Context) {
     fun loadAlbums(): List<AlbumItem> = buildAlbums(loadMedia(null))
 
     fun loadAlbumMedia(bucketId: String, limit: Int, offset: Int): List<GalleryItem> {
-        val result = mutableListOf<GalleryItem>()
-        if (hasImagePermission(context)) {
-            result += queryMedia(
-                collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                idColumn = MediaStore.Images.Media._ID,
-                nameColumn = MediaStore.Images.Media.DISPLAY_NAME,
-                widthColumn = MediaStore.Images.Media.WIDTH,
-                heightColumn = MediaStore.Images.Media.HEIGHT,
-                sizeColumn = MediaStore.Images.Media.SIZE,
-                modifiedColumn = MediaStore.Images.Media.DATE_MODIFIED,
-                bucketIdColumn = MediaStore.Images.Media.BUCKET_ID,
-                bucketNameColumn = MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
-                relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Images.Media.RELATIVE_PATH else null,
-                kind = MediaKind.IMAGE,
-                limit = limit,
-                offset = offset,
-                selection = "${MediaStore.Images.Media.BUCKET_ID}=?",
-                selectionArgs = arrayOf(bucketId),
-            )
-        }
-        if (hasVideoPermission(context)) {
-            result += queryMedia(
-                collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                idColumn = MediaStore.Video.Media._ID,
-                nameColumn = MediaStore.Video.Media.DISPLAY_NAME,
-                widthColumn = MediaStore.Video.Media.WIDTH,
-                heightColumn = MediaStore.Video.Media.HEIGHT,
-                sizeColumn = MediaStore.Video.Media.SIZE,
-                modifiedColumn = MediaStore.Video.Media.DATE_MODIFIED,
-                bucketIdColumn = MediaStore.Video.Media.BUCKET_ID,
-                bucketNameColumn = MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
-                relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Video.Media.RELATIVE_PATH else null,
-                kind = MediaKind.VIDEO,
-                limit = limit,
-                offset = offset,
-                selection = "${MediaStore.Video.Media.BUCKET_ID}=?",
-                selectionArgs = arrayOf(bucketId),
-            )
-        }
-        return result.sortedByDescending { it.modifiedTime }.take(limit)
+        return queryFilesMedia(limit = limit, offset = offset, bucketId = bucketId)
     }
 
-    fun loadMedia(limit: Int? = null): List<GalleryItem> {
+    fun loadMedia(limit: Int? = null, offset: Int = 0): List<GalleryItem> {
+        return queryFilesMedia(limit = limit, offset = offset, bucketId = null)
+    }
+
+    private fun queryFilesMedia(limit: Int?, offset: Int, bucketId: String?): List<GalleryItem> {
         val result = mutableListOf<PhotoItem>()
-        val perKindLimit = limit?.coerceAtLeast(1)
-        if (hasImagePermission(context)) {
-            result += queryMedia(
-                collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                idColumn = MediaStore.Images.Media._ID,
-                nameColumn = MediaStore.Images.Media.DISPLAY_NAME,
-                widthColumn = MediaStore.Images.Media.WIDTH,
-                heightColumn = MediaStore.Images.Media.HEIGHT,
-                sizeColumn = MediaStore.Images.Media.SIZE,
-                modifiedColumn = MediaStore.Images.Media.DATE_MODIFIED,
-                bucketIdColumn = MediaStore.Images.Media.BUCKET_ID,
-                bucketNameColumn = MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
-                relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Images.Media.RELATIVE_PATH else null,
-                kind = MediaKind.IMAGE,
-                limit = perKindLimit,
-                offset = 0,
-            )
+        if (!hasImagePermission(context) && !hasVideoPermission(context)) return emptyList()
+        val collection = MediaStore.Files.getContentUri("external")
+        val idColumn = MediaStore.Files.FileColumns._ID
+        val mediaTypeColumn = MediaStore.Files.FileColumns.MEDIA_TYPE
+        val nameColumn = MediaStore.MediaColumns.DISPLAY_NAME
+        val widthColumn = MediaStore.MediaColumns.WIDTH
+        val heightColumn = MediaStore.MediaColumns.HEIGHT
+        val sizeColumn = MediaStore.MediaColumns.SIZE
+        val modifiedColumn = MediaStore.MediaColumns.DATE_MODIFIED
+        val bucketIdColumn = MediaStore.Images.Media.BUCKET_ID
+        val bucketNameColumn = MediaStore.Images.Media.BUCKET_DISPLAY_NAME
+        val relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.MediaColumns.RELATIVE_PATH else null
+        val projection = listOfNotNull(
+            idColumn,
+            mediaTypeColumn,
+            nameColumn,
+            widthColumn,
+            heightColumn,
+            sizeColumn,
+            modifiedColumn,
+            bucketIdColumn,
+            bucketNameColumn,
+            relativePathColumn,
+        ).toTypedArray()
+        val mediaTypes = mutableListOf<String>()
+        if (hasImagePermission(context)) mediaTypes += MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString()
+        if (hasVideoPermission(context)) mediaTypes += MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()
+        val selectionParts = mutableListOf("${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (${mediaTypes.joinToString(",") { "?" }})")
+        val args = mutableListOf<String>().apply { addAll(mediaTypes) }
+        if (bucketId != null) {
+            selectionParts += "$bucketIdColumn=?"
+            args += bucketId
         }
-        if (hasVideoPermission(context)) {
-            result += queryMedia(
-                collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                idColumn = MediaStore.Video.Media._ID,
-                nameColumn = MediaStore.Video.Media.DISPLAY_NAME,
-                widthColumn = MediaStore.Video.Media.WIDTH,
-                heightColumn = MediaStore.Video.Media.HEIGHT,
-                sizeColumn = MediaStore.Video.Media.SIZE,
-                modifiedColumn = MediaStore.Video.Media.DATE_MODIFIED,
-                bucketIdColumn = MediaStore.Video.Media.BUCKET_ID,
-                bucketNameColumn = MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
-                relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Video.Media.RELATIVE_PATH else null,
-                kind = MediaKind.VIDEO,
-                limit = perKindLimit,
-                offset = 0,
-            )
+        val selection = selectionParts.joinToString(" AND ")
+        val limitedSortOrder = if (limit != null) "$modifiedColumn DESC, $idColumn DESC LIMIT $limit OFFSET $offset" else "$modifiedColumn DESC, $idColumn DESC"
+        var manualOffset = false
+        val cursorResult = runCatching {
+            context.contentResolver.query(collection, projection, selection, args.toTypedArray(), limitedSortOrder)
+        }.getOrNull() ?: run {
+            manualOffset = true
+            context.contentResolver.query(collection, projection, selection, args.toTypedArray(), "$modifiedColumn DESC, $idColumn DESC")
         }
-        return result.sortedByDescending { it.modifiedTime }.let { sorted ->
-            if (limit == null) sorted else sorted.take(limit)
+        cursorResult?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(idColumn)
+            val mediaTypeCol = cursor.getColumnIndexOrThrow(mediaTypeColumn)
+            val nameCol = cursor.getColumnIndexOrThrow(nameColumn)
+            val widthCol = cursor.getColumnIndex(widthColumn)
+            val heightCol = cursor.getColumnIndex(heightColumn)
+            val sizeCol = cursor.getColumnIndex(sizeColumn)
+            val modifiedCol = cursor.getColumnIndexOrThrow(modifiedColumn)
+            val bucketIdCol = cursor.getColumnIndex(bucketIdColumn)
+            val bucketNameCol = cursor.getColumnIndex(bucketNameColumn)
+            val relativePathCol = relativePathColumn?.let { cursor.getColumnIndex(it) } ?: -1
+            var skipped = 0
+            while (cursor.moveToNext()) {
+                if (manualOffset && limit != null && skipped < offset) {
+                    skipped++
+                    continue
+                }
+                if (limit != null && result.size >= limit) break
+                val mediaType = cursor.getInt(mediaTypeCol)
+                val kind = when (mediaType) {
+                    MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE -> MediaKind.IMAGE
+                    MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO -> MediaKind.VIDEO
+                    else -> continue
+                }
+                val id = cursor.getLong(idCol)
+                val displayName = cursor.getString(nameCol) ?: "${kind.name.lowercase(Locale.US)}-$id"
+                if (kind == MediaKind.IMAGE && (displayName.startsWith(GENERATED_VR_PREFIX) || displayName.startsWith("VR_"))) continue
+                val itemUri = if (kind == MediaKind.IMAGE) {
+                    ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+                } else {
+                    ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
+                }
+                result += GalleryItem(
+                    id = id,
+                    uri = itemUri,
+                    displayName = displayName,
+                    width = if (widthCol >= 0) cursor.getInt(widthCol) else 0,
+                    height = if (heightCol >= 0) cursor.getInt(heightCol) else 0,
+                    size = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L,
+                    modifiedTime = cursor.getLong(modifiedCol),
+                    kind = kind,
+                    bucketId = if (bucketIdCol >= 0) cursor.getString(bucketIdCol).orEmpty() else "",
+                    bucketName = if (bucketNameCol >= 0) cursor.getString(bucketNameCol).orEmpty() else "",
+                    relativePath = if (relativePathCol >= 0) cursor.getString(relativePathCol).orEmpty() else "",
+                )
+            }
         }
+        return result
     }
 
     private fun queryMedia(
@@ -2791,6 +2844,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSetTab = viewModel::setHomeTab,
                 onOpenAlbum = viewModel::openAlbum,
                 onCloseAlbum = viewModel::closeAlbum,
+                onLoadMoreAll = viewModel::loadMoreAllMedia,
                 onLoadMoreAlbum = viewModel::loadMoreSelectedAlbum,
                 onSaveGenerated = { viewModel.saveGeneratedCopies(context, it) },
                 onReplaceOriginal = { indexes ->
@@ -2847,6 +2901,7 @@ private fun GalleryScreen(
     onSetTab: (String) -> Unit,
     onOpenAlbum: (String) -> Unit,
     onCloseAlbum: () -> Unit,
+    onLoadMoreAll: () -> Unit,
     onLoadMoreAlbum: () -> Unit,
     onSaveGenerated: (List<Int>) -> Unit,
     onReplaceOriginal: (List<Int>) -> Unit,
@@ -2875,7 +2930,7 @@ private fun GalleryScreen(
     }
     val photoIndexByKey = remember(state.photos) { state.photos.mapIndexed { index, item -> item.cacheKey to index }.toMap() }
     val visibleScopeKeys = remember(visibleItems, state.homeTab, state.selectedAlbumId) {
-        if (state.homeTab == "albums" && state.selectedAlbumId != null) visibleItems.map { it.cacheKey }.toSet() else emptySet()
+        if (state.homeTab == "generated") emptySet() else visibleItems.map { it.cacheKey }.toSet()
     }
     val selectedIndexes = remember(selectedKeys, photoIndexByKey) {
         if (selectedKeys.isEmpty()) emptyList() else selectedKeys.mapNotNull { photoIndexByKey[it] }
@@ -2990,7 +3045,7 @@ private fun GalleryScreen(
                         } else {
                             val index = state.photos.indexOfFirst { it.cacheKey == photo.cacheKey }
                             if (index >= 0) {
-                                if (state.homeTab == "albums") {
+                                if (state.homeTab == "albums" || state.homeTab == "all") {
                                     onOpenScoped(index, visibleScopeKeys, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
                                 } else {
                                     onOpen(index, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
@@ -3004,8 +3059,9 @@ private fun GalleryScreen(
                         }
                     },
                     onNearEnd = {
-                        if (state.homeTab == "albums" && state.selectedAlbumId != null) {
-                            onLoadMoreAlbum()
+                        when {
+                            state.homeTab == "albums" && state.selectedAlbumId != null -> onLoadMoreAlbum()
+                            state.homeTab == "all" -> onLoadMoreAll()
                         }
                     },
                     footerText = if (state.homeTab == "albums" && state.selectedAlbumId != null) {
@@ -3015,6 +3071,12 @@ private fun GalleryScreen(
                             state.albumLoading -> lang.t("正在加载更多...", "Loading more...")
                             loaded < total -> lang.t("已加载 $loaded/$total，继续下滑加载更多", "Loaded $loaded/$total; scroll for more")
                             else -> lang.t("已加载全部 $loaded 项", "Loaded all $loaded items")
+                        }
+                    } else if (state.homeTab == "all") {
+                        when {
+                            state.allLoading -> lang.t("正在预取更多...", "Prefetching more...")
+                            !state.allExhausted -> lang.t("已加载 ${visibleItems.size} 项，继续下滑加载更多", "Loaded ${visibleItems.size} items; scroll for more")
+                            else -> lang.t("已加载全部 ${visibleItems.size} 项", "Loaded all ${visibleItems.size} items")
                         }
                     } else {
                         null
