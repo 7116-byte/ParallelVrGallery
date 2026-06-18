@@ -24,6 +24,14 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.media.MediaPlayer
 import android.net.Uri
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
+import android.opengl.GLES20
+import android.opengl.GLUtils
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
@@ -102,7 +110,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -147,6 +154,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.FloatBuffer
 import java.nio.channels.FileChannel
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
@@ -343,6 +351,7 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
+private const val VIDEO_ENCODER_VERSION = "encoderV2"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -424,6 +433,8 @@ data class UiState(
     val manageOpen: Boolean = false,
     val homeTab: String = "all",
     val generatedTab: String = "images",
+    val tileSizeDp: Float = 112f,
+    val expandedGeneratedVersions: Set<String> = emptySet(),
     val allOffset: Int = 0,
     val allLoading: Boolean = false,
     val allExhausted: Boolean = false,
@@ -744,6 +755,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(generatedTab = tab) }
     }
 
+    fun setTileSizeDp(value: Float) {
+        _uiState.update { it.copy(tileSizeDp = value.coerceIn(42f, 220f)) }
+    }
+
+    fun toggleGeneratedVersion(version: String) {
+        _uiState.update {
+            val expanded = it.expandedGeneratedVersions
+            it.copy(expandedGeneratedVersions = if (version in expanded) expanded - version else expanded + version)
+        }
+    }
+
     fun openAlbum(bucketId: String) {
         _uiState.update { it.copy(homeTab = "albums", selectedAlbumId = bucketId, manageOpen = false) }
         loadAlbumPage(bucketId, reset = true)
@@ -817,7 +839,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.10"
+                    val current = "v2.11"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1439,7 +1461,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private fun processVideoJob(next: VideoQueuedJob) {
         synchronized(pausedVideoParams) { activeVideoParams[next.item.cacheKey] = next.params }
         val vrParams = next.params.toVrParams()
-        val videoCacheVersion = vrParams.cacheVersion()
+        val videoCacheVersion = next.params.cacheVersion()
         var lastRuntimeInfo = "pending"
         _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.GENERATING)) }
         videoQueueTags.upsert(next.item.cacheKey, VideoVrState.GENERATING, next.params)
@@ -2273,7 +2295,6 @@ private class VideoQueueTagStore(context: Context) {
     }
 
     private fun VideoGenerationParams.encodeForQueue(): String {
-        val vrParams = toVrParams()
         return listOf(
             vr.depthModel,
             vr.outputMode,
@@ -2286,7 +2307,7 @@ private class VideoQueueTagStore(context: Context) {
             vr.quality.toString(),
             modelThreads.toString(),
             useGpu.toString(),
-            vrParams.cacheVersion(),
+            cacheVersion(),
         ).joinToString(",") { it.replace(",", "_").replace('\t', '_').replace('\n', '_').replace('\r', '_') }
     }
 
@@ -2521,6 +2542,7 @@ private class VideoVrCacheManager(private val context: Context) {
             val parts = it.split("=", limit = 2)
             parts.first() to parts.getOrElse(1) { "" }
         }
+        if (values["encoderVersion"] != VIDEO_ENCODER_VERSION) return null
         return VideoCacheEntry(
             videoKey = videoKey,
             outputPath = output.absolutePath,
@@ -2975,7 +2997,7 @@ private class VideoVrGenerator(
         onProgress: (Float, Int, Int, Int, Long) -> Unit,
     ): VideoCacheEntry {
         val vrParams = params.toVrParams()
-        val version = vrParams.cacheVersion()
+        val version = params.cacheVersion()
         val dir = cache.entryDir(item, version)
         val framesDir = File(dir, "frames").also { it.mkdirs() }
         val output = File(dir, "vr_sbs.mp4")
@@ -3021,6 +3043,7 @@ private class VideoVrGenerator(
             height = height,
             fps = fps,
             totalFrames = totalFrames,
+            version = version,
             params = vrParams,
             onModelProgress = onModelProgress,
             onRuntimeInfo = onRuntimeInfo,
@@ -3038,6 +3061,7 @@ private class VideoVrGenerator(
                 "source=${item.displayName}",
                 "depthModel=${vrParams.depthModel}",
                 "cacheVersion=$version",
+                "encoderVersion=$VIDEO_ENCODER_VERSION",
                 "modelThreads=${vrParams.modelThreads}",
                 "useGpu=${vrParams.useGpu}",
                 "maxLongEdge=${vrParams.maxLongEdge}",
@@ -3058,6 +3082,7 @@ private class VideoVrGenerator(
         height: Int,
         fps: Int,
         totalFrames: Int,
+        version: String,
         params: VrGenerationParams,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
@@ -3108,13 +3133,16 @@ private class VideoVrGenerator(
             }
         }
 
+        var renderer: InputSurfaceRenderer? = null
         try {
+            val activeRenderer = InputSurfaceRenderer(surface, width, height)
+            renderer = activeRenderer
             data class FrameResult(val bitmap: Bitmap, val generatedMs: Long)
 
             fun cachedOrGenerateFrame(frame: Int): FrameResult? {
                 val frameCache = File(framesDir, "frame_${frame.toString().padStart(6, '0')}.jpg")
                 BitmapFactory.decodeFile(frameCache.absolutePath)?.let {
-                    onRuntimeInfo("frame cache hit frame=$frame version=${params.cacheVersion()}")
+                    onRuntimeInfo("frame cache hit frame=$frame version=$version")
                     return FrameResult(it, 0L)
                 }
                 val started = System.currentTimeMillis()
@@ -3135,7 +3163,8 @@ private class VideoVrGenerator(
                     cachedOrGenerateFrame(frame) ?: continue
                 }
                 val sbs = frameResult.bitmap
-                drawBitmapToSurface(surface, sbs, width, height)
+                val presentationTimeUs = frame * 1_000_000L / fps
+                activeRenderer.draw(sbs, presentationTimeUs)
                 if (frame != 0) sbs.recycle()
                 drain(end = false)
                 onProgress((frame + 1).toFloat() / totalFrames.toFloat(), frame + 1, totalFrames, fps, frameResult.generatedMs)
@@ -3147,9 +3176,10 @@ private class VideoVrGenerator(
             }
         } finally {
             firstSbs.recycle()
-            surface.release()
-            codec.stop()
+            renderer?.release()
+            runCatching { codec.stop() }
             codec.release()
+            surface.release()
             audio?.extractor?.release()
             runCatching { muxer.stop() }
             muxer.release()
@@ -3198,6 +3228,177 @@ private class VideoVrGenerator(
     }
 
     private fun even(value: Int): Int = if (value % 2 == 0) value else value - 1
+}
+
+private class InputSurfaceRenderer(
+    private val surface: Surface,
+    private val width: Int,
+    private val height: Int,
+) {
+    private val eglDisplay: EGLDisplay
+    private val eglContext: EGLContext
+    private val eglSurface: EGLSurface
+    private val program: Int
+    private val textureId: Int
+    private val positionBuffer: FloatBuffer
+    private val texCoordBuffer: FloatBuffer
+
+    init {
+        eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        check(eglDisplay != EGL14.EGL_NO_DISPLAY) { "Unable to get EGL display" }
+        val version = IntArray(2)
+        check(EGL14.eglInitialize(eglDisplay, version, 0, version, 1)) { "Unable to initialize EGL" }
+
+        val attribList = intArrayOf(
+            EGL14.EGL_RED_SIZE, 8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGLExt.EGL_RECORDABLE_ANDROID, 1,
+            EGL14.EGL_NONE,
+        )
+        val configs = arrayOfNulls<EGLConfig>(1)
+        val numConfigs = IntArray(1)
+        check(EGL14.eglChooseConfig(eglDisplay, attribList, 0, configs, 0, configs.size, numConfigs, 0)) { "Unable to choose EGL config" }
+        val eglConfig = configs[0] ?: error("No EGL config")
+        eglContext = EGL14.eglCreateContext(
+            eglDisplay,
+            eglConfig,
+            EGL14.EGL_NO_CONTEXT,
+            intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
+            0,
+        )
+        check(eglContext != EGL14.EGL_NO_CONTEXT) { "Unable to create EGL context" }
+        eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, eglConfig, surface, intArrayOf(EGL14.EGL_NONE), 0)
+        check(eglSurface != EGL14.EGL_NO_SURFACE) { "Unable to create EGL window surface" }
+        makeCurrent()
+
+        program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
+        textureId = createTexture()
+        positionBuffer = floatBufferOf(
+            -1f, -1f,
+            1f, -1f,
+            -1f, 1f,
+            1f, 1f,
+        )
+        texCoordBuffer = floatBufferOf(
+            0f, 1f,
+            1f, 1f,
+            0f, 0f,
+            1f, 0f,
+        )
+    }
+
+    fun draw(bitmap: Bitmap, presentationTimeUs: Long) {
+        makeCurrent()
+        GLES20.glViewport(0, 0, width, height)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glUseProgram(program)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+
+        val positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
+        val texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
+        val textureHandle = GLES20.glGetUniformLocation(program, "uTexture")
+        GLES20.glUniform1i(textureHandle, 0)
+
+        positionBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(positionHandle)
+        GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, positionBuffer)
+        texCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(texCoordHandle)
+        GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(positionHandle)
+        GLES20.glDisableVertexAttribArray(texCoordHandle)
+
+        EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, presentationTimeUs * 1000L)
+        check(EGL14.eglSwapBuffers(eglDisplay, eglSurface)) { "Unable to swap EGL buffers" }
+    }
+
+    fun release() {
+        makeCurrent()
+        GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+        GLES20.glDeleteProgram(program)
+        EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+        EGL14.eglDestroySurface(eglDisplay, eglSurface)
+        EGL14.eglDestroyContext(eglDisplay, eglContext)
+        EGL14.eglTerminate(eglDisplay)
+    }
+
+    private fun makeCurrent() {
+        check(EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) { "Unable to make EGL context current" }
+    }
+
+    private fun createTexture(): Int {
+        val textures = IntArray(1)
+        GLES20.glGenTextures(1, textures, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textures[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        return textures[0]
+    }
+
+    private fun createProgram(vertexSource: String, fragmentSource: String): Int {
+        val vertexShader = compileShader(GLES20.GL_VERTEX_SHADER, vertexSource)
+        val fragmentShader = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSource)
+        val program = GLES20.glCreateProgram()
+        GLES20.glAttachShader(program, vertexShader)
+        GLES20.glAttachShader(program, fragmentShader)
+        GLES20.glLinkProgram(program)
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        check(linkStatus[0] == GLES20.GL_TRUE) { "Unable to link GL program: ${GLES20.glGetProgramInfoLog(program)}" }
+        GLES20.glDeleteShader(vertexShader)
+        GLES20.glDeleteShader(fragmentShader)
+        return program
+    }
+
+    private fun compileShader(type: Int, source: String): Int {
+        val shader = GLES20.glCreateShader(type)
+        GLES20.glShaderSource(shader, source)
+        GLES20.glCompileShader(shader)
+        val status = IntArray(1)
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, status, 0)
+        check(status[0] == GLES20.GL_TRUE) { "Unable to compile GL shader: ${GLES20.glGetShaderInfoLog(shader)}" }
+        return shader
+    }
+
+    private fun floatBufferOf(vararg values: Float): FloatBuffer {
+        return ByteBuffer.allocateDirect(values.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .apply {
+                put(values)
+                position(0)
+            }
+    }
+
+    companion object {
+        private const val VERTEX_SHADER = """
+            attribute vec4 aPosition;
+            attribute vec2 aTexCoord;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_Position = aPosition;
+                vTexCoord = aTexCoord;
+            }
+        """
+        private const val FRAGMENT_SHADER = """
+            precision mediump float;
+            varying vec2 vTexCoord;
+            uniform sampler2D uTexture;
+            void main() {
+                gl_FragColor = texture2D(uTexture, vTexCoord);
+            }
+        """
+    }
 }
 
 private class DebugExporter(
@@ -3309,6 +3510,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onBack = viewModel::closeManage,
                 selectedTab = state.generatedTab,
                 onTabChange = viewModel::setGeneratedTab,
+                onToggleVersion = viewModel::toggleGeneratedVersion,
                 onDeleteVersion = viewModel::deleteCacheVersion,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
@@ -3356,6 +3558,8 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSettings = viewModel::openSettings,
                 onSetTab = viewModel::setHomeTab,
                 onSetGeneratedTab = viewModel::setGeneratedTab,
+                onSetTileSize = viewModel::setTileSizeDp,
+                onToggleGeneratedVersion = viewModel::toggleGeneratedVersion,
                 onOpenAlbum = viewModel::openAlbum,
                 onCloseAlbum = viewModel::closeAlbum,
                 onLoadMoreAll = viewModel::loadMoreAllMedia,
@@ -3414,6 +3618,8 @@ private fun GalleryScreen(
     onSettings: () -> Unit,
     onSetTab: (String) -> Unit,
     onSetGeneratedTab: (String) -> Unit,
+    onSetTileSize: (Float) -> Unit,
+    onToggleGeneratedVersion: (String) -> Unit,
     onOpenAlbum: (String) -> Unit,
     onCloseAlbum: () -> Unit,
     onLoadMoreAll: () -> Unit,
@@ -3433,7 +3639,7 @@ private fun GalleryScreen(
     onRegenerateImages: (List<Int>) -> Unit,
 ) {
     val lang = state.settings.language
-    var tileSize by rememberSaveable { mutableStateOf(112f) }
+    val tileSize = state.tileSizeDp
     var lastPinchAt by remember { mutableStateOf(0L) }
     var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     val systemItems = remember(state.photos) { state.photos.filterNot { it.generatedVirtual } }
@@ -3496,12 +3702,6 @@ private fun GalleryScreen(
                         }) { Text(lang.t("替换", "Replace")) }
                     }
                 }
-                val showPrefetch = state.homeTab == "all" || (state.homeTab == "albums" && state.selectedAlbumId != null)
-                if (showPrefetch) {
-                    Spacer(Modifier.height(10.dp))
-                    val prefetch = if (state.settings.autoPrefetch) lang.t("自动：2 -> 4 -> 8", "Auto: 2 -> 4 -> 8") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
-                    Text(lang.t("预加载：$prefetch", "Prefetch: $prefetch"), style = MaterialTheme.typography.bodySmall)
-                }
                 state.message?.let {
                     Spacer(Modifier.height(6.dp))
                     Text(lang.pickMixed(it), style = MaterialTheme.typography.bodySmall)
@@ -3521,6 +3721,7 @@ private fun GalleryScreen(
                         onBack = {},
                         selectedTab = state.generatedTab,
                         onTabChange = onSetGeneratedTab,
+                        onToggleVersion = onToggleGeneratedVersion,
                         onDeleteVersion = onDeleteVersion,
                         onOpenGenerated = onOpenGenerated,
                         onOpenGeneratedVideo = onOpenGeneratedVideo,
@@ -3561,7 +3762,7 @@ private fun GalleryScreen(
                     selectedKeys = selectedKeys,
                     onPinch = { zoom ->
                         lastPinchAt = System.currentTimeMillis()
-                        tileSize = (tileSize * zoom).coerceIn(42f, 220f)
+                        onSetTileSize((tileSize * zoom).coerceIn(42f, 220f))
                     },
                     onItemClick = { photo ->
                         if (selectedKeys.isNotEmpty()) {
@@ -3971,6 +4172,7 @@ private fun ManageScreen(
     onBack: () -> Unit,
     selectedTab: String,
     onTabChange: (String) -> Unit,
+    onToggleVersion: (String) -> Unit,
     onDeleteVersion: (String) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
     onOpenGeneratedVideo: (Int) -> Unit,
@@ -4009,6 +4211,7 @@ private fun ManageScreen(
         )
         Spacer(Modifier.height(8.dp))
         if (tab == "videos") {
+            val videoGridState = rememberLazyGridState()
             val videos = state.photos.filter { item ->
                 item.kind == MediaKind.VIDEO &&
                     ((state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) != VideoVrState.NORMAL ||
@@ -4030,58 +4233,63 @@ private fun ManageScreen(
             if (videos.isEmpty()) {
                 Text(lang.t("暂无生成中或已生成的视频", "No generating or generated videos"))
             } else {
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(130.dp),
-                    modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.White).padding(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    items(videos, key = { it.cacheKey }) { item ->
-                        val index = state.photos.indexOfFirst { it.cacheKey == item.cacheKey }
-                        val videoState = state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL
-                        val job = state.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(androidx.compose.ui.graphics.Color(0xff16191c)),
-                        ) {
-                            Box(
+                Box(Modifier.fillMaxSize()) {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(130.dp),
+                        state = videoGridState,
+                        modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.White).padding(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(videos, key = { it.cacheKey }) { item ->
+                            val index = state.photos.indexOfFirst { it.cacheKey == item.cacheKey }
+                            val videoState = state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL
+                            val job = state.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .aspectRatio(1f)
-                                    .combinedClickable(
-                                        enabled = index >= 0,
-                                        onClick = {
-                                            if (selectedVideoKeys.isNotEmpty()) {
-                                                selectedVideoKeys = if (item.cacheKey in selectedVideoKeys) selectedVideoKeys - item.cacheKey else selectedVideoKeys + item.cacheKey
-                                            } else {
-                                                onOpenGeneratedVideo(index)
-                                            }
-                                        },
-                                        onLongClick = { selectedVideoKeys = selectedVideoKeys + item.cacheKey },
-                                    ),
+                                    .background(androidx.compose.ui.graphics.Color(0xff16191c)),
                             ) {
-                                AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
-                                if (item.cacheKey in selectedVideoKeys) SelectionBadge()
-                                Text(
-                                    text = "${videoState.label(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}%  当前${job?.currentFrameMs ?: 0}ms 平均${job?.avgFrameMs ?: 0}ms",
-                                    color = androidx.compose.ui.graphics.Color.White,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.align(Alignment.BottomStart).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(5.dp),
-                                )
-                            }
-                            Row(Modifier.fillMaxWidth().padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                OutlinedButton(onClick = { onSaveVideo(index) }, enabled = videoState == VideoVrState.READY && index >= 0, modifier = Modifier.weight(1f)) {
-                                    Text(lang.t("保存", "Save"), style = MaterialTheme.typography.labelSmall)
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .aspectRatio(1f)
+                                        .combinedClickable(
+                                            enabled = index >= 0,
+                                            onClick = {
+                                                if (selectedVideoKeys.isNotEmpty()) {
+                                                    selectedVideoKeys = if (item.cacheKey in selectedVideoKeys) selectedVideoKeys - item.cacheKey else selectedVideoKeys + item.cacheKey
+                                                } else {
+                                                    onOpenGeneratedVideo(index)
+                                                }
+                                            },
+                                            onLongClick = { selectedVideoKeys = selectedVideoKeys + item.cacheKey },
+                                        ),
+                                ) {
+                                    AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
+                                    if (item.cacheKey in selectedVideoKeys) SelectionBadge()
+                                    Text(
+                                        text = "${videoState.label(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}%  当前${job?.currentFrameMs ?: 0}ms 平均${job?.avgFrameMs ?: 0}ms",
+                                        color = androidx.compose.ui.graphics.Color.White,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.align(Alignment.BottomStart).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(5.dp),
+                                    )
                                 }
-                                OutlinedButton(onClick = { onDeleteVideo(index) }, enabled = videoState == VideoVrState.READY && index >= 0, modifier = Modifier.weight(1f)) {
-                                    Text(lang.t("删除", "Delete"), style = MaterialTheme.typography.labelSmall)
+                                Row(Modifier.fillMaxWidth().padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    OutlinedButton(onClick = { onSaveVideo(index) }, enabled = videoState == VideoVrState.READY && index >= 0, modifier = Modifier.weight(1f)) {
+                                        Text(lang.t("保存", "Save"), style = MaterialTheme.typography.labelSmall)
+                                    }
+                                    OutlinedButton(onClick = { onDeleteVideo(index) }, enabled = videoState == VideoVrState.READY && index >= 0, modifier = Modifier.weight(1f)) {
+                                        Text(lang.t("删除", "Delete"), style = MaterialTheme.typography.labelSmall)
+                                    }
                                 }
                             }
                         }
                     }
+                    GridScrollbar(videoGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
+                    GridToTopButton(videoGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
                 }
             }
         } else {
@@ -4101,65 +4309,85 @@ private fun ManageScreen(
             if (state.cacheVersions.isEmpty()) {
                 Text(lang.t("暂无已生成图片", "No generated images yet"))
             } else {
-                val manageScroll = rememberScrollState()
-                val scope = rememberCoroutineScope()
+                val imageGridState = rememberLazyGridState()
                 Box(Modifier.fillMaxSize()) {
-                    Column(Modifier.fillMaxSize().verticalScroll(manageScroll)) {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(86.dp),
+                        state = imageGridState,
+                        modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.White).padding(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
                         state.cacheVersions.forEach { summary ->
                             val items = state.managedCacheItems.filter { it.entry.version == summary.version }
-                            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Column(Modifier.weight(1f)) {
-                                        Text(lang.t("版本：${summary.version}", "Version: ${summary.version}"), fontWeight = FontWeight.Bold)
-                                        Text(lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"), style = MaterialTheme.typography.bodySmall)
+                            val expanded = summary.version in state.expandedGeneratedVersions
+                            item(
+                                key = "version_header_${summary.version}",
+                                span = { GridItemSpan(maxLineSpan) },
+                            ) {
+                                Column(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .background(androidx.compose.ui.graphics.Color(0xfff5f6f7), RoundedCornerShape(8.dp))
+                                        .padding(10.dp),
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = lang.t("版本：${summary.version}", "Version: ${summary.version}"),
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        OutlinedButton(onClick = { onToggleVersion(summary.version) }) {
+                                            Text(if (expanded) lang.t("收起", "Collapse") else lang.t("展开", "Expand"))
+                                        }
                                     }
-                                    OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
-                                        Text(lang.t("删除", "Delete"))
+                                    Spacer(Modifier.height(6.dp))
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = androidx.compose.ui.graphics.Color(0xff555555),
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                        OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
+                                            Text(lang.t("删除", "Delete"))
+                                        }
                                     }
                                 }
-                                Spacer(Modifier.height(8.dp))
-                                LazyVerticalGrid(
-                                    columns = GridCells.Adaptive(86.dp),
-                                    modifier = Modifier.fillMaxWidth().height(260.dp).background(androidx.compose.ui.graphics.Color(0xffffffff)).padding(6.dp),
-                                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                ) {
-                                    items(items, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
-                                        val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
-                                        val selectionKey = "${item.entry.photoKey}|${item.entry.version}"
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .aspectRatio(1f)
-                                                .background(androidx.compose.ui.graphics.Color(0xff16191c))
-                                                .combinedClickable(
-                                                    enabled = index >= 0,
-                                                    onClick = {
-                                                        if (selectedImageKeys.isNotEmpty()) {
-                                                            selectedImageKeys = if (selectionKey in selectedImageKeys) selectedImageKeys - selectionKey else selectedImageKeys + selectionKey
-                                                        } else {
-                                                            onOpenGenerated(index, item.entry)
-                                                        }
-                                                    },
-                                                    onLongClick = { selectedImageKeys = selectedImageKeys + selectionKey },
-                                                ),
-                                        ) {
-                                            GeneratedSbsThumbnail(File(item.entry.outputPath), 360, ContentScale.Crop, Modifier.fillMaxSize(), lang)
-                                            if (selectionKey in selectedImageKeys) SelectionBadge()
-                                        }
+                            }
+                            if (expanded) {
+                                items(items, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
+                                    val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
+                                    val selectionKey = "${item.entry.photoKey}|${item.entry.version}"
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .aspectRatio(1f)
+                                            .background(androidx.compose.ui.graphics.Color(0xff16191c))
+                                            .combinedClickable(
+                                                enabled = index >= 0,
+                                                onClick = {
+                                                    if (selectedImageKeys.isNotEmpty()) {
+                                                        selectedImageKeys = if (selectionKey in selectedImageKeys) selectedImageKeys - selectionKey else selectedImageKeys + selectionKey
+                                                    } else {
+                                                        onOpenGenerated(index, item.entry)
+                                                    }
+                                                },
+                                                onLongClick = { selectedImageKeys = selectedImageKeys + selectionKey },
+                                            ),
+                                    ) {
+                                        GeneratedSbsThumbnail(File(item.entry.outputPath), 360, ContentScale.Crop, Modifier.fillMaxSize(), lang)
+                                        if (selectionKey in selectedImageKeys) SelectionBadge()
                                     }
                                 }
                             }
                         }
                     }
-                    if (manageScroll.value > 600) {
-                        Button(
-                            onClick = { scope.launch { manageScroll.animateScrollTo(0) } },
-                            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
-                        ) {
-                            Text(lang.t("顶部", "Top"))
-                        }
-                    }
+                    GridScrollbar(imageGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
+                    GridToTopButton(imageGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
                 }
             }
         }
@@ -5373,6 +5601,11 @@ private fun VrGenerationParams.cacheVersion(): String {
     val invert = if (invertDepth) "inv1" else "inv0"
     val gpu = if (useGpu) "gpu1" else "gpu0"
     return "${depthModel}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_$gpu"
+        .replace(Regex("[^A-Za-z0-9._-]"), "_")
+}
+
+private fun VideoGenerationParams.cacheVersion(): String {
+    return "${toVrParams().cacheVersion()}_$VIDEO_ENCODER_VERSION"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 

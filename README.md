@@ -4,6 +4,15 @@
 
 An Android gallery app for local parallel-eye SBS VR generation. It browses system photos/videos and keeps generated VR results in the app cache.
 
+## v2.11 更新
+
+- 双指缩放后的网格列数会保留到 Viewer 返回后，不再恢复默认列数导致定位错位。
+- 首页顶部不再显示预加载档位，普通图库浏览更干净。
+- 生成页图片 tab 改为按版本默认收起，展开后直接向下铺开图片。
+- 生成页图片/视频 tab 都增加滚动条和回到顶部按钮。
+- 视频 VR 生成改为按原视频 FPS 写入帧时间戳，修复先播封面+BGM、后播无声 3D 视频的问题。
+- 视频缓存增加 `encoderV2` 标记，旧问题视频不会继续被识别为当前可用缓存。
+
 ## v2.10 更新
 
 - 统一整理 `全部 / 相册 / 生成 / Viewer / 调试 / 设置` 的页面安全区、返回路径和状态刷新。
