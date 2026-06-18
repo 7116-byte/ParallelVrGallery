@@ -4,6 +4,13 @@
 
 An Android gallery app for local parallel-eye SBS VR generation. It browses system photos/videos and keeps generated VR results in the app cache.
 
+## v2.12 更新
+
+- 全部、相册、生成三页的缩略图列数独立保存，互不影响。
+- 每页初始列数改为 5，最小 1 列，最大 8 列。
+- 双指缩放改为按列数离散变化，每次只增加或减少 1 列。
+- 从 Viewer 返回后继续保留进入前的列数，避免列数恢复默认导致定位错位。
+
 ## v2.11 更新
 
 - 双指缩放后的网格列数会保留到 Viewer 返回后，不再恢复默认列数导致定位错位。

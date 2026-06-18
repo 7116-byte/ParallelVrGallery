@@ -433,7 +433,9 @@ data class UiState(
     val manageOpen: Boolean = false,
     val homeTab: String = "all",
     val generatedTab: String = "images",
-    val tileSizeDp: Float = 112f,
+    val allColumns: Int = 5,
+    val albumColumns: Int = 5,
+    val generatedColumns: Int = 5,
     val expandedGeneratedVersions: Set<String> = emptySet(),
     val allOffset: Int = 0,
     val allLoading: Boolean = false,
@@ -755,8 +757,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(generatedTab = tab) }
     }
 
-    fun setTileSizeDp(value: Float) {
-        _uiState.update { it.copy(tileSizeDp = value.coerceIn(42f, 220f)) }
+    fun setPageColumns(page: String, columns: Int) {
+        val safeColumns = columns.coerceIn(1, 8)
+        _uiState.update {
+            when (page) {
+                "all" -> it.copy(allColumns = safeColumns)
+                "albums" -> it.copy(albumColumns = safeColumns)
+                "generated" -> it.copy(generatedColumns = safeColumns)
+                else -> it
+            }
+        }
     }
 
     fun toggleGeneratedVersion(version: String) {
@@ -839,7 +849,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.11"
+                    val current = "v2.12"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3511,6 +3521,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 selectedTab = state.generatedTab,
                 onTabChange = viewModel::setGeneratedTab,
                 onToggleVersion = viewModel::toggleGeneratedVersion,
+                onSetGeneratedColumns = { viewModel.setPageColumns("generated", it) },
                 onDeleteVersion = viewModel::deleteCacheVersion,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
@@ -3558,7 +3569,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSettings = viewModel::openSettings,
                 onSetTab = viewModel::setHomeTab,
                 onSetGeneratedTab = viewModel::setGeneratedTab,
-                onSetTileSize = viewModel::setTileSizeDp,
+                onSetPageColumns = viewModel::setPageColumns,
                 onToggleGeneratedVersion = viewModel::toggleGeneratedVersion,
                 onOpenAlbum = viewModel::openAlbum,
                 onCloseAlbum = viewModel::closeAlbum,
@@ -3618,7 +3629,7 @@ private fun GalleryScreen(
     onSettings: () -> Unit,
     onSetTab: (String) -> Unit,
     onSetGeneratedTab: (String) -> Unit,
-    onSetTileSize: (Float) -> Unit,
+    onSetPageColumns: (String, Int) -> Unit,
     onToggleGeneratedVersion: (String) -> Unit,
     onOpenAlbum: (String) -> Unit,
     onCloseAlbum: () -> Unit,
@@ -3639,7 +3650,6 @@ private fun GalleryScreen(
     onRegenerateImages: (List<Int>) -> Unit,
 ) {
     val lang = state.settings.language
-    val tileSize = state.tileSizeDp
     var lastPinchAt by remember { mutableStateOf(0L) }
     var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     val systemItems = remember(state.photos) { state.photos.filterNot { it.generatedVirtual } }
@@ -3666,6 +3676,7 @@ private fun GalleryScreen(
         initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
     )
     val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
+    val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumColumns else state.allColumns
 
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
@@ -3722,6 +3733,7 @@ private fun GalleryScreen(
                         selectedTab = state.generatedTab,
                         onTabChange = onSetGeneratedTab,
                         onToggleVersion = onToggleGeneratedVersion,
+                        onSetGeneratedColumns = { onSetPageColumns("generated", it) },
                         onDeleteVersion = onDeleteVersion,
                         onOpenGenerated = onOpenGenerated,
                         onOpenGeneratedVideo = onOpenGeneratedVideo,
@@ -3738,9 +3750,15 @@ private fun GalleryScreen(
             } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
                 Box(Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp)) {
                     LazyVerticalGrid(
-                        columns = GridCells.Adaptive(168.dp),
+                        columns = GridCells.Fixed(state.albumColumns),
                         state = albumListGridState,
-                        modifier = Modifier.fillMaxSize(),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .discreteColumnPinch(
+                                columns = state.albumColumns,
+                                onColumns = { onSetPageColumns("albums", it) },
+                                onPinchActivity = { lastPinchAt = System.currentTimeMillis() },
+                            ),
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(14.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
@@ -3758,11 +3776,11 @@ private fun GalleryScreen(
                     state = state,
                     lang = lang,
                     gridState = gridState,
-                    tileSize = tileSize,
+                    columns = timelineColumns,
                     selectedKeys = selectedKeys,
-                    onPinch = { zoom ->
+                    onColumns = { nextColumns ->
                         lastPinchAt = System.currentTimeMillis()
-                        onSetTileSize((tileSize * zoom).coerceIn(42f, 220f))
+                        onSetPageColumns(if (state.homeTab == "albums") "albums" else "all", nextColumns)
                     },
                     onItemClick = { photo ->
                         if (selectedKeys.isNotEmpty()) {
@@ -3829,9 +3847,9 @@ private fun TimelineGrid(
     state: UiState,
     lang: AppLanguage,
     gridState: androidx.compose.foundation.lazy.grid.LazyGridState,
-    tileSize: Float,
+    columns: Int,
     selectedKeys: Set<String>,
-    onPinch: (Float) -> Unit,
+    onColumns: (Int) -> Unit,
     onItemClick: (PhotoItem) -> Unit,
     onItemLongClick: (PhotoItem) -> Unit,
     onNearEnd: () -> Unit,
@@ -3874,26 +3892,11 @@ private fun TimelineGrid(
     }
     Box(modifier) {
         LazyVerticalGrid(
-            columns = GridCells.Adaptive(tileSize.dp),
+            columns = GridCells.Fixed(columns),
             state = gridState,
-            modifier = Modifier.fillMaxSize().pointerInput(Unit) {
-                awaitPointerEventScope {
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val pressed = event.changes.filter { it.pressed }
-                        if (pressed.size >= 2) {
-                            val centroid = pressed.centroid()
-                            val previousCentroid = pressed.previousCentroid()
-                            val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
-                            val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
-                            if (abs(zoom - 1f) > 0.01f) {
-                                onPinch(zoom)
-                                event.changes.forEach { it.consume() }
-                            }
-                        }
-                    }
-                }
-            },
+            modifier = Modifier
+                .fillMaxSize()
+                .discreteColumnPinch(columns = columns, onColumns = onColumns),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
             verticalArrangement = Arrangement.spacedBy(3.dp),
             horizontalArrangement = Arrangement.spacedBy(3.dp),
@@ -3929,7 +3932,7 @@ private fun TimelineGrid(
                             statusText = statusText,
                             entry = state.entries[photo.cacheKey],
                             lang = lang,
-                            tileSize = tileSize,
+                            columns = columns,
                             selected = photo.cacheKey in selectedKeys,
                             onClick = { onItemClick(photo) },
                             onLongClick = { onItemLongClick(photo) },
@@ -4103,6 +4106,38 @@ private fun RoundedPillTabs(
     }
 }
 
+private fun Modifier.discreteColumnPinch(
+    columns: Int,
+    onColumns: (Int) -> Unit,
+    onPinchActivity: () -> Unit = {},
+): Modifier = pointerInput(columns) {
+    var lastStepAt = 0L
+    awaitPointerEventScope {
+        while (true) {
+            val event = awaitPointerEvent()
+            val pressed = event.changes.filter { it.pressed }
+            if (pressed.size >= 2) {
+                val centroid = pressed.centroid()
+                val previousCentroid = pressed.previousCentroid()
+                val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
+                val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.6f, 1.6f)
+                val now = System.currentTimeMillis()
+                val next = when {
+                    zoom > 1.08f -> columns - 1
+                    zoom < 0.92f -> columns + 1
+                    else -> columns
+                }.coerceIn(1, 8)
+                if (next != columns && now - lastStepAt > 140L) {
+                    onPinchActivity()
+                    onColumns(next)
+                    lastStepAt = now
+                }
+                event.changes.forEach { it.consume() }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PhotoTile(
@@ -4110,12 +4145,12 @@ private fun PhotoTile(
     statusText: String,
     entry: VrCacheEntry?,
     lang: AppLanguage,
-    tileSize: Float,
+    columns: Int,
     selected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
 ) {
-    val compact = tileSize < 64f
+    val compact = columns >= 7
     val labelStyle = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall
     val labelPaddingH = if (compact) 3.dp else 5.dp
     val labelPaddingV = if (compact) 1.dp else 2.dp
@@ -4173,6 +4208,7 @@ private fun ManageScreen(
     selectedTab: String,
     onTabChange: (String) -> Unit,
     onToggleVersion: (String) -> Unit,
+    onSetGeneratedColumns: (Int) -> Unit,
     onDeleteVersion: (String) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
     onOpenGeneratedVideo: (Int) -> Unit,
@@ -4235,9 +4271,13 @@ private fun ManageScreen(
             } else {
                 Box(Modifier.fillMaxSize()) {
                     LazyVerticalGrid(
-                        columns = GridCells.Adaptive(130.dp),
+                        columns = GridCells.Fixed(state.generatedColumns),
                         state = videoGridState,
-                        modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.White).padding(8.dp),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(androidx.compose.ui.graphics.Color.White)
+                            .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                            .padding(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
@@ -4312,9 +4352,13 @@ private fun ManageScreen(
                 val imageGridState = rememberLazyGridState()
                 Box(Modifier.fillMaxSize()) {
                     LazyVerticalGrid(
-                        columns = GridCells.Adaptive(86.dp),
+                        columns = GridCells.Fixed(state.generatedColumns),
                         state = imageGridState,
-                        modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.White).padding(8.dp),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(androidx.compose.ui.graphics.Color.White)
+                            .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                            .padding(8.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
