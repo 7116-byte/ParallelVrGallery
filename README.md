@@ -4,6 +4,11 @@
 
 An Android gallery app for local parallel-eye SBS VR generation. It browses system photos/videos and keeps generated VR results in the app cache.
 
+## v2.13 更新
+
+- 双指缩放改为按整次手势累计跨度变化判断，手指离得远也能正常触发列数变化。
+- 相册主页的相册列数和相册详情里的图片列数拆开保存，互不影响。
+
 ## v2.12 更新
 
 - 全部、相册、生成三页的缩略图列数独立保存，互不影响。

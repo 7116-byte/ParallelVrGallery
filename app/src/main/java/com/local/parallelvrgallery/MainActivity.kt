@@ -120,6 +120,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerInputChange
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
@@ -434,7 +435,8 @@ data class UiState(
     val homeTab: String = "all",
     val generatedTab: String = "images",
     val allColumns: Int = 5,
-    val albumColumns: Int = 5,
+    val albumListColumns: Int = 5,
+    val albumDetailColumns: Int = 5,
     val generatedColumns: Int = 5,
     val expandedGeneratedVersions: Set<String> = emptySet(),
     val allOffset: Int = 0,
@@ -762,7 +764,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update {
             when (page) {
                 "all" -> it.copy(allColumns = safeColumns)
-                "albums" -> it.copy(albumColumns = safeColumns)
+                "albumList" -> it.copy(albumListColumns = safeColumns)
+                "albumDetail" -> it.copy(albumDetailColumns = safeColumns)
                 "generated" -> it.copy(generatedColumns = safeColumns)
                 else -> it
             }
@@ -849,7 +852,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.12"
+                    val current = "v2.13"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3676,7 +3679,7 @@ private fun GalleryScreen(
         initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
     )
     val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
-    val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumColumns else state.allColumns
+    val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
 
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
@@ -3750,13 +3753,13 @@ private fun GalleryScreen(
             } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
                 Box(Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp)) {
                     LazyVerticalGrid(
-                        columns = GridCells.Fixed(state.albumColumns),
+                        columns = GridCells.Fixed(state.albumListColumns),
                         state = albumListGridState,
                         modifier = Modifier
                             .fillMaxSize()
                             .discreteColumnPinch(
-                                columns = state.albumColumns,
-                                onColumns = { onSetPageColumns("albums", it) },
+                                columns = state.albumListColumns,
+                                onColumns = { onSetPageColumns("albumList", it) },
                                 onPinchActivity = { lastPinchAt = System.currentTimeMillis() },
                             ),
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(14.dp),
@@ -3780,7 +3783,7 @@ private fun GalleryScreen(
                     selectedKeys = selectedKeys,
                     onColumns = { nextColumns ->
                         lastPinchAt = System.currentTimeMillis()
-                        onSetPageColumns(if (state.homeTab == "albums") "albums" else "all", nextColumns)
+                        onSetPageColumns(if (state.homeTab == "albums") "albumDetail" else "all", nextColumns)
                     },
                     onItemClick = { photo ->
                         if (selectedKeys.isNotEmpty()) {
@@ -4111,28 +4114,33 @@ private fun Modifier.discreteColumnPinch(
     onColumns: (Int) -> Unit,
     onPinchActivity: () -> Unit = {},
 ): Modifier = pointerInput(columns) {
+    val stepThresholdPx = 36f
     var lastStepAt = 0L
+    var baselineSpan: Float? = null
     awaitPointerEventScope {
         while (true) {
-            val event = awaitPointerEvent()
+            val event = awaitPointerEvent(PointerEventPass.Initial)
             val pressed = event.changes.filter { it.pressed }
             if (pressed.size >= 2) {
                 val centroid = pressed.centroid()
-                val previousCentroid = pressed.previousCentroid()
-                val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
-                val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.6f, 1.6f)
+                val currentSpan = pressed.span(centroid)
+                val startSpan = baselineSpan ?: currentSpan.also { baselineSpan = it }
+                val delta = currentSpan - startSpan
                 val now = System.currentTimeMillis()
                 val next = when {
-                    zoom > 1.08f -> columns - 1
-                    zoom < 0.92f -> columns + 1
+                    delta > stepThresholdPx -> columns - 1
+                    delta < -stepThresholdPx -> columns + 1
                     else -> columns
                 }.coerceIn(1, 8)
                 if (next != columns && now - lastStepAt > 140L) {
                     onPinchActivity()
                     onColumns(next)
+                    baselineSpan = currentSpan
                     lastStepAt = now
                 }
                 event.changes.forEach { it.consume() }
+            } else {
+                baselineSpan = null
             }
         }
     }
