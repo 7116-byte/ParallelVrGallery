@@ -12,7 +12,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageDecoder
 import android.media.MediaCodec
@@ -51,6 +50,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -98,6 +98,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -110,6 +111,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
@@ -749,7 +751,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.4"
+                    val current = "v2.5"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -2357,7 +2359,7 @@ private class VrGenerator(
         val heap = Runtime.getRuntime()
         val heapAvailable = heap.maxMemory() - (heap.totalMemory() - heap.freeMemory())
         val budget = min(160L * 1024L * 1024L, max(48L * 1024L * 1024L, (heapAvailable * 55L) / 100L))
-        val bytesPerSourcePixel = 40f
+        val bytesPerSourcePixel = 18f
         val requestedPixels = requested.toFloat() * requested.toFloat() * ratio
         val requestedBytes = requestedPixels * bytesPerSourcePixel
         if (requestedBytes <= budget) return requested
@@ -2484,37 +2486,29 @@ private class VrGenerator(
     private fun makeParallelSbs(source: Bitmap, depth: FloatArray, depthScale: Float, fillRadius: Int): Bitmap {
         val w = source.width
         val h = source.height
-        val left = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val right = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val srcPixels = IntArray(w * h)
-        val leftPixels = IntArray(w * h)
-        val rightPixels = IntArray(w * h)
-        source.getPixels(srcPixels, 0, w, 0, 0, w, h)
-        srcPixels.copyInto(leftPixels)
-        srcPixels.copyInto(rightPixels)
-
         val fill = fillRadius.coerceIn(1, 32)
         val depthScaling = depthScale / w.toFloat()
+        val out = Bitmap.createBitmap(w * 2, h, Bitmap.Config.ARGB_8888)
+        val srcRow = IntArray(w)
+        val leftRow = IntArray(w)
+        val dxForX = IntArray(w) { x -> (x * 517 / max(1, w - 1)).coerceIn(0, 517) }
 
-        for (x in w - 1 downTo 0) {
-            for (y in 0 until h) {
-                val dx = (x * 517 / max(1, w - 1)).coerceIn(0, 517)
-                val dy = (y * 517 / max(1, h - 1)).coerceIn(0, 517)
-                val d = depth[dy * 518 + dx]
+        for (y in 0 until h) {
+            source.getPixels(srcRow, 0, w, 0, y, w, 1)
+            srcRow.copyInto(leftRow)
+            val depthBase = (y * 517 / max(1, h - 1)).coerceIn(0, 517) * 518
+            for (x in w - 1 downTo 0) {
+                val d = depth[depthBase + dxForX[x]]
                 val shift = (d.coerceIn(0f, 1f) * 255f * depthScaling).toInt().coerceIn(0, w - 1)
-                val color = srcPixels[y * w + x]
+                val color = srcRow[x]
                 for (offset in 0 until fill) {
                     val leftX = (x + shift + offset).coerceIn(0, w - 1)
-                    leftPixels[y * w + leftX] = color
+                    leftRow[leftX] = color
                 }
             }
+            out.setPixels(leftRow, 0, w, 0, y, w, 1)
+            out.setPixels(srcRow, 0, w, w, y, w, 1)
         }
-        left.setPixels(leftPixels, 0, w, 0, 0, w, h)
-        right.setPixels(rightPixels, 0, w, 0, 0, w, h)
-        val out = Bitmap.createBitmap(w * 2, h, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
-        canvas.drawBitmap(left, 0f, 0f, null)
-        canvas.drawBitmap(right, w.toFloat(), 0f, null)
         return out
     }
 }
@@ -3104,7 +3098,7 @@ private fun GalleryScreen(
                     selectedKeys = selectedKeys,
                     onPinch = { zoom ->
                         lastPinchAt = System.currentTimeMillis()
-                        tileSize = (tileSize * zoom).coerceIn(72f, 220f)
+                        tileSize = (tileSize * zoom).coerceIn(42f, 220f)
                     },
                     onItemClick = { photo ->
                         if (selectedKeys.isNotEmpty()) {
@@ -3309,21 +3303,39 @@ private fun GridScrollbar(
     val visibleCount = visible.size.coerceAtLeast(1)
     val thumbFraction = (visibleCount.toFloat() / total.toFloat()).coerceIn(0.06f, 1f)
     val topFraction = (first.toFloat() / total.toFloat()).coerceIn(0f, 1f - thumbFraction)
+    val scope = rememberCoroutineScope()
+    var trackHeight by remember { mutableStateOf(1) }
+    fun scrollToTrackPosition(y: Float) {
+        val fraction = (y / trackHeight.toFloat()).coerceIn(0f, 1f)
+        val targetIndex = (fraction * (total - 1).toFloat()).roundToInt().coerceIn(0, total - 1)
+        scope.launch { gridState.scrollToItem(targetIndex) }
+    }
     Box(
         modifier
-            .width(4.dp)
+            .width(22.dp)
             .fillMaxSize()
-            .padding(vertical = 12.dp),
+            .padding(vertical = 12.dp)
+            .onSizeChanged { trackHeight = it.height.coerceAtLeast(1) }
+            .pointerInput(total, trackHeight) {
+                detectVerticalDragGestures(
+                    onDragStart = { offset -> scrollToTrackPosition(offset.y) },
+                    onVerticalDrag = { change, _ ->
+                        scrollToTrackPosition(change.position.y)
+                        change.consume()
+                    },
+                )
+            },
+        contentAlignment = Alignment.Center,
     ) {
         Box(
             Modifier
-                .fillMaxWidth()
+                .width(5.dp)
                 .fillMaxHeight()
                 .background(androidx.compose.ui.graphics.Color(0x22000000), RoundedCornerShape(3.dp)),
         )
         Box(
             Modifier
-                .fillMaxWidth()
+                .width(5.dp)
                 .fillMaxHeight(thumbFraction)
                 .align(Alignment.TopCenter)
                 .graphicsLayer { translationY = size.height * topFraction / thumbFraction }
