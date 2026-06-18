@@ -783,7 +783,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.7"
+                    val current = "v2.8"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3402,9 +3402,10 @@ private fun TimelineGrid(
     footerText: String?,
     modifier: Modifier = Modifier,
 ) {
-    var renderLimit by remember { mutableStateOf(min(1200, items.size)) }
+    val restoreRenderLimit = min(items.size, max(1200, gridState.firstVisibleItemIndex + 400))
+    var renderLimit by remember(items.firstOrNull()?.cacheKey) { mutableStateOf(restoreRenderLimit) }
     LaunchedEffect(items.size) {
-        renderLimit = renderLimit.coerceAtLeast(min(1200, items.size)).coerceAtMost(items.size)
+        renderLimit = renderLimit.coerceAtLeast(restoreRenderLimit).coerceAtMost(items.size)
     }
     LaunchedEffect(items.size, gridState) {
         snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }
@@ -3481,11 +3482,18 @@ private fun TimelineGrid(
                     )
                     is TimelineCell.Media -> {
                         val photo = cell.item
+                        val imageState = state.states[photo.cacheKey] ?: VrState.NORMAL
+                        val statusText = if (photo.kind == MediaKind.VIDEO) {
+                            (state.videoStates[photo.cacheKey] ?: VideoVrState.NORMAL).label(lang)
+                        } else {
+                            imageState.label(lang)
+                        }
                         PhotoTile(
                             photo = photo,
-                            state = state.states[photo.cacheKey] ?: VrState.NORMAL,
+                            statusText = statusText,
                             entry = state.entries[photo.cacheKey],
                             lang = lang,
+                            tileSize = tileSize,
                             selected = photo.cacheKey in selectedKeys,
                             onClick = { onItemClick(photo) },
                             onLongClick = { onItemLongClick(photo) },
@@ -3627,13 +3635,18 @@ private fun HomeBottomNav(current: String, lang: AppLanguage, onSelect: (String)
 @Composable
 private fun PhotoTile(
     photo: PhotoItem,
-    state: VrState,
+    statusText: String,
     entry: VrCacheEntry?,
     lang: AppLanguage,
+    tileSize: Float,
     selected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
 ) {
+    val compact = tileSize < 64f
+    val labelStyle = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall
+    val labelPaddingH = if (compact) 3.dp else 5.dp
+    val labelPaddingV = if (compact) 1.dp else 2.dp
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -3649,8 +3662,11 @@ private fun PhotoTile(
             Text(
                 text = "▶",
                 color = androidx.compose.ui.graphics.Color.White,
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.align(Alignment.Center).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(horizontal = 8.dp, vertical = 4.dp),
+                style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.titleMedium,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(androidx.compose.ui.graphics.Color(0x99000000), RoundedCornerShape(3.dp))
+                    .padding(horizontal = if (compact) 4.dp else 8.dp, vertical = if (compact) 1.dp else 4.dp),
             )
         }
         if (selected) {
@@ -3663,10 +3679,15 @@ private fun PhotoTile(
             )
         }
         Text(
-            text = state.label(lang),
+            text = statusText,
             color = androidx.compose.ui.graphics.Color.White,
-            style = MaterialTheme.typography.labelSmall,
-            modifier = Modifier.align(Alignment.BottomStart).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(5.dp),
+            style = labelStyle,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .background(androidx.compose.ui.graphics.Color(0xaa000000), RoundedCornerShape(3.dp))
+                .padding(horizontal = labelPaddingH, vertical = labelPaddingV),
         )
     }
 }
