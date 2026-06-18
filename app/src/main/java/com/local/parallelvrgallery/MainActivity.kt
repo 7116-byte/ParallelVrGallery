@@ -68,6 +68,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
@@ -108,6 +109,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerInputChange
@@ -388,6 +390,7 @@ data class VideoVrJob(
     val currentFrame: Int = 0,
     val totalFrames: Int = 0,
     val fps: Int = 30,
+    val currentFrameMs: Long = 0L,
     val avgFrameMs: Long = 0L,
     val modelId: String = "",
     val cacheVersion: String = "",
@@ -410,7 +413,7 @@ data class UiState(
     val hasNotificationPermission: Boolean = false,
     val photos: List<PhotoItem> = emptyList(),
     val selectedIndex: Int? = null,
-    val viewerReturnToManage: Boolean = false,
+    val viewerOrigin: ViewerOrigin = ViewerOrigin.NORMAL,
     val manageViewerKeys: Set<String> = emptySet(),
     val viewerScopeKeys: Set<String> = emptySet(),
     val galleryAnchorIndex: Int = 0,
@@ -420,6 +423,7 @@ data class UiState(
     val settingsOpen: Boolean = false,
     val manageOpen: Boolean = false,
     val homeTab: String = "all",
+    val generatedTab: String = "images",
     val allOffset: Int = 0,
     val allLoading: Boolean = false,
     val allExhausted: Boolean = false,
@@ -473,6 +477,12 @@ private enum class QueueSource {
     ALL,
     ALBUM,
     GENERATED,
+}
+
+enum class ViewerOrigin {
+    NORMAL,
+    GENERATED_TAB,
+    MANAGE_MODAL,
 }
 
 private data class QueueContext(val source: QueueSource, val albumId: String?)
@@ -643,7 +653,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 galleryScrollOffset = firstVisibleOffset,
                 galleryAnchorSlot = (index - firstVisibleIndex).coerceAtLeast(0),
                 vrMode = true,
-                viewerReturnToManage = false,
+                viewerOrigin = ViewerOrigin.NORMAL,
                 manageViewerKeys = emptySet(),
                 viewerScopeKeys = scopeKeys,
                 message = null,
@@ -656,13 +666,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val photo = _uiState.value.photos.getOrNull(index)
         _uiState.update {
             val keys = it.managedCacheItems.map { item -> item.photoItem.cacheKey }.toSet()
+            val origin = if (it.manageOpen) ViewerOrigin.MANAGE_MODAL else ViewerOrigin.GENERATED_TAB
             it.copy(
                 selectedIndex = index,
                 galleryAnchorIndex = index,
                 galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
                 vrMode = true,
                 manageOpen = false,
-                viewerReturnToManage = true,
+                homeTab = if (origin == ViewerOrigin.GENERATED_TAB) "generated" else it.homeTab,
+                generatedTab = "images",
+                viewerOrigin = origin,
                 manageViewerKeys = keys + listOfNotNull(photo?.cacheKey),
                 viewerScopeKeys = keys + listOfNotNull(photo?.cacheKey),
                 entries = if (photo != null && entry != null) it.entries + (photo.cacheKey to entry) else it.entries,
@@ -679,13 +692,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         it.videoEntries.containsKey(item.cacheKey) ||
                         it.videoJobs.any { job -> job.item.cacheKey == item.cacheKey })
             }.map { item -> item.cacheKey }.toSet()
+            val origin = if (it.manageOpen) ViewerOrigin.MANAGE_MODAL else ViewerOrigin.GENERATED_TAB
             it.copy(
                 selectedIndex = index,
                 galleryAnchorIndex = index,
                 galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
                 vrMode = true,
                 manageOpen = false,
-                viewerReturnToManage = true,
+                homeTab = if (origin == ViewerOrigin.GENERATED_TAB) "generated" else it.homeTab,
+                generatedTab = "videos",
+                viewerOrigin = origin,
                 manageViewerKeys = keys,
                 viewerScopeKeys = keys,
                 message = null,
@@ -696,11 +712,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun closeViewer() {
         _uiState.update {
             val currentIndex = it.selectedIndex ?: it.galleryAnchorIndex
+            val returnToManage = it.viewerOrigin == ViewerOrigin.MANAGE_MODAL
+            val returnToGeneratedTab = it.viewerOrigin == ViewerOrigin.GENERATED_TAB
             it.copy(
                 selectedIndex = null,
                 debugIndex = null,
-                manageOpen = it.viewerReturnToManage,
-                viewerReturnToManage = false,
+                manageOpen = returnToManage,
+                homeTab = if (returnToGeneratedTab) "generated" else it.homeTab,
+                viewerOrigin = ViewerOrigin.NORMAL,
                 manageViewerKeys = emptySet(),
                 viewerScopeKeys = emptySet(),
                 galleryAnchorIndex = currentIndex,
@@ -719,6 +738,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
         rebalanceQueueForActiveSource()
         startWorker()
+    }
+
+    fun setGeneratedTab(tab: String) {
+        _uiState.update { it.copy(generatedTab = tab) }
     }
 
     fun openAlbum(bucketId: String) {
@@ -794,7 +817,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.9"
+                    val current = "v2.10"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1425,7 +1448,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val started = System.currentTimeMillis()
         var totalFrameTimeMs = 0L
         var measuredFrameCount = 0
-        var lastFrameAt: Long? = null
         val result = runCatching {
             videoGenerator.generate(
                 next.item,
@@ -1445,20 +1467,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     lastRuntimeInfo = runtime
                     upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = runtime)
                 },
-            ) { progress, frame, total, fps ->
+            ) { progress, frame, total, fps, currentFrameMs ->
                 if (synchronized(pausedVideos) { pausedVideos.contains(next.item.cacheKey) }) {
                     throw VideoPausedException()
                 }
-                val now = System.currentTimeMillis()
-                lastFrameAt?.let { previous ->
-                    if (frame > 1) {
-                        totalFrameTimeMs += (now - previous).coerceAtLeast(0L)
-                        measuredFrameCount++
-                    }
+                if (currentFrameMs > 0L) {
+                    totalFrameTimeMs += currentFrameMs
+                    measuredFrameCount++
                 }
-                lastFrameAt = now
                 val avgFrameMs = if (measuredFrameCount > 0) totalFrameTimeMs / measuredFrameCount else 0L
-                upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
+                upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, currentFrameMs = currentFrameMs, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
                 videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
             }
         }
@@ -1473,7 +1491,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     message = "视频 VR 已生成：${next.item.displayName}（${elapsed}ms）",
                 )
             }
-            upsertVideoJob(next.item, VideoVrState.READY, 1f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis())
+            refreshGeneratedLibrary()
+            upsertVideoJob(next.item, VideoVrState.READY, 1f, currentFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.currentFrameMs ?: 0L, avgFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.avgFrameMs ?: 0L, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis())
             videoQueueTags.remove(next.item.cacheKey)
             synchronized(pausedVideoParams) {
                 pausedVideoParams.remove(next.item.cacheKey)
@@ -1595,10 +1614,34 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 entries = it.entries + (key to entry),
             )
         }
+        refreshGeneratedLibrary()
     }
 
     private fun markState(key: String, state: VrState) {
         _uiState.update { it.copy(states = it.states + (key to state)) }
+    }
+
+    private fun refreshGeneratedLibrary(message: String? = null) {
+        val photos = _uiState.value.photos
+        val imageEntries = photos
+            .filter { it.kind == MediaKind.IMAGE }
+            .mapNotNull { cache.findEntry(it) }
+            .associateBy { it.photoKey }
+        val managedItems = cache.allEntries(photos)
+        val videoPairs = videoCache.allEntries(photos)
+        val videoEntries = videoPairs.associate { it.first.cacheKey to it.second }
+        val cacheVersions = cache.summaries()
+        _uiState.update { current ->
+            current.copy(
+                entries = current.entries + imageEntries,
+                states = current.states + imageEntries.keys.associateWith { VrState.READY },
+                videoEntries = current.videoEntries + videoEntries,
+                videoStates = current.videoStates + videoEntries.keys.associateWith { VideoVrState.READY },
+                managedCacheItems = managedItems,
+                cacheVersions = cacheVersions,
+                message = message ?: current.message,
+            )
+        }
     }
 
     private fun upsertJob(
@@ -1632,6 +1675,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         totalFrames: Int = 0,
         fps: Int = 30,
         avgFrameMs: Long = 0L,
+        currentFrameMs: Long = 0L,
         modelId: String = "",
         cacheVersion: String = "",
         modelThreads: Int = 0,
@@ -1650,6 +1694,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 currentFrame = currentFrame.takeIf { it > 0 } ?: previous?.currentFrame ?: 0,
                 totalFrames = totalFrames.takeIf { it > 0 } ?: previous?.totalFrames ?: 0,
                 fps = fps.takeIf { it > 0 } ?: previous?.fps ?: 30,
+                currentFrameMs = currentFrameMs.takeIf { it > 0L } ?: previous?.currentFrameMs ?: 0L,
                 avgFrameMs = avgFrameMs.takeIf { it > 0L } ?: previous?.avgFrameMs ?: 0L,
                 modelId = modelId.ifBlank { previous?.modelId.orEmpty() },
                 cacheVersion = cacheVersion.ifBlank { previous?.cacheVersion.orEmpty() },
@@ -2927,7 +2972,7 @@ private class VideoVrGenerator(
         params: VideoGenerationParams,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit = {},
-        onProgress: (Float, Int, Int, Int) -> Unit,
+        onProgress: (Float, Int, Int, Int, Long) -> Unit,
     ): VideoCacheEntry {
         val vrParams = params.toVrParams()
         val version = vrParams.cacheVersion()
@@ -3016,7 +3061,7 @@ private class VideoVrGenerator(
         params: VrGenerationParams,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
-        onProgress: (Float, Int, Int, Int) -> Unit,
+        onProgress: (Float, Int, Int, Int, Long) -> Unit,
         mark: (String) -> Unit,
     ) {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
@@ -3064,12 +3109,15 @@ private class VideoVrGenerator(
         }
 
         try {
-            fun cachedOrGenerateFrame(frame: Int): Bitmap? {
+            data class FrameResult(val bitmap: Bitmap, val generatedMs: Long)
+
+            fun cachedOrGenerateFrame(frame: Int): FrameResult? {
                 val frameCache = File(framesDir, "frame_${frame.toString().padStart(6, '0')}.jpg")
                 BitmapFactory.decodeFile(frameCache.absolutePath)?.let {
                     onRuntimeInfo("frame cache hit frame=$frame version=${params.cacheVersion()}")
-                    return it
+                    return FrameResult(it, 0L)
                 }
+                val started = System.currentTimeMillis()
                 val timeUs = frame * 1_000_000L / fps
                 val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                     ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
@@ -3077,19 +3125,20 @@ private class VideoVrGenerator(
                 val generated = frameGenerator.generateSbsBitmap(bitmap.copy(Bitmap.Config.ARGB_8888, false), params, onModelProgress, onRuntimeInfo)
                 FileOutputStream(frameCache).use { generated.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
                 bitmap.recycle()
-                return generated
+                return FrameResult(generated, System.currentTimeMillis() - started)
             }
 
             for (frame in 0 until totalFrames) {
-                val sbs = if (frame == 0) {
-                    firstSbs
+                val frameResult = if (frame == 0) {
+                    FrameResult(firstSbs, 0L)
                 } else {
                     cachedOrGenerateFrame(frame) ?: continue
                 }
+                val sbs = frameResult.bitmap
                 drawBitmapToSurface(surface, sbs, width, height)
                 if (frame != 0) sbs.recycle()
                 drain(end = false)
-                onProgress((frame + 1).toFloat() / totalFrames.toFloat(), frame + 1, totalFrames, fps)
+                onProgress((frame + 1).toFloat() / totalFrames.toFloat(), frame + 1, totalFrames, fps, frameResult.generatedMs)
             }
             drain(end = true)
             if (audio != null && audioTrack >= 0 && muxerStarted) {
@@ -3258,6 +3307,8 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
             AppScreen.Manage -> ManageScreen(
                 state = state,
                 onBack = viewModel::closeManage,
+                selectedTab = state.generatedTab,
+                onTabChange = viewModel::setGeneratedTab,
                 onDeleteVersion = viewModel::deleteCacheVersion,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
@@ -3304,6 +3355,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onOpenScoped = viewModel::openScopedPhoto,
                 onSettings = viewModel::openSettings,
                 onSetTab = viewModel::setHomeTab,
+                onSetGeneratedTab = viewModel::setGeneratedTab,
                 onOpenAlbum = viewModel::openAlbum,
                 onCloseAlbum = viewModel::closeAlbum,
                 onLoadMoreAll = viewModel::loadMoreAllMedia,
@@ -3361,6 +3413,7 @@ private fun GalleryScreen(
     onOpenScoped: (Int, Set<String>, Int, Int) -> Unit,
     onSettings: () -> Unit,
     onSetTab: (String) -> Unit,
+    onSetGeneratedTab: (String) -> Unit,
     onOpenAlbum: (String) -> Unit,
     onCloseAlbum: () -> Unit,
     onLoadMoreAll: () -> Unit,
@@ -3411,7 +3464,7 @@ private fun GalleryScreen(
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
             topBar = {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+                Column(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp, vertical = 12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selectedKeys.isEmpty()) {
                         val title = when {
@@ -3443,9 +3496,12 @@ private fun GalleryScreen(
                         }) { Text(lang.t("替换", "Replace")) }
                     }
                 }
-                Spacer(Modifier.height(10.dp))
-                val prefetch = if (state.settings.autoPrefetch) lang.t("自动：2 -> 4 -> 8", "Auto: 2 -> 4 -> 8") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
-                Text(lang.t("预加载：$prefetch", "Prefetch: $prefetch"), style = MaterialTheme.typography.bodySmall)
+                val showPrefetch = state.homeTab == "all" || (state.homeTab == "albums" && state.selectedAlbumId != null)
+                if (showPrefetch) {
+                    Spacer(Modifier.height(10.dp))
+                    val prefetch = if (state.settings.autoPrefetch) lang.t("自动：2 -> 4 -> 8", "Auto: 2 -> 4 -> 8") else lang.t("前后各 ${state.settings.prefetchWindow} 张", "${state.settings.prefetchWindow} each side")
+                    Text(lang.t("预加载：$prefetch", "Prefetch: $prefetch"), style = MaterialTheme.typography.bodySmall)
+                }
                 state.message?.let {
                     Spacer(Modifier.height(6.dp))
                     Text(lang.pickMixed(it), style = MaterialTheme.typography.bodySmall)
@@ -3463,6 +3519,8 @@ private fun GalleryScreen(
                         state = state,
                         embedded = true,
                         onBack = {},
+                        selectedTab = state.generatedTab,
+                        onTabChange = onSetGeneratedTab,
                         onDeleteVersion = onDeleteVersion,
                         onOpenGenerated = onOpenGenerated,
                         onOpenGeneratedVideo = onOpenGeneratedVideo,
@@ -3792,18 +3850,54 @@ private fun HomeBottomNav(current: String, lang: AppLanguage, onSelect: (String)
             "generated" to lang.t("生成", "Generated"),
         ).forEach { (key, label) ->
             val selected = key == current
-            Text(
-                text = label,
-                color = if (selected) androidx.compose.ui.graphics.Color.White else androidx.compose.ui.graphics.Color(0xff333333),
-                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+            Surface(
+                color = if (selected) androidx.compose.ui.graphics.Color(0xff6650a4) else androidx.compose.ui.graphics.Color.Transparent,
+                shape = RoundedCornerShape(28.dp),
                 modifier = Modifier
-                    .background(
-                        if (selected) androidx.compose.ui.graphics.Color(0xff6650a4) else androidx.compose.ui.graphics.Color.Transparent,
-                        RoundedCornerShape(28.dp),
-                    )
-                    .clickable { onSelect(key) }
-                    .padding(horizontal = 22.dp, vertical = 12.dp),
-            )
+                    .clip(RoundedCornerShape(28.dp))
+                    .clickable { onSelect(key) },
+            ) {
+                Text(
+                    text = label,
+                    color = if (selected) androidx.compose.ui.graphics.Color.White else androidx.compose.ui.graphics.Color(0xff333333),
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RoundedPillTabs(
+    options: List<Pair<String, String>>,
+    selected: String,
+    onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier
+            .background(androidx.compose.ui.graphics.Color.White, RoundedCornerShape(28.dp))
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        options.forEach { (key, label) ->
+            val active = key == selected
+            Surface(
+                color = if (active) androidx.compose.ui.graphics.Color(0xfff0eaff) else androidx.compose.ui.graphics.Color.Transparent,
+                shape = RoundedCornerShape(24.dp),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(24.dp))
+                    .clickable { onSelect(key) },
+            ) {
+                Text(
+                    text = label,
+                    color = if (active) androidx.compose.ui.graphics.Color(0xff3f2a78) else androidx.compose.ui.graphics.Color(0xff333333),
+                    fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp),
+                )
+            }
         }
     }
 }
@@ -3875,6 +3969,8 @@ private fun ManageScreen(
     state: UiState,
     embedded: Boolean = false,
     onBack: () -> Unit,
+    selectedTab: String,
+    onTabChange: (String) -> Unit,
     onDeleteVersion: (String) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
     onOpenGeneratedVideo: (Int) -> Unit,
@@ -3888,13 +3984,14 @@ private fun ManageScreen(
     onRegenerateImages: (List<Int>) -> Unit,
 ) {
     val lang = state.settings.language
-    var tab by remember { mutableStateOf("images") }
+    val tab = selectedTab
     var selectedImageKeys by remember { mutableStateOf(setOf<String>()) }
     var selectedVideoKeys by remember { mutableStateOf(setOf<String>()) }
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
+            .then(if (embedded) Modifier else Modifier.statusBarsPadding())
             .padding(if (embedded) 0.dp else 16.dp),
     ) {
         if (!embedded) {
@@ -3905,15 +4002,11 @@ private fun ManageScreen(
             }
             Spacer(Modifier.height(16.dp))
         }
-        SingleChoiceSegmentedButtonRow {
-            listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")).forEachIndexed { index, option ->
-                SegmentedButton(
-                    selected = tab == option.first,
-                    onClick = { tab = option.first },
-                    shape = SegmentedButtonDefaults.itemShape(index, 2),
-                ) { Text(option.second) }
-            }
-        }
+        RoundedPillTabs(
+            options = listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
+            selected = tab,
+            onSelect = onTabChange,
+        )
         Spacer(Modifier.height(8.dp))
         if (tab == "videos") {
             val videos = state.photos.filter { item ->
@@ -3971,9 +4064,11 @@ private fun ManageScreen(
                                 AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
                                 if (item.cacheKey in selectedVideoKeys) SelectionBadge()
                                 Text(
-                                    text = "${videoState.label(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}%",
+                                    text = "${videoState.label(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}%  当前${job?.currentFrameMs ?: 0}ms 平均${job?.avgFrameMs ?: 0}ms",
                                     color = androidx.compose.ui.graphics.Color.White,
                                     style = MaterialTheme.typography.labelSmall,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier.align(Alignment.BottomStart).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(5.dp),
                                 )
                             }
@@ -4407,7 +4502,7 @@ private fun ViewerScreen(
                     modifier = Modifier.fillMaxSize(),
                     active = page == pagerState.currentPage,
                     controlsVisible = controlsVisible,
-                    statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  平均帧${job?.avgFrameMs ?: 0}ms",
+                    statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  当前帧${job?.currentFrameMs ?: 0}ms  平均帧${job?.avgFrameMs ?: 0}ms",
                     onSingleTap = { controlsVisible = !controlsVisible },
                 )
             } else {
@@ -4544,6 +4639,7 @@ private fun DebugScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(androidx.compose.ui.graphics.Color(0xff111315))
+            .statusBarsPadding()
             .padding(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -4560,7 +4656,7 @@ private fun DebugScreen(
         }
         Spacer(Modifier.height(8.dp))
         Text(
-            text = "${photo?.displayName.orEmpty()}  ${lang.t("状态", "State")}: $vrState",
+            text = "${photo?.displayName.orEmpty()}  ${lang.t("状态", "State")}: ${if (isVideo) photo?.let { state.videoStates[it.cacheKey] } ?: VideoVrState.NORMAL else vrState}",
             color = androidx.compose.ui.graphics.Color.White,
             style = MaterialTheme.typography.bodyMedium,
             maxLines = 1,
@@ -4578,6 +4674,7 @@ private fun DebugScreen(
                     DebugLine("Frame", "${videoJob?.currentFrame ?: 0}/${videoJob?.totalFrames ?: 0}")
                     DebugLine("Progress", "${((videoJob?.progress ?: 0f) * 100f).roundToInt()}%")
                     DebugLine("FPS", "${videoJob?.fps ?: videoEntry?.fps ?: 30}")
+                    DebugLine("Current frame", "${videoJob?.currentFrameMs ?: 0}ms")
                     DebugLine("Avg frame", "${videoJob?.avgFrameMs ?: 0}ms")
                     DebugLine("Model", videoJob?.modelId?.ifBlank { state.settings.videoModelId } ?: state.settings.videoModelId)
                     DebugLine("Cache", videoJob?.cacheVersion?.ifBlank { "-" } ?: "-")
