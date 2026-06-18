@@ -325,6 +325,7 @@ private val AvailableModels = listOf(
 
 private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
+private const val ALBUM_PAGE_SIZE = 1200
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -405,6 +406,8 @@ data class UiState(
     val manageOpen: Boolean = false,
     val homeTab: String = "all",
     val selectedAlbumId: String? = null,
+    val albumOffsets: Map<String, Int> = emptyMap(),
+    val albumLoading: Boolean = false,
     val albums: List<AlbumItem> = emptyList(),
     val vrMode: Boolean = false,
     val settings: AppSettings = AppSettings(),
@@ -445,7 +448,7 @@ private data class MediaSnapshot(
 private sealed class TimelineCell {
     data class Header(val day: Long, val label: String) : TimelineCell()
     data class Media(val item: PhotoItem) : TimelineCell()
-    data class Footer(val loaded: Int, val total: Int) : TimelineCell()
+    data class Footer(val loaded: Int, val total: Int, val text: String? = null) : TimelineCell()
 }
 
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
@@ -642,10 +645,46 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun openAlbum(bucketId: String) {
         _uiState.update { it.copy(homeTab = "albums", selectedAlbumId = bucketId, manageOpen = false) }
+        loadAlbumPage(bucketId, reset = true)
     }
 
     fun closeAlbum() {
         _uiState.update { it.copy(selectedAlbumId = null) }
+    }
+
+    fun loadMoreSelectedAlbum() {
+        val state = _uiState.value
+        val bucketId = state.selectedAlbumId ?: return
+        if (state.albumLoading) return
+        val album = state.albums.firstOrNull { it.bucketId == bucketId }
+        val loaded = state.photos.count { !it.generatedVirtual && it.bucketId == bucketId }
+        if (album != null && loaded >= album.count) return
+        loadAlbumPage(bucketId, reset = false)
+    }
+
+    private fun loadAlbumPage(bucketId: String, reset: Boolean) {
+        viewModelScope.launch {
+            val current = _uiState.value
+            if (current.albumLoading && !reset) return@launch
+            val offset = if (reset) 0 else current.albumOffsets[bucketId] ?: current.photos.count { !it.generatedVirtual && it.bucketId == bucketId }
+            _uiState.update { it.copy(albumLoading = true) }
+            val page = withContext(Dispatchers.IO) { repository.loadAlbumMedia(bucketId, ALBUM_PAGE_SIZE, offset) }
+            _uiState.update { state ->
+                val virtualItems = state.photos.filter { it.generatedVirtual }
+                val otherSystemItems = if (reset) {
+                    state.photos.filter { !it.generatedVirtual && it.bucketId != bucketId }
+                } else {
+                    state.photos.filterNot { it.generatedVirtual }
+                }
+                val mergedSystem = (otherSystemItems + page).distinctBy { it.cacheKey }.sortedByDescending { it.modifiedTime }
+                state.copy(
+                    photos = mergedSystem + virtualItems,
+                    albumOffsets = state.albumOffsets + (bucketId to (offset + page.size)),
+                    albumLoading = false,
+                    message = state.settings.language.t("相册已加载 ${offset + page.size} 项", "Album loaded ${offset + page.size} items"),
+                )
+            }
+        }
     }
 
     fun openSettings() {
@@ -674,7 +713,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v1.24"
+                    val current = "v2.0"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1612,6 +1651,49 @@ private class PhotoRepository(private val context: Context) {
 
     fun loadAlbums(): List<AlbumItem> = buildAlbums(loadMedia(null))
 
+    fun loadAlbumMedia(bucketId: String, limit: Int, offset: Int): List<GalleryItem> {
+        val result = mutableListOf<GalleryItem>()
+        if (hasImagePermission(context)) {
+            result += queryMedia(
+                collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                idColumn = MediaStore.Images.Media._ID,
+                nameColumn = MediaStore.Images.Media.DISPLAY_NAME,
+                widthColumn = MediaStore.Images.Media.WIDTH,
+                heightColumn = MediaStore.Images.Media.HEIGHT,
+                sizeColumn = MediaStore.Images.Media.SIZE,
+                modifiedColumn = MediaStore.Images.Media.DATE_MODIFIED,
+                bucketIdColumn = MediaStore.Images.Media.BUCKET_ID,
+                bucketNameColumn = MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+                relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Images.Media.RELATIVE_PATH else null,
+                kind = MediaKind.IMAGE,
+                limit = limit,
+                offset = offset,
+                selection = "${MediaStore.Images.Media.BUCKET_ID}=?",
+                selectionArgs = arrayOf(bucketId),
+            )
+        }
+        if (hasVideoPermission(context)) {
+            result += queryMedia(
+                collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                idColumn = MediaStore.Video.Media._ID,
+                nameColumn = MediaStore.Video.Media.DISPLAY_NAME,
+                widthColumn = MediaStore.Video.Media.WIDTH,
+                heightColumn = MediaStore.Video.Media.HEIGHT,
+                sizeColumn = MediaStore.Video.Media.SIZE,
+                modifiedColumn = MediaStore.Video.Media.DATE_MODIFIED,
+                bucketIdColumn = MediaStore.Video.Media.BUCKET_ID,
+                bucketNameColumn = MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
+                relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Video.Media.RELATIVE_PATH else null,
+                kind = MediaKind.VIDEO,
+                limit = limit,
+                offset = offset,
+                selection = "${MediaStore.Video.Media.BUCKET_ID}=?",
+                selectionArgs = arrayOf(bucketId),
+            )
+        }
+        return result.sortedByDescending { it.modifiedTime }.take(limit)
+    }
+
     fun loadMedia(limit: Int? = null): List<GalleryItem> {
         val result = mutableListOf<PhotoItem>()
         val perKindLimit = limit?.coerceAtLeast(1)
@@ -1629,6 +1711,7 @@ private class PhotoRepository(private val context: Context) {
                 relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Images.Media.RELATIVE_PATH else null,
                 kind = MediaKind.IMAGE,
                 limit = perKindLimit,
+                offset = 0,
             )
         }
         if (hasVideoPermission(context)) {
@@ -1645,6 +1728,7 @@ private class PhotoRepository(private val context: Context) {
                 relativePathColumn = if (Build.VERSION.SDK_INT >= 29) MediaStore.Video.Media.RELATIVE_PATH else null,
                 kind = MediaKind.VIDEO,
                 limit = perKindLimit,
+                offset = 0,
             )
         }
         return result.sortedByDescending { it.modifiedTime }.let { sorted ->
@@ -1665,13 +1749,20 @@ private class PhotoRepository(private val context: Context) {
         relativePathColumn: String?,
         kind: MediaKind,
         limit: Int?,
+        offset: Int = 0,
+        selection: String? = null,
+        selectionArgs: Array<String>? = null,
     ): List<GalleryItem> {
         val projection = listOfNotNull(idColumn, nameColumn, widthColumn, heightColumn, sizeColumn, modifiedColumn, bucketIdColumn, bucketNameColumn, relativePathColumn).toTypedArray()
         val result = mutableListOf<GalleryItem>()
-        val limitedSortOrder = if (limit != null) "$modifiedColumn DESC LIMIT $limit" else "$modifiedColumn DESC"
+        val limitedSortOrder = if (limit != null) "$modifiedColumn DESC LIMIT $limit OFFSET $offset" else "$modifiedColumn DESC"
+        var manualOffset = false
         val cursorResult = runCatching {
-            context.contentResolver.query(collection, projection, null, null, limitedSortOrder)
-        }.getOrNull() ?: context.contentResolver.query(collection, projection, null, null, "$modifiedColumn DESC")
+            context.contentResolver.query(collection, projection, selection, selectionArgs, limitedSortOrder)
+        }.getOrNull() ?: run {
+            manualOffset = true
+            context.contentResolver.query(collection, projection, selection, selectionArgs, "$modifiedColumn DESC")
+        }
         cursorResult?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(idColumn)
             val nameCol = cursor.getColumnIndexOrThrow(nameColumn)
@@ -1682,7 +1773,12 @@ private class PhotoRepository(private val context: Context) {
             val bucketIdCol = cursor.getColumnIndex(bucketIdColumn)
             val bucketNameCol = cursor.getColumnIndex(bucketNameColumn)
             val relativePathCol = relativePathColumn?.let { cursor.getColumnIndex(it) } ?: -1
+            var skipped = 0
             while (cursor.moveToNext()) {
+                if (manualOffset && limit != null && skipped < offset) {
+                    skipped++
+                    continue
+                }
                 if (limit != null && result.size >= limit) break
                 val id = cursor.getLong(idCol)
                 val displayName = cursor.getString(nameCol) ?: "${kind.name.lowercase(Locale.US)}-$id"
@@ -2695,6 +2791,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSetTab = viewModel::setHomeTab,
                 onOpenAlbum = viewModel::openAlbum,
                 onCloseAlbum = viewModel::closeAlbum,
+                onLoadMoreAlbum = viewModel::loadMoreSelectedAlbum,
                 onSaveGenerated = { viewModel.saveGeneratedCopies(context, it) },
                 onReplaceOriginal = { indexes ->
                     if (Build.VERSION.SDK_INT >= 30) {
@@ -2750,6 +2847,7 @@ private fun GalleryScreen(
     onSetTab: (String) -> Unit,
     onOpenAlbum: (String) -> Unit,
     onCloseAlbum: () -> Unit,
+    onLoadMoreAlbum: () -> Unit,
     onSaveGenerated: (List<Int>) -> Unit,
     onReplaceOriginal: (List<Int>) -> Unit,
     onDeleteVersion: (String) -> Unit,
@@ -2902,8 +3000,24 @@ private fun GalleryScreen(
                     },
                     onItemLongClick = { photo ->
                         if (System.currentTimeMillis() - lastPinchAt > 700L) {
-                            selectedKeys = selectedKeys + photo.cacheKey
+                    selectedKeys = selectedKeys + photo.cacheKey
                         }
+                    },
+                    onNearEnd = {
+                        if (state.homeTab == "albums" && state.selectedAlbumId != null) {
+                            onLoadMoreAlbum()
+                        }
+                    },
+                    footerText = if (state.homeTab == "albums" && state.selectedAlbumId != null) {
+                        val total = state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.count ?: visibleItems.size
+                        val loaded = visibleItems.size
+                        when {
+                            state.albumLoading -> lang.t("正在加载更多...", "Loading more...")
+                            loaded < total -> lang.t("已加载 $loaded/$total，继续下滑加载更多", "Loaded $loaded/$total; scroll for more")
+                            else -> lang.t("已加载全部 $loaded 项", "Loaded all $loaded items")
+                        }
+                    } else {
+                        null
                     },
                     modifier = Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp),
                 )
@@ -2933,6 +3047,8 @@ private fun TimelineGrid(
     onPinch: (Float) -> Unit,
     onItemClick: (PhotoItem) -> Unit,
     onItemLongClick: (PhotoItem) -> Unit,
+    onNearEnd: () -> Unit,
+    footerText: String?,
     modifier: Modifier = Modifier,
 ) {
     var renderLimit by remember(items) { mutableStateOf(min(1200, items.size)) }
@@ -2941,6 +3057,9 @@ private fun TimelineGrid(
             .collect { lastVisible ->
                 if (lastVisible > renderLimit - 80 && renderLimit < items.size) {
                     renderLimit = min(items.size, renderLimit + 1200)
+                }
+                if (lastVisible > renderLimit - 80) {
+                    onNearEnd()
                 }
             }
     }
@@ -2957,8 +3076,8 @@ private fun TimelineGrid(
             }
             result += TimelineCell.Media(item)
         }
-        if (renderLimit < items.size) {
-            result += TimelineCell.Footer(renderLimit, items.size)
+        if (footerText != null || renderLimit < items.size) {
+            result += TimelineCell.Footer(renderLimit, items.size, footerText)
         }
         result
     }
@@ -2993,7 +3112,7 @@ private fun TimelineGrid(
                 when (cell) {
                     is TimelineCell.Header -> "header_${cell.day}"
                     is TimelineCell.Media -> cell.item.cacheKey
-                    is TimelineCell.Footer -> "footer_${cell.loaded}_${cell.total}"
+                is TimelineCell.Footer -> "footer_${cell.loaded}_${cell.total}_${cell.text.orEmpty()}"
                 }
             },
             span = { cell -> if (cell is TimelineCell.Media) GridItemSpan(1) else GridItemSpan(maxLineSpan) },
@@ -3018,7 +3137,7 @@ private fun TimelineGrid(
                     )
                 }
                 is TimelineCell.Footer -> Text(
-                    text = lang.t("已显示 ${cell.loaded}/${cell.total}，继续下滑自动加载更多", "Showing ${cell.loaded}/${cell.total}; keep scrolling to load more"),
+                    text = cell.text ?: lang.t("已显示 ${cell.loaded}/${cell.total}，继续下滑自动加载更多", "Showing ${cell.loaded}/${cell.total}; keep scrolling to load more"),
                     style = MaterialTheme.typography.bodySmall,
                     color = androidx.compose.ui.graphics.Color(0xff777777),
                     modifier = Modifier.fillMaxWidth().padding(14.dp),
