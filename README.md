@@ -4,6 +4,12 @@
 
 An Android gallery app for local parallel-eye SBS VR generation. It browses system photos/videos and keeps generated VR results in the app cache.
 
+## v2.15 更新
+
+- 刷新媒体库时保留生成中、排队、暂停、失败的视频任务，不再把生成中的视频从生成页刷没。
+- 相册主页字体缩小改为 6/7/8 列分别减 2/4/6 级。
+- 普通图库缩略图角标（原图、未生成、生成中等）在 6/7/8 列时也按 2/4/6 级缩小。
+
 ## v2.14 更新
 
 - 双指改变列数的触发距离翻倍，减少轻微手势就跳列的情况。

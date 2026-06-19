@@ -129,6 +129,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -597,17 +598,25 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
             _uiState.update {
+                val readyVideoStates = snapshot.videoEntries.keys.associateWith { VideoVrState.READY }
+                val activeVideoStates = it.videoStates.filterValues { state -> state != VideoVrState.NORMAL } - readyVideoStates.keys
+                val snapshotKeys = snapshot.photos.map { item -> item.cacheKey }.toSet()
+                val activeVideoItems = it.videoJobs
+                    .filter { job -> job.state != VideoVrState.READY || job.item.cacheKey !in snapshot.videoEntries }
+                    .map { job -> if (job.item.cacheKey in snapshotKeys) job.item else job.item.copy(generatedVirtual = true) }
+                val mergedPhotos = (snapshot.photos + activeVideoItems)
+                    .distinctBy { item -> item.cacheKey }
                 it.copy(
-                    photos = snapshot.photos,
+                    photos = mergedPhotos,
                     albums = snapshot.albums,
                     entries = snapshot.entries,
                     states = snapshot.entries.keys.associateWith { VrState.READY },
-                    videoStates = snapshot.videoEntries.keys.associateWith { VideoVrState.READY },
+                    videoStates = activeVideoStates + readyVideoStates,
                     videoEntries = snapshot.videoEntries,
-                    allOffset = snapshot.photos.count { !it.generatedVirtual },
-                    allExhausted = snapshot.photos.count { !it.generatedVirtual } < INITIAL_MEDIA_LIMIT,
+                    allOffset = mergedPhotos.count { !it.generatedVirtual },
+                    allExhausted = mergedPhotos.count { !it.generatedVirtual } < INITIAL_MEDIA_LIMIT,
                     loading = false,
-                    message = "已加载最近 ${snapshot.photos.count { !it.generatedVirtual }} 项媒体，生成库 ${snapshot.managedItems.size + snapshot.videoEntries.size} 项 / Loaded recent media and generated cache",
+                    message = "已加载最近 ${mergedPhotos.count { !it.generatedVirtual }} 项媒体，生成库 ${snapshot.managedItems.size + snapshot.videoEntries.size} 项 / Loaded recent media and generated cache",
                     cacheVersions = snapshot.cacheVersions,
                     managedCacheItems = snapshot.managedItems,
                     modelStatus = modelStatusText(it.settings),
@@ -852,7 +861,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.14"
+                    val current = "v2.15"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3973,18 +3982,9 @@ private fun GridToTopButton(
 
 @Composable
 private fun AlbumTile(album: AlbumItem, lang: AppLanguage, columns: Int, onClick: () -> Unit) {
-    val titleStyle = when {
-        columns >= 8 -> MaterialTheme.typography.bodySmall
-        columns == 7 -> MaterialTheme.typography.bodyMedium
-        columns == 6 -> MaterialTheme.typography.titleSmall
-        else -> MaterialTheme.typography.titleMedium
-    }
-    val countStyle = when {
-        columns >= 8 -> MaterialTheme.typography.labelSmall
-        columns == 7 -> MaterialTheme.typography.labelMedium
-        columns == 6 -> MaterialTheme.typography.labelLarge
-        else -> MaterialTheme.typography.bodySmall
-    }
+    val reduction = columnFontReduction(columns)
+    val titleSize = (16 - reduction).coerceAtLeast(9).sp
+    val countSize = (12 - reduction).coerceAtLeast(8).sp
     val textGap = if (columns >= 7) 4.dp else 8.dp
     Column(Modifier.fillMaxWidth().clickable(onClick = onClick)) {
         Box(
@@ -3996,8 +3996,8 @@ private fun AlbumTile(album: AlbumItem, lang: AppLanguage, columns: Int, onClick
             AsyncMediaThumbnail(album.coverKind, album.coverUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
         }
         Spacer(Modifier.height(textGap))
-        Text(album.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, style = titleStyle)
-        Text(lang.t("${album.count} 项", "${album.count} items"), color = androidx.compose.ui.graphics.Color(0xff777777), style = countStyle, maxLines = 1)
+        Text(album.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = titleSize)
+        Text(lang.t("${album.count} 项", "${album.count} items"), color = androidx.compose.ui.graphics.Color(0xff777777), fontSize = countSize, maxLines = 1)
     }
 }
 
@@ -4159,6 +4159,8 @@ private fun Modifier.discreteColumnPinch(
     }
 }
 
+private fun columnFontReduction(columns: Int): Int = ((columns - 5).coerceAtLeast(0) * 2).coerceAtMost(6)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PhotoTile(
@@ -4172,7 +4174,8 @@ private fun PhotoTile(
     onLongClick: () -> Unit,
 ) {
     val compact = columns >= 7
-    val labelStyle = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall
+    val labelSize = (14 - columnFontReduction(columns)).coerceAtLeast(8).sp
+    val playSize = (20 - columnFontReduction(columns)).coerceAtLeast(10).sp
     val labelPaddingH = if (compact) 3.dp else 5.dp
     val labelPaddingV = if (compact) 1.dp else 2.dp
     Box(
@@ -4190,7 +4193,7 @@ private fun PhotoTile(
             Text(
                 text = "▶",
                 color = androidx.compose.ui.graphics.Color.White,
-                style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.titleMedium,
+                fontSize = playSize,
                 modifier = Modifier
                     .align(Alignment.Center)
                     .background(androidx.compose.ui.graphics.Color(0x99000000), RoundedCornerShape(3.dp))
@@ -4209,7 +4212,7 @@ private fun PhotoTile(
         Text(
             text = statusText,
             color = androidx.compose.ui.graphics.Color.White,
-            style = labelStyle,
+            fontSize = labelSize,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier
