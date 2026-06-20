@@ -4,6 +4,12 @@
 
 An Android gallery app for local parallel-eye SBS VR generation. It browses system photos/videos and keeps generated VR results in the app cache.
 
+## v2.16 更新
+
+- 图片生成增加性能诊断计时：解码、模型推理、深度后处理、SBS 合成、写文件、总耗时。
+- 图片调试页新增“性能诊断”区域，READY 缓存可直接查看各阶段耗时。
+- 新生成图片会把计时写入 `params.json` 的 `timings` 字段；旧缓存没有该字段时显示为空。
+
 ## v2.15 更新
 
 - 刷新媒体库时保留生成中、排队、暂停、失败的视频任务，不再把生成中的视频从生成页刷没。

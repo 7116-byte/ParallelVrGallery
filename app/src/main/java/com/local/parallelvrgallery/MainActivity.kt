@@ -413,6 +413,15 @@ data class VideoVrJob(
     val error: String? = null,
 )
 
+data class GenerationTimings(
+    val decodeMs: Long = 0L,
+    val modelMs: Long = 0L,
+    val depthPostMs: Long = 0L,
+    val sbsMs: Long = 0L,
+    val writeMs: Long = 0L,
+    val totalMs: Long = 0L,
+)
+
 data class LastGenerationInfo(
     val relativeIndex: Int,
     val elapsedMs: Long,
@@ -861,7 +870,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.15"
+                    val current = "v2.16"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1906,6 +1915,14 @@ private fun jsonIntValue(text: String, key: String): Int? {
         ?.toIntOrNull()
 }
 
+private fun jsonLongValue(text: String, key: String): Long? {
+    return Regex("\"${Regex.escape(key)}\"\\s*:\\s*(\\d+)")
+        .find(text)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toLongOrNull()
+}
+
 private fun imageRecentGenerationLines(state: UiState, lang: AppLanguage): List<String> {
     return state.recentGenerations.take(3).map {
         val side = when {
@@ -2758,8 +2775,10 @@ private class VrGenerator(
         if (decodeMaxLongEdge < params.maxLongEdge) {
             mark("memory capped maxLongEdge ${params.maxLongEdge} -> $decodeMaxLongEdge")
         }
+        val decodeStart = System.currentTimeMillis()
         var original = decodeScaledBitmap(context, photo.uri, decodeMaxLongEdge)
-        mark("decoded ${original.width}x${original.height}")
+        val decodeMs = System.currentTimeMillis() - decodeStart
+        mark("decode ${decodeMs}ms size=${original.width}x${original.height}")
         if (max(photo.width, photo.height) > decodeMaxLongEdge) {
             mark("downsampled source because original long edge exceeded $decodeMaxLongEdge")
         }
@@ -2769,14 +2788,17 @@ private class VrGenerator(
         val rawDepth = runDepthModel(original, modelFile, params.modelThreads, params.useGpu) { runtime ->
             mark(runtime)
         }
+        val modelMs = System.currentTimeMillis() - depthStart
+        mark("model inference ${modelMs}ms")
+        val depthPostStart = System.currentTimeMillis()
         val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
-        mark("depth model ${System.currentTimeMillis() - depthStart}ms")
         onProgress(0.55f)
 
         val depthBitmap = depthToBitmap(depthSmall)
         val depthPath = File(dir, "depth.png")
         FileOutputStream(depthPath).use { depthBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
-        mark("depth saved ${depthBitmap.width}x${depthBitmap.height}")
+        val depthPostMs = System.currentTimeMillis() - depthPostStart
+        mark("depth post ${depthPostMs}ms output=${depthBitmap.width}x${depthBitmap.height}")
         onProgress(0.7f)
 
         val sbsStart = System.currentTimeMillis()
@@ -2797,7 +2819,9 @@ private class VrGenerator(
             original = reduced
             makeParallelSbs(original, depthSmall, params.depthScale, params.fillRadius)
         }
-        mark("sbs ${System.currentTimeMillis() - sbsStart}ms output=${vr.width}x${vr.height}")
+        val sbsMs = System.currentTimeMillis() - sbsStart
+        mark("sbs ${sbsMs}ms output=${vr.width}x${vr.height}")
+        val writeStart = System.currentTimeMillis()
         val vrPath = File(dir, "vr_sbs.jpg")
         FileOutputStream(vrPath).use { vr.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
         onProgress(0.9f)
@@ -2805,9 +2829,22 @@ private class VrGenerator(
         val outputHeight = vr.height
 
         val paramsPath = File(dir, "params.json")
-        paramsPath.writeText(params.toJson(photo, original, vr), Charsets.UTF_8)
         val logPath = File(dir, "job.log")
-        mark("done total=${System.currentTimeMillis() - start}ms")
+        val totalBeforeFinalLog = System.currentTimeMillis() - start
+        val timings = GenerationTimings(
+            decodeMs = decodeMs,
+            modelMs = modelMs,
+            depthPostMs = depthPostMs,
+            sbsMs = sbsMs,
+            writeMs = 0L,
+            totalMs = totalBeforeFinalLog,
+        )
+        paramsPath.writeText(params.toJson(photo, original, vr, timings), Charsets.UTF_8)
+        val writeMs = System.currentTimeMillis() - writeStart
+        val finalTimings = timings.copy(writeMs = writeMs, totalMs = System.currentTimeMillis() - start)
+        paramsPath.writeText(params.toJson(photo, original, vr, finalTimings), Charsets.UTF_8)
+        mark("write ${writeMs}ms")
+        mark("done total=${finalTimings.totalMs}ms")
         logPath.writeText(log.toString(), Charsets.UTF_8)
         depthBitmap.recycle()
         original.recycle()
@@ -4929,6 +4966,7 @@ private fun DebugScreen(
     val videoJob = photo?.let { p -> state.videoJobs.firstOrNull { it.item.cacheKey == p.cacheKey } }
     val imageLogLines = remember(entry?.logPath, entry?.createdAt) { entry?.logPath?.let { readLastLines(File(it), 16) } ?: emptyList() }
     val imageParamsLines = remember(entry?.paramsPath, entry?.createdAt) { entry?.paramsPath?.let { readLastLines(File(it), 16) } ?: emptyList() }
+    val imageTimings = remember(entry?.paramsPath, entry?.createdAt) { entry?.paramsPath?.let { readImageTimings(File(it)) } }
     val videoLogLines = remember(videoEntry?.logPath, videoEntry?.createdAt) { videoEntry?.logPath?.let { readLastLines(File(it), 18) } ?: emptyList() }
 
     Column(
@@ -4996,6 +5034,14 @@ private fun DebugScreen(
                     DebugLine("GPU requested", "${state.settings.useGpu}")
                     DebugLine("Error", job?.error ?: "-")
                 }
+                DebugSection(lang.t("性能诊断", "Performance")) {
+                    DebugLine(lang.t("解码", "Decode"), imageTimings?.decodeMs?.let { "${it}ms" } ?: "-")
+                    DebugLine(lang.t("模型推理", "Model"), imageTimings?.modelMs?.let { "${it}ms" } ?: "-")
+                    DebugLine(lang.t("深度后处理", "Depth post"), imageTimings?.depthPostMs?.let { "${it}ms" } ?: "-")
+                    DebugLine(lang.t("SBS 合成", "SBS"), imageTimings?.sbsMs?.let { "${it}ms" } ?: "-")
+                    DebugLine(lang.t("写文件", "Write"), imageTimings?.writeMs?.let { "${it}ms" } ?: "-")
+                    DebugLine(lang.t("总耗时", "Total"), imageTimings?.totalMs?.let { "${it}ms" } ?: "-")
+                }
                 Row(Modifier.fillMaxWidth().height(260.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     DebugImagePanel(lang.t("原图", "Source"), photo?.uri, Modifier.weight(1f), lang)
                     DebugImagePanel(lang.t("深度图", "Depth"), entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f), lang)
@@ -5062,6 +5108,22 @@ private fun readLastLines(file: File, count: Int): List<String> {
     return runCatching {
         if (!file.exists()) emptyList() else file.readLines(Charsets.UTF_8).takeLast(count)
     }.getOrDefault(emptyList())
+}
+
+private fun readImageTimings(file: File): GenerationTimings? {
+    return runCatching {
+        if (!file.exists()) return@runCatching null
+        val text = file.readText(Charsets.UTF_8)
+        val decode = jsonLongValue(text, "decodeMs") ?: return@runCatching null
+        GenerationTimings(
+            decodeMs = decode,
+            modelMs = jsonLongValue(text, "modelMs") ?: 0L,
+            depthPostMs = jsonLongValue(text, "depthPostMs") ?: 0L,
+            sbsMs = jsonLongValue(text, "sbsMs") ?: 0L,
+            writeMs = jsonLongValue(text, "writeMs") ?: 0L,
+            totalMs = jsonLongValue(text, "totalMs") ?: 0L,
+        )
+    }.getOrNull()
 }
 
 @Composable
@@ -5637,7 +5699,7 @@ private fun loadModelFile(file: File): ByteBuffer {
     }
 }
 
-private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: Bitmap): String {
+private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: Bitmap, timings: GenerationTimings): String {
     return """
         {
           "photoKey": "${photo.cacheKey}",
@@ -5658,6 +5720,14 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: 
           "useGpu": $useGpu,
           "inpaintMode": "$inpaintMode",
           "quality": $quality,
+          "timings": {
+            "decodeMs": ${timings.decodeMs},
+            "modelMs": ${timings.modelMs},
+            "depthPostMs": ${timings.depthPostMs},
+            "sbsMs": ${timings.sbsMs},
+            "writeMs": ${timings.writeMs},
+            "totalMs": ${timings.totalMs}
+          },
           "modelSha256": "B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F",
           "modelSource": "https://github.com/7116-byte/ParallelVrGallery/releases/download/model-assets-v1/depth_anything_v2.tflite"
         }
