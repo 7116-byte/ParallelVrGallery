@@ -553,6 +553,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val pausedVideos = mutableSetOf<String>()
     private val pausedVideoParams = mutableMapOf<String, VideoGenerationParams>()
     private val activeVideoParams = mutableMapOf<String, VideoGenerationParams>()
+    private val videoRunTokens = mutableMapOf<String, Long>()
     private var sequence = 0L
     private var videoSequence = 0L
     private var restoredQueueTags = false
@@ -876,7 +877,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.18"
+                    val current = "v2.19"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1070,6 +1071,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val items = indexes.distinct().mapNotNull { _uiState.value.photos.getOrNull(it) }.filter { it.kind == MediaKind.VIDEO }
         viewModelScope.launch(Dispatchers.IO) {
             items.forEach {
+                nextVideoRunToken(it.cacheKey)
+                synchronized(videoPending) { videoPending.removeAll { job -> job.item.cacheKey == it.cacheKey } }
                 videoCache.delete(it)
                 videoQueueTags.remove(it.cacheKey)
             }
@@ -1131,6 +1134,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch(Dispatchers.IO) {
             val videos = unique.mapNotNull { _uiState.value.photos.getOrNull(it) }.filter { it.kind == MediaKind.VIDEO }
             videos.forEach {
+                nextVideoRunToken(it.cacheKey)
+                synchronized(videoPending) { videoPending.removeAll { job -> job.item.cacheKey == it.cacheKey } }
                 videoCache.delete(it)
                 videoQueueTags.remove(it.cacheKey)
                 synchronized(pausedVideoParams) {
@@ -1377,7 +1382,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val restoredStates = mutableMapOf<String, VideoVrState>()
         val restoredJobs = mutableListOf<VideoVrJob>()
         videoQueueTags.load().forEach { tag ->
-            val item = videoByKey[tag.videoKey] ?: return@forEach
+            val item = videoByKey[tag.videoKey] ?: queuedVideoItemFromKey(tag.videoKey)
             val entry = videoCache.findEntry(item)
             if (entry != null) {
                 videoQueueTags.remove(tag.videoKey)
@@ -1412,7 +1417,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
         if (restoredStates.isNotEmpty()) {
             _uiState.update {
+                val restoredItems = restoredJobs.map { job -> job.item }
                 it.copy(
+                    photos = (it.photos + restoredItems).distinctBy { item -> item.cacheKey },
                     videoStates = it.videoStates + restoredStates,
                     videoJobs = (restoredJobs + it.videoJobs).distinctBy { job -> job.item.cacheKey }.take(100),
                     message = it.settings.language.t("已恢复 ${restoredStates.size} 条视频生成标签", "Restored ${restoredStates.size} video generation tags"),
@@ -1452,7 +1459,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (!force && (existing == VideoVrState.QUEUED || existing == VideoVrState.GENERATING)) return
         synchronized(videoPending) {
             videoPending.removeAll { it.item.cacheKey == item.cacheKey }
-            videoPending.add(VideoQueuedJob(item, params, videoSequence++))
+            val runToken = nextVideoRunToken(item.cacheKey)
+            videoPending.add(VideoQueuedJob(item, params, videoSequence++, runToken))
         }
         upsertVideoJob(item, VideoVrState.QUEUED, 0f)
         videoQueueTags.upsert(item.cacheKey, VideoVrState.QUEUED, params)
@@ -1467,6 +1475,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             videoPending.removeAll { it.item.cacheKey == item.cacheKey }
         }
         synchronized(pausedVideos) { pausedVideos.add(item.cacheKey) }
+        nextVideoRunToken(item.cacheKey)
         val paramsSnapshot = synchronized(pausedVideoParams) {
             activeVideoParams[item.cacheKey]?.let { pausedVideoParams[item.cacheKey] = it }
             pausedVideoParams[item.cacheKey]
@@ -1496,6 +1505,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun processVideoJob(next: VideoQueuedJob) {
+        if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) {
+            addLog("video stale queued job ignored ${next.item.displayName}")
+            return
+        }
         synchronized(pausedVideoParams) { activeVideoParams[next.item.cacheKey] = next.params }
         val vrParams = next.params.toVrParams()
         val videoCacheVersion = next.params.cacheVersion()
@@ -1529,6 +1542,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = runtime)
                     },
                 ) { progress, frame, total, fps, currentFrameMs ->
+                    if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) {
+                        throw VideoStaleException()
+                    }
                     if (synchronized(pausedVideos) { pausedVideos.contains(next.item.cacheKey) }) {
                         throw VideoPausedException()
                     }
@@ -1543,6 +1559,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
         } finally {
             videoKeepAlive.release()
+        }
+        if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) {
+            addLog("video stale result ignored ${next.item.displayName}")
+            return
         }
         result.onSuccess { entry ->
             val elapsed = SystemClock.uptimeMillis() - started
@@ -1565,7 +1585,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             videoNotifier.show(next.item, 1, 1, indeterminate = false, status = "已完成")
             addLog("video ready ${next.item.displayName} ${entry.width}x${entry.height} ${elapsed}ms")
         }.onFailure { error ->
-            if (error is VideoPausedException) {
+            if (error is VideoStaleException) {
+                addLog("video stale failure ignored ${next.item.displayName}")
+            } else if (error is VideoPausedException) {
                 _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.PAUSED), modelProgress = null) }
                 videoQueueTags.upsert(next.item.cacheKey, VideoVrState.PAUSED, next.params)
                 synchronized(pausedVideoParams) {
@@ -1769,8 +1791,21 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 finishedAt = finishedAt,
                 error = error,
             )
-            current.copy(videoJobs = (listOf(job) + existing).take(100))
+            current.copy(
+                videoStates = current.videoStates + (item.cacheKey to state),
+                videoJobs = (listOf(job) + existing).take(100),
+            )
         }
+    }
+
+    private fun nextVideoRunToken(videoKey: String): Long = synchronized(videoRunTokens) {
+        val next = (videoRunTokens[videoKey] ?: 0L) + 1L
+        videoRunTokens[videoKey] = next
+        next
+    }
+
+    private fun isCurrentVideoRun(videoKey: String, token: Long): Boolean = synchronized(videoRunTokens) {
+        videoRunTokens[videoKey] == token
     }
 
     private fun addLog(line: String) {
@@ -1789,9 +1824,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
 private data class QueuedJob(val photo: PhotoItem, val priority: Int, val sequence: Long, val source: QueueSource, val albumId: String?)
 
-private data class VideoQueuedJob(val item: GalleryItem, val params: VideoGenerationParams, val sequence: Long)
+private data class VideoQueuedJob(val item: GalleryItem, val params: VideoGenerationParams, val sequence: Long, val runToken: Long)
 
 private class VideoPausedException : RuntimeException("Video generation paused")
+private class VideoStaleException : RuntimeException("Video generation superseded")
 
 private fun AppLanguage.t(zh: String, en: String): String = if (this == AppLanguage.ZH) zh else en
 
@@ -1800,6 +1836,27 @@ private fun AppLanguage.pickMixed(text: String): String {
     if (!text.contains(marker)) return text
     val parts = text.split(marker, limit = 2)
     return if (this == AppLanguage.ZH) parts.first() else parts.getOrElse(1) { parts.first() }
+}
+
+private fun queuedVideoItemFromKey(videoKey: String): GalleryItem {
+    val rawKey = videoKey.removePrefix("VIDEO_")
+    val parts = rawKey.split("_")
+    val mediaId = parts.getOrNull(0)?.toLongOrNull()
+    val size = parts.getOrNull(1)?.toLongOrNull() ?: 0L
+    val modified = parts.getOrNull(2)?.toLongOrNull() ?: 0L
+    val id = mediaId ?: abs(videoKey.hashCode()).toLong()
+    return GalleryItem(
+        id = id,
+        uri = mediaId?.let { ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, it) } ?: Uri.EMPTY,
+        displayName = mediaId?.let { "restored_video_$it.mp4" } ?: "restored_${videoKey.take(12)}.mp4",
+        width = 0,
+        height = 0,
+        size = size,
+        modifiedTime = modified,
+        kind = MediaKind.VIDEO,
+        forcedCacheKey = videoKey,
+        generatedVirtual = true,
+    )
 }
 
 private fun VrState.label(lang: AppLanguage): String = when (this) {
