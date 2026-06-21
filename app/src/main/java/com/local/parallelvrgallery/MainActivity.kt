@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Activity
 import android.app.Application
+import android.app.Service
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
@@ -34,6 +35,9 @@ import android.opengl.GLES20
 import android.opengl.GLUtils
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Size
 import android.view.MotionEvent
@@ -534,6 +538,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val cache = VrCacheManager(app)
     private val videoCache = VideoVrCacheManager(app)
     private val videoNotifier = VideoGenerationNotifier(app)
+    private val videoKeepAlive = VideoGenerationKeepAlive(app)
     private val modelManager = ModelManager(app)
     private val generator = VrGenerator(app, cache, modelManager)
     private val videoGenerator = VideoVrGenerator(app, videoCache, generator)
@@ -870,7 +875,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.16"
+                    val current = "v2.17"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1498,43 +1503,48 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         videoQueueTags.upsert(next.item.cacheKey, VideoVrState.GENERATING, next.params)
         upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
         videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
-        val started = System.currentTimeMillis()
+        val started = SystemClock.uptimeMillis()
         var totalFrameTimeMs = 0L
         var measuredFrameCount = 0
-        val result = runCatching {
-            videoGenerator.generate(
-                next.item,
-                next.params,
-                onModelProgress = { progress ->
-                    _uiState.update {
-                        it.copy(
-                            modelProgress = progress,
-                            modelStatus = if (progress < 1f) "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%" else "模型已就绪 / Model ready",
-                        )
+        videoKeepAlive.acquire()
+        val result = try {
+            runCatching {
+                videoGenerator.generate(
+                    next.item,
+                    next.params,
+                    onModelProgress = { progress ->
+                        _uiState.update {
+                            it.copy(
+                                modelProgress = progress,
+                                modelStatus = if (progress < 1f) "正在下载模型 / Downloading model ${(progress * 100f).roundToInt()}%" else "模型已就绪 / Model ready",
+                            )
+                        }
+                    },
+                    onRuntimeInfo = { runtime ->
+                        if (runtime != lastRuntimeInfo && runtime.startsWith("tflite")) {
+                            addLog("video runtime ${next.item.displayName}: $runtime")
+                        }
+                        lastRuntimeInfo = runtime
+                        upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = runtime)
+                    },
+                ) { progress, frame, total, fps, currentFrameMs ->
+                    if (synchronized(pausedVideos) { pausedVideos.contains(next.item.cacheKey) }) {
+                        throw VideoPausedException()
                     }
-                },
-                onRuntimeInfo = { runtime ->
-                    if (runtime != lastRuntimeInfo && runtime.startsWith("tflite")) {
-                        addLog("video runtime ${next.item.displayName}: $runtime")
+                    if (currentFrameMs > 0L) {
+                        totalFrameTimeMs += currentFrameMs
+                        measuredFrameCount++
                     }
-                    lastRuntimeInfo = runtime
-                    upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = runtime)
-                },
-            ) { progress, frame, total, fps, currentFrameMs ->
-                if (synchronized(pausedVideos) { pausedVideos.contains(next.item.cacheKey) }) {
-                    throw VideoPausedException()
+                    val avgFrameMs = if (measuredFrameCount > 0) totalFrameTimeMs / measuredFrameCount else 0L
+                    upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, currentFrameMs = currentFrameMs, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
+                    videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
                 }
-                if (currentFrameMs > 0L) {
-                    totalFrameTimeMs += currentFrameMs
-                    measuredFrameCount++
-                }
-                val avgFrameMs = if (measuredFrameCount > 0) totalFrameTimeMs / measuredFrameCount else 0L
-                upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, currentFrameMs = currentFrameMs, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
-                videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
             }
+        } finally {
+            videoKeepAlive.release()
         }
         result.onSuccess { entry ->
-            val elapsed = System.currentTimeMillis() - started
+            val elapsed = SystemClock.uptimeMillis() - started
             _uiState.update {
                 it.copy(
                     videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.READY),
@@ -2624,6 +2634,85 @@ private class VideoVrCacheManager(private val context: Context) {
     }
 }
 
+class VideoGenerationForegroundService : Service() {
+    override fun onCreate() {
+        super.onCreate()
+        ensureChannel()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        startForeground(
+            SERVICE_NOTIFICATION_ID,
+            NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_upload)
+                .setContentTitle("视频 VR 生成运行中")
+                .setContentText("切到后台或锁屏时继续生成")
+                .setOnlyAlertOnce(true)
+                .setOngoing(true)
+                .setProgress(100, 0, true)
+                .build(),
+        )
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun ensureChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "视频 VR 后台生成", NotificationManager.IMPORTANCE_LOW))
+        }
+    }
+
+    companion object {
+        const val ACTION_START = "com.local.parallelvrgallery.video.START"
+        const val ACTION_STOP = "com.local.parallelvrgallery.video.STOP"
+        private const val CHANNEL_ID = "video_vr_foreground"
+        private const val SERVICE_NOTIFICATION_ID = 9117
+    }
+}
+
+private class VideoGenerationKeepAlive(context: Context) {
+    private val appContext = context.applicationContext
+    private val wakeLock = (appContext.getSystemService(Context.POWER_SERVICE) as PowerManager)
+        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ParallelVrGallery:VideoGeneration")
+        .apply { setReferenceCounted(false) }
+    private var activeCount = 0
+
+    @Synchronized
+    fun acquire() {
+        activeCount++
+        if (activeCount == 1) {
+            val intent = Intent(appContext, VideoGenerationForegroundService::class.java)
+                .setAction(VideoGenerationForegroundService.ACTION_START)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    ContextCompat.startForegroundService(appContext, intent)
+                } else {
+                    appContext.startService(intent)
+                }
+            }
+            runCatching {
+                if (!wakeLock.isHeld) wakeLock.acquire(12 * 60 * 60 * 1000L)
+            }
+        }
+    }
+
+    @Synchronized
+    fun release() {
+        if (activeCount > 0) activeCount--
+        if (activeCount == 0) {
+            runCatching { if (wakeLock.isHeld) wakeLock.release() }
+            runCatching { appContext.stopService(Intent(appContext, VideoGenerationForegroundService::class.java)) }
+        }
+    }
+}
+
 private class VideoGenerationNotifier(private val context: Context) {
     private val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
@@ -3204,7 +3293,7 @@ private class VideoVrGenerator(
                     onRuntimeInfo("frame cache hit frame=$frame version=$version")
                     return FrameResult(it, 0L)
                 }
-                val started = System.currentTimeMillis()
+                val started = SystemClock.uptimeMillis()
                 val timeUs = frame * 1_000_000L / fps
                 val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                     ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
@@ -3212,7 +3301,7 @@ private class VideoVrGenerator(
                 val generated = frameGenerator.generateSbsBitmap(bitmap.copy(Bitmap.Config.ARGB_8888, false), params, onModelProgress, onRuntimeInfo)
                 FileOutputStream(frameCache).use { generated.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
                 bitmap.recycle()
-                return FrameResult(generated, System.currentTimeMillis() - started)
+                return FrameResult(generated, SystemClock.uptimeMillis() - started)
             }
 
             for (frame in 0 until totalFrames) {
@@ -4378,14 +4467,6 @@ private fun ManageScreen(
                                         modifier = Modifier.align(Alignment.BottomStart).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(5.dp),
                                     )
                                 }
-                                Row(Modifier.fillMaxWidth().padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    OutlinedButton(onClick = { onSaveVideo(index) }, enabled = videoState == VideoVrState.READY && index >= 0, modifier = Modifier.weight(1f)) {
-                                        Text(lang.t("保存", "Save"), style = MaterialTheme.typography.labelSmall)
-                                    }
-                                    OutlinedButton(onClick = { onDeleteVideo(index) }, enabled = videoState == VideoVrState.READY && index >= 0, modifier = Modifier.weight(1f)) {
-                                        Text(lang.t("删除", "Delete"), style = MaterialTheme.typography.labelSmall)
-                                    }
-                                }
                             }
                         }
                     }
@@ -5008,8 +5089,8 @@ private fun DebugScreen(
                     DebugLine("Frame", "${videoJob?.currentFrame ?: 0}/${videoJob?.totalFrames ?: 0}")
                     DebugLine("Progress", "${((videoJob?.progress ?: 0f) * 100f).roundToInt()}%")
                     DebugLine("FPS", "${videoJob?.fps ?: videoEntry?.fps ?: 30}")
-                    DebugLine("Current frame", "${videoJob?.currentFrameMs ?: 0}ms")
-                    DebugLine("Avg frame", "${videoJob?.avgFrameMs ?: 0}ms")
+                    DebugLine(lang.t("当前有效帧", "Current active frame"), "${videoJob?.currentFrameMs ?: 0}ms")
+                    DebugLine(lang.t("平均有效帧", "Avg active frame"), "${videoJob?.avgFrameMs ?: 0}ms")
                     DebugLine("Model", videoJob?.modelId?.ifBlank { state.settings.videoModelId } ?: state.settings.videoModelId)
                     DebugLine("Cache", videoJob?.cacheVersion?.ifBlank { "-" } ?: "-")
                     DebugLine("Threads", "${videoJob?.modelThreads ?: state.settings.videoModelThreads}")
