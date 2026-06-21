@@ -152,6 +152,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.File
 import java.io.FileInputStream
@@ -875,7 +876,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.17"
+                    val current = "v2.18"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -2996,27 +2997,51 @@ private class VrGenerator(
         val inputSize = 518
         val model = loadModelFile(modelFile)
         var gpuDelegate: GpuDelegate? = null
+        val gpuDiagnostics = mutableListOf<String>()
+        gpuDiagnostics += "device=${Build.MANUFACTURER}/${Build.MODEL} sdk=${Build.VERSION.SDK_INT}"
         val options = Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8))
-        if (useGpu) {
+        if (!useGpu) {
+            gpuDiagnostics += "gpu=disabled"
+        } else {
+            var compatibility: CompatibilityList? = null
+            val compatibilityResult = runCatching {
+                CompatibilityList().also { compatibility = it }
+            }
+            val compatible = compatibilityResult.getOrNull()?.isDelegateSupportedOnThisDevice
+            gpuDiagnostics += "compat=${compatible ?: "unknown"}"
+            compatibilityResult.exceptionOrNull()?.let { error ->
+                gpuDiagnostics += "compatError=${error.shortMessage()}"
+            }
             runCatching {
-                gpuDelegate = GpuDelegate()
+                val delegateOptions = if (compatible == true) {
+                    compatibility?.bestOptionsForThisDevice
+                } else {
+                    null
+                }
+                gpuDelegate = if (delegateOptions != null) GpuDelegate(delegateOptions) else GpuDelegate()
                 options.addDelegate(gpuDelegate)
-            }.onFailure {
+                gpuDiagnostics += "delegateCreate=ok"
+            }.onFailure { error ->
+                gpuDiagnostics += "delegateCreate=failed:${error.shortMessage()}"
                 gpuDelegate?.close()
                 gpuDelegate = null
+            }.also {
+                runCatching { compatibility?.close() }
             }
         }
         var delegateActive = false
         val interpreter = runCatching { Interpreter(model, options) }.onSuccess {
             delegateActive = gpuDelegate != null
+            gpuDiagnostics += "interpreterCreate=ok"
         }.getOrElse {
+            gpuDiagnostics += "interpreterCreate=failed:${it.shortMessage()}"
             gpuDelegate?.close()
             gpuDelegate = null
-            onRuntimeInfo?.invoke("tflite gpu delegate fallback: ${it.message}")
+            onRuntimeInfo?.invoke("tflite gpu delegate fallback: ${it.shortMessage()}")
             Interpreter(model, Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8)))
         }
         val threadCount = modelThreads.coerceIn(1, 8)
-        onRuntimeInfo?.invoke("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=$delegateActive")
+        onRuntimeInfo?.invoke("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=$delegateActive ${gpuDiagnostics.joinToString(" ")}")
         val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
         val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
         val pixels = IntArray(inputSize * inputSize)
@@ -5826,6 +5851,12 @@ private fun VrGenerationParams.cacheVersion(): String {
 private fun VideoGenerationParams.cacheVersion(): String {
     return "${toVrParams().cacheVersion()}_$VIDEO_ENCODER_VERSION"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
+}
+
+private fun Throwable.shortMessage(): String {
+    val type = this::class.java.simpleName.ifBlank { "Error" }
+    val message = message?.replace('\n', ' ')?.replace('\r', ' ')?.take(180)
+    return if (message.isNullOrBlank()) type else "$type:$message"
 }
 
 private fun File.sha256(): String {

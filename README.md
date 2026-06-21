@@ -2,6 +2,12 @@
 
 一个本地 Android 图库应用：按“全部 / 相册 / 生成”浏览系统图片和视频，并在手机本地生成平行眼 SBS VR 缓存。
 
+## v2.18 更新
+
+- 视频/图片生成的 TFLite Runtime 诊断补全 GPU 细节：设备信息、CompatibilityList 兼容性、delegate 创建结果、Interpreter 创建结果。
+- GPU delegate 创建失败或 Interpreter 挂载失败时，不再只显示 `delegateActive=false`，会显示具体异常摘要和 CPU 回退原因。
+- 新增 `tensorflow-lite-gpu-api` 依赖，用于获取官方兼容性推荐选项。
+
 ## v2.17 更新
 
 - 调试页视频耗时改为“当前有效帧 / 平均有效帧”，避免锁屏、后台等待或唤醒时间污染平均帧耗时。

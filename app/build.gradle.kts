@@ -12,8 +12,8 @@ android {
         applicationId = "com.local.parallelvrgallery"
         minSdk = 26
         targetSdk = 35
-        versionCode = 217
-        versionName = "2.17"
+        versionCode = 218
+        versionName = "2.18"
     }
 
     buildFeatures {
@@ -44,6 +44,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.6")
 }
