@@ -359,7 +359,7 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
-private const val VIDEO_ENCODER_VERSION = "encoderV2"
+private const val VIDEO_ENCODER_VERSION = "encoderV3"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -878,7 +878,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.20"
+                    val current = "v2.21"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3158,7 +3158,7 @@ class DepthModelSession(
     private val threadCount = modelThreads.coerceIn(1, 8)
     private val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
     private val pixels = IntArray(inputSize * inputSize)
-    private val output = Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(1) } } }
+    private val output = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 4).order(ByteOrder.nativeOrder())
 
     init {
         val options = Interpreter.Options().setNumThreads(threadCount)
@@ -3214,6 +3214,7 @@ class DepthModelSession(
             input.putFloat(Color.blue(pixel) / 255f)
         }
         input.rewind()
+        output.clear()
         runCatching {
             interpreter.run(input, output)
         }.onFailure { error ->
@@ -3225,6 +3226,7 @@ class DepthModelSession(
             delegateActive = false
             interpreter = Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
             input.rewind()
+            output.clear()
             interpreter.run(input, output)
             onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=runFailure")
         }
@@ -3232,13 +3234,12 @@ class DepthModelSession(
         val flat = FloatArray(inputSize * inputSize)
         var minValue = Float.MAX_VALUE
         var maxValue = -Float.MAX_VALUE
-        for (y in 0 until inputSize) {
-            for (x in 0 until inputSize) {
-                val value = output[0][y][x][0]
-                flat[y * inputSize + x] = value
-                minValue = min(minValue, value)
-                maxValue = max(maxValue, value)
-            }
+        output.rewind()
+        for (i in flat.indices) {
+            val value = output.getFloat()
+            flat[i] = value
+            minValue = min(minValue, value)
+            maxValue = max(maxValue, value)
         }
         val range = max(0.0001f, maxValue - minValue)
         for (i in flat.indices) {

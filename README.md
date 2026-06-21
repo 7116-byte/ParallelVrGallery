@@ -2,6 +2,12 @@
 
 一个本地 Android 图库应用：按“全部 / 相册 / 生成”浏览系统图片和视频，并在手机本地生成平行眼 SBS VR 缓存。
 
+## v2.21 更新
+
+- 修复 v2.20 视频复用深度模型会话后，部分设备生成速度变快但 3D 视差消失的问题。
+- 深度输出改为 direct ByteBuffer，避免复用 GPU Interpreter 时多层 Java Array 输出异常。
+- 视频缓存版本升级到 `encoderV3`，不会继续读取 v2.20 可能生成过的错误中间帧。
+
 ## v2.20 更新
 
 - 视频生成复用深度模型会话：每个视频任务只创建一次 TFLite Interpreter / GPU Delegate，后续帧复用同一个会话。
