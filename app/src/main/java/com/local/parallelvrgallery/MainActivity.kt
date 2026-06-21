@@ -155,6 +155,7 @@ import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.File
+import java.io.Closeable
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
@@ -877,7 +878,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.19"
+                    val current = "v2.20"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3015,8 +3016,8 @@ private class VrGenerator(
         params: VrGenerationParams,
         onModelProgress: (Float) -> Unit = {},
         onRuntimeInfo: (String) -> Unit = {},
+        depthSession: DepthModelSession? = null,
     ): Bitmap {
-        val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress)
         val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge)
         val working = if (max(source.width, source.height) > safeMaxLongEdge) {
             val scale = safeMaxLongEdge.toFloat() / max(source.width, source.height).toFloat()
@@ -3024,9 +3025,24 @@ private class VrGenerator(
         } else {
             source
         }
-        val rawDepth = runDepthModel(working, modelFile, params.modelThreads, params.useGpu, onRuntimeInfo)
+        val rawDepth = if (depthSession != null) {
+            depthSession.run(working)
+        } else {
+            openDepthSession(params, onModelProgress, onRuntimeInfo).use { session ->
+                session.run(working)
+            }
+        }
         val depthSmall = smoothDepth(rawDepth, params.blurRadius, params.invertDepth)
         return makeParallelSbs(working, depthSmall, params.depthScale, params.fillRadius)
+    }
+
+    fun openDepthSession(
+        params: VrGenerationParams,
+        onModelProgress: (Float) -> Unit = {},
+        onRuntimeInfo: (String) -> Unit = {},
+    ): DepthModelSession {
+        val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress)
+        return DepthModelSession(modelFile, params.modelThreads, params.useGpu, onRuntimeInfo)
     }
 
     private fun memorySafeMaxLongEdge(width: Int, height: Int, requested: Int): Int {
@@ -3051,95 +3067,9 @@ private class VrGenerator(
         useGpu: Boolean,
         onRuntimeInfo: ((String) -> Unit)? = null,
     ): FloatArray {
-        val inputSize = 518
-        val model = loadModelFile(modelFile)
-        var gpuDelegate: GpuDelegate? = null
-        val gpuDiagnostics = mutableListOf<String>()
-        gpuDiagnostics += "device=${Build.MANUFACTURER}/${Build.MODEL} sdk=${Build.VERSION.SDK_INT}"
-        val options = Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8))
-        if (!useGpu) {
-            gpuDiagnostics += "gpu=disabled"
-        } else {
-            var compatibility: CompatibilityList? = null
-            val compatibilityResult = runCatching {
-                CompatibilityList().also { compatibility = it }
-            }
-            val compatible = compatibilityResult.getOrNull()?.isDelegateSupportedOnThisDevice
-            gpuDiagnostics += "compat=${compatible ?: "unknown"}"
-            compatibilityResult.exceptionOrNull()?.let { error ->
-                gpuDiagnostics += "compatError=${error.shortMessage()}"
-            }
-            runCatching {
-                val delegateOptions = if (compatible == true) {
-                    compatibility?.bestOptionsForThisDevice
-                } else {
-                    null
-                }
-                gpuDelegate = if (delegateOptions != null) GpuDelegate(delegateOptions) else GpuDelegate()
-                options.addDelegate(gpuDelegate)
-                gpuDiagnostics += "delegateCreate=ok"
-            }.onFailure { error ->
-                gpuDiagnostics += "delegateCreate=failed:${error.shortMessage()}"
-                gpuDelegate?.close()
-                gpuDelegate = null
-            }.also {
-                runCatching { compatibility?.close() }
-            }
+        return DepthModelSession(modelFile, modelThreads, useGpu, onRuntimeInfo ?: {}).use { session ->
+            session.run(bitmap)
         }
-        var delegateActive = false
-        val interpreter = runCatching { Interpreter(model, options) }.onSuccess {
-            delegateActive = gpuDelegate != null
-            gpuDiagnostics += "interpreterCreate=ok"
-        }.getOrElse {
-            gpuDiagnostics += "interpreterCreate=failed:${it.shortMessage()}"
-            gpuDelegate?.close()
-            gpuDelegate = null
-            onRuntimeInfo?.invoke("tflite gpu delegate fallback: ${it.shortMessage()}")
-            Interpreter(model, Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8)))
-        }
-        val threadCount = modelThreads.coerceIn(1, 8)
-        onRuntimeInfo?.invoke("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=$delegateActive ${gpuDiagnostics.joinToString(" ")}")
-        val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-        val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
-        val pixels = IntArray(inputSize * inputSize)
-        scaled.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
-        for (pixel in pixels) {
-            input.putFloat(Color.red(pixel) / 255f)
-            input.putFloat(Color.green(pixel) / 255f)
-            input.putFloat(Color.blue(pixel) / 255f)
-        }
-        val output = Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(1) } } }
-        runCatching {
-            interpreter.run(input, output)
-        }.onFailure { error ->
-            interpreter.close()
-            gpuDelegate?.close()
-            if (!useGpu) throw error
-            val cpuInterpreter = Interpreter(model, Interpreter.Options().setNumThreads(modelThreads.coerceIn(1, 8)))
-            input.rewind()
-            onRuntimeInfo?.invoke("tflite gpu run failed; fallback cpu threads=$threadCount error=${error.message}")
-            cpuInterpreter.run(input, output)
-            cpuInterpreter.close()
-            delegateActive = false
-        }
-        interpreter.close()
-        gpuDelegate?.close()
-        val flat = FloatArray(inputSize * inputSize)
-        var minValue = Float.MAX_VALUE
-        var maxValue = -Float.MAX_VALUE
-        for (y in 0 until inputSize) {
-            for (x in 0 until inputSize) {
-                val value = output[0][y][x][0]
-                flat[y * inputSize + x] = value
-                minValue = min(minValue, value)
-                maxValue = max(maxValue, value)
-            }
-        }
-        val range = max(0.0001f, maxValue - minValue)
-        for (i in flat.indices) {
-            flat[i] = (flat[i] - minValue) / range
-        }
-        return flat
     }
 
     private fun depthToBitmap(depth: FloatArray): Bitmap {
@@ -3214,6 +3144,116 @@ private class VrGenerator(
     }
 }
 
+class DepthModelSession(
+    modelFile: File,
+    private val modelThreads: Int,
+    private val useGpu: Boolean,
+    private val onRuntimeInfo: (String) -> Unit = {},
+) : Closeable {
+    private val inputSize = 518
+    private val model = loadModelFile(modelFile)
+    private var gpuDelegate: GpuDelegate? = null
+    private var interpreter: Interpreter
+    private var delegateActive = false
+    private val threadCount = modelThreads.coerceIn(1, 8)
+    private val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
+    private val pixels = IntArray(inputSize * inputSize)
+    private val output = Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(1) } } }
+
+    init {
+        val options = Interpreter.Options().setNumThreads(threadCount)
+        val gpuDiagnostics = mutableListOf<String>()
+        gpuDiagnostics += "device=${Build.MANUFACTURER}/${Build.MODEL} sdk=${Build.VERSION.SDK_INT}"
+        if (!useGpu) {
+            gpuDiagnostics += "gpu=disabled"
+        } else {
+            var compatibility: CompatibilityList? = null
+            val compatibilityResult = runCatching {
+                CompatibilityList().also { compatibility = it }
+            }
+            val compatible = compatibilityResult.getOrNull()?.isDelegateSupportedOnThisDevice
+            gpuDiagnostics += "compat=${compatible ?: "unknown"}"
+            compatibilityResult.exceptionOrNull()?.let { error ->
+                gpuDiagnostics += "compatError=${error.shortMessage()}"
+            }
+            runCatching {
+                val delegateOptions = if (compatible == true) compatibility?.bestOptionsForThisDevice else null
+                gpuDelegate = if (delegateOptions != null) GpuDelegate(delegateOptions) else GpuDelegate()
+                options.addDelegate(gpuDelegate)
+                gpuDiagnostics += "delegateCreate=ok"
+            }.onFailure { error ->
+                gpuDiagnostics += "delegateCreate=failed:${error.shortMessage()}"
+                gpuDelegate?.close()
+                gpuDelegate = null
+            }.also {
+                runCatching { compatibility?.close() }
+            }
+        }
+        interpreter = runCatching { Interpreter(model, options) }.onSuccess {
+            delegateActive = gpuDelegate != null
+            gpuDiagnostics += "interpreterCreate=ok"
+        }.getOrElse { error ->
+            gpuDiagnostics += "interpreterCreate=failed:${error.shortMessage()}"
+            gpuDelegate?.close()
+            gpuDelegate = null
+            onRuntimeInfo("tflite gpu delegate fallback: ${error.shortMessage()}")
+            Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
+        }
+        onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=$delegateActive reusedSession=true ${gpuDiagnostics.joinToString(" ")}")
+    }
+
+    @Synchronized
+    fun run(bitmap: Bitmap): FloatArray {
+        val scaled = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        input.clear()
+        scaled.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
+        scaled.recycle()
+        for (pixel in pixels) {
+            input.putFloat(Color.red(pixel) / 255f)
+            input.putFloat(Color.green(pixel) / 255f)
+            input.putFloat(Color.blue(pixel) / 255f)
+        }
+        input.rewind()
+        runCatching {
+            interpreter.run(input, output)
+        }.onFailure { error ->
+            if (!useGpu || !delegateActive) throw error
+            onRuntimeInfo("tflite gpu run failed; fallback cpu threads=$threadCount error=${error.shortMessage()}")
+            runCatching { interpreter.close() }
+            gpuDelegate?.close()
+            gpuDelegate = null
+            delegateActive = false
+            interpreter = Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
+            input.rewind()
+            interpreter.run(input, output)
+            onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=runFailure")
+        }
+
+        val flat = FloatArray(inputSize * inputSize)
+        var minValue = Float.MAX_VALUE
+        var maxValue = -Float.MAX_VALUE
+        for (y in 0 until inputSize) {
+            for (x in 0 until inputSize) {
+                val value = output[0][y][x][0]
+                flat[y * inputSize + x] = value
+                minValue = min(minValue, value)
+                maxValue = max(maxValue, value)
+            }
+        }
+        val range = max(0.0001f, maxValue - minValue)
+        for (i in flat.indices) {
+            flat[i] = (flat[i] - minValue) / range
+        }
+        return flat
+    }
+
+    override fun close() {
+        runCatching { interpreter.close() }
+        gpuDelegate?.close()
+        gpuDelegate = null
+    }
+}
+
 private class VideoVrGenerator(
     private val context: Context,
     private val cache: VideoVrCacheManager,
@@ -3248,38 +3288,43 @@ private class VideoVrGenerator(
         val totalFrames = ((durationMs / 1000f) * fps).roundToInt().coerceAtLeast(1)
         mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} useGpu=${vrParams.useGpu}")
 
-        val first = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST) ?: error("Unable to decode first video frame")
-        val firstFrameCache = File(framesDir, "frame_000000.jpg")
-        val firstSbs = if (firstFrameCache.exists()) {
-            BitmapFactory.decodeFile(firstFrameCache.absolutePath)?.also { onRuntimeInfo("frame cache hit frame=0 version=$version") }
-                ?: frameGenerator.generateSbsBitmap(first.copy(Bitmap.Config.ARGB_8888, false), vrParams, onModelProgress, onRuntimeInfo)
-        } else {
-            frameGenerator.generateSbsBitmap(first.copy(Bitmap.Config.ARGB_8888, false), vrParams, onModelProgress, onRuntimeInfo).also { bitmap ->
-                FileOutputStream(firstFrameCache).use { bitmap.compress(Bitmap.CompressFormat.JPEG, vrParams.quality, it) }
+        var width = 0
+        var height = 0
+        frameGenerator.openDepthSession(vrParams, onModelProgress, onRuntimeInfo).use { depthSession ->
+            val first = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST) ?: error("Unable to decode first video frame")
+            val firstFrameCache = File(framesDir, "frame_000000.jpg")
+            val firstSbs = if (firstFrameCache.exists()) {
+                BitmapFactory.decodeFile(firstFrameCache.absolutePath)?.also { onRuntimeInfo("frame cache hit frame=0 version=$version") }
+                    ?: frameGenerator.generateSbsBitmap(first.copy(Bitmap.Config.ARGB_8888, false), vrParams, onModelProgress, onRuntimeInfo, depthSession)
+            } else {
+                frameGenerator.generateSbsBitmap(first.copy(Bitmap.Config.ARGB_8888, false), vrParams, onModelProgress, onRuntimeInfo, depthSession).also { bitmap ->
+                    FileOutputStream(firstFrameCache).use { bitmap.compress(Bitmap.CompressFormat.JPEG, vrParams.quality, it) }
+                }
             }
-        }
-        val width = even(firstSbs.width)
-        val height = even(firstSbs.height)
-        first.recycle()
-        mark("first frame sbs=${firstSbs.width}x${firstSbs.height} encode=${width}x${height}")
+            width = even(firstSbs.width)
+            height = even(firstSbs.height)
+            first.recycle()
+            mark("first frame sbs=${firstSbs.width}x${firstSbs.height} encode=${width}x${height}")
 
-        encodeVideo(
-            item = item,
-            retriever = retriever,
-            firstSbs = firstSbs,
-            framesDir = framesDir,
-            output = output,
-            width = width,
-            height = height,
-            fps = fps,
-            totalFrames = totalFrames,
-            version = version,
-            params = vrParams,
-            onModelProgress = onModelProgress,
-            onRuntimeInfo = onRuntimeInfo,
-            onProgress = onProgress,
-            mark = ::mark,
-        )
+            encodeVideo(
+                item = item,
+                retriever = retriever,
+                firstSbs = firstSbs,
+                framesDir = framesDir,
+                output = output,
+                width = width,
+                height = height,
+                fps = fps,
+                totalFrames = totalFrames,
+                version = version,
+                params = vrParams,
+                depthSession = depthSession,
+                onModelProgress = onModelProgress,
+                onRuntimeInfo = onRuntimeInfo,
+                onProgress = onProgress,
+                mark = ::mark,
+            )
+        }
         retriever.release()
 
         metaPath.writeText(
@@ -3314,6 +3359,7 @@ private class VideoVrGenerator(
         totalFrames: Int,
         version: String,
         params: VrGenerationParams,
+        depthSession: DepthModelSession,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
         onProgress: (Float, Int, Int, Int, Long) -> Unit,
@@ -3380,7 +3426,7 @@ private class VideoVrGenerator(
                 val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                     ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     ?: return null
-                val generated = frameGenerator.generateSbsBitmap(bitmap.copy(Bitmap.Config.ARGB_8888, false), params, onModelProgress, onRuntimeInfo)
+                val generated = frameGenerator.generateSbsBitmap(bitmap.copy(Bitmap.Config.ARGB_8888, false), params, onModelProgress, onRuntimeInfo, depthSession)
                 FileOutputStream(frameCache).use { generated.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
                 bitmap.recycle()
                 return FrameResult(generated, SystemClock.uptimeMillis() - started)
