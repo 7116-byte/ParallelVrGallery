@@ -2,48 +2,12 @@
 
 一个本地 Android 图库应用：按“全部 / 相册 / 生成”浏览系统图片和视频，并在手机本地生成平行眼 SBS VR 缓存。
 
-## v2.21 更新
+## v2.22 更新
 
-- 修复 v2.20 视频复用深度模型会话后，部分设备生成速度变快但 3D 视差消失的问题。
-- 深度输出改为 direct ByteBuffer，避免复用 GPU Interpreter 时多层 Java Array 输出异常。
-- 视频缓存版本升级到 `encoderV3`，不会继续读取 v2.20 可能生成过的错误中间帧。
-
-## v2.20 更新
-
-- 视频生成复用深度模型会话：每个视频任务只创建一次 TFLite Interpreter / GPU Delegate，后续帧复用同一个会话。
-- 视频画质不变：模型、输入尺寸、深度后处理、SBS 合成和缓存版本均不改变。
-- Runtime 诊断会显示 `reusedSession=true`，用于确认视频正在使用复用会话。
-- 重新生成仍会创建新的独立任务和新的模型会话，不复用旧任务状态。
-
-## v2.19 更新
-
-- 修复升级或刷新后，未完成的视频生成任务如果不在首页最近加载窗口内，会从生成页消失的问题。
-- 恢复视频队列标签时，会根据持久化的 `VIDEO_id_size_modified` 构造虚拟视频项，确保生成页仍能看到暂停/生成中任务。
-- 修复视频重新生成时，旧任务失败回调覆盖新任务状态，导致页面显示失败但后台仍在生成的问题。
-
-## v2.18 更新
-
-- 视频/图片生成的 TFLite Runtime 诊断补全 GPU 细节：设备信息、CompatibilityList 兼容性、delegate 创建结果、Interpreter 创建结果。
-- GPU delegate 创建失败或 Interpreter 挂载失败时，不再只显示 `delegateActive=false`，会显示具体异常摘要和 CPU 回退原因。
-- 新增 `tensorflow-lite-gpu-api` 依赖，用于获取官方兼容性推荐选项。
-
-## v2.17 更新
-
-- 调试页视频耗时改为“当前有效帧 / 平均有效帧”，避免锁屏、后台等待或唤醒时间污染平均帧耗时。
-- 视频生成期间启动前台服务并申请部分唤醒锁，减少切后台或锁屏后停止生成的问题。
-- 生成页视频卡片不再直接显示“保存 / 删除”按钮，管理操作继续通过长按多选完成。
-- 检查更新的当前版本更新为 `v2.17`。
-
-## 诊断说明
-
-如果调试页显示：
-
-```text
-GPU requested true
-Runtime tflite runtime threads=4 requestedGpu=true delegateActive=false
-```
-
-说明设置里请求了 GPU，但 TensorFlow Lite GPU delegate 实际没有启用，生成仍在 CPU 上运行。此时单帧 3 秒左右主要来自 CPU 模型推理、深度后处理和 SBS 合成链路。
+- 视频深度图增加轻量时序平滑，减少相邻帧深度忽深忽浅导致的画面抽动。
+- 调试页新增视频单帧分段耗时：取帧、深度推理、时序平滑、深度后处理、SBS、缓存写入、编码提交。
+- 视频缓存版本升级到 `encoderV4`，不会继续把旧版本未平滑的视频帧当作当前结果。
+- 继续保留 v2.21 的真 3D 修复：深度输出使用 direct ByteBuffer，避免复用 GPU/TFLite 会话后视差丢失。
 
 ## 功能
 
@@ -52,7 +16,25 @@ Runtime tflite runtime threads=4 requestedGpu=true delegateActive=false
 - 图片 VR：本地生成深度图和 SBS 平行眼图，支持缓存、调试页和调试包分享。
 - 视频 VR：手动加入队列后逐帧生成 SBS 视频，并尽量保留原音频。
 - 生成页：按图片/视频管理已生成、生成中、暂停和失败的缓存任务。
-- 模型按需下载：APK 不内置大模型，首次生成前下载并校验。
+- 模型按需下载：APK 不内置大模型，首次生成前下载并校验 SHA-256。
+
+## 诊断说明
+
+如果调试页显示：
+
+```text
+GPU requested true
+Runtime ... delegateActive=false
+```
+
+说明设置里请求了 GPU，但 TensorFlow Lite GPU delegate 实际没有启用，生成仍在 CPU 上运行。
+
+如果视频“当前有效帧”很慢，可以看 v2.22 新增的分段耗时：
+
+- `深度推理` 高：主要受模型、CPU/GPU delegate、线程数影响。
+- `SBS` 高：主要受输出分辨率、深度强度、边缘填充影响。
+- `缓存写入` 高：主要受图片质量和存储速度影响。
+- `编码提交` 高：主要受硬件编码器和输出分辨率影响。
 
 ## 构建
 
