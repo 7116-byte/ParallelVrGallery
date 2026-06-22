@@ -280,6 +280,7 @@ data class VideoGenerationParams(
     val vr: VrGenerationParams,
     val modelThreads: Int = 4,
     val useGpu: Boolean = false,
+    val depthWorkers: Int = 2,
 ) {
     fun toVrParams(): VrGenerationParams = vr.copy(modelThreads = modelThreads, useGpu = useGpu, forceGpuNoFallback = useGpu)
 }
@@ -316,6 +317,7 @@ data class AppSettings(
     val forceGpuNoFallback: Boolean = true,
     val videoModelThreads: Int = 4,
     val videoUseGpu: Boolean = false,
+    val videoDepthWorkers: Int = 2,
 ) {
     fun toParams(): VrGenerationParams = VrGenerationParams(
         depthModel = imageModelId,
@@ -334,6 +336,7 @@ data class AppSettings(
         vr = toParams().copy(depthModel = videoModelId, useGpu = videoUseGpu, forceGpuNoFallback = videoUseGpu),
         modelThreads = videoModelThreads,
         useGpu = videoUseGpu,
+        depthWorkers = videoDepthWorkers,
     )
 }
 
@@ -378,7 +381,7 @@ private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
-private const val VIDEO_ENCODER_VERSION = "encoderV11"
+private const val VIDEO_ENCODER_VERSION = "encoderV12"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -431,6 +434,7 @@ data class VideoVrJob(
     val modelId: String = "",
     val cacheVersion: String = "",
     val modelThreads: Int = 0,
+    val depthWorkers: Int = 0,
     val useGpu: Boolean = false,
     val runtimeInfo: String = "",
     val startedAt: Long? = null,
@@ -924,7 +928,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.29"
+                    val current = "v2.30"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1456,6 +1460,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     item = item,
                     state = restoredState,
                     progress = if (restoredState == VideoVrState.FAILED) 1f else 0f,
+                    modelId = tag.params?.vr?.depthModel.orEmpty(),
+                    cacheVersion = tag.params?.cacheVersion().orEmpty(),
+                    modelThreads = tag.params?.modelThreads ?: 0,
+                    depthWorkers = tag.params?.depthWorkers ?: 0,
+                    useGpu = tag.params?.useGpu ?: false,
                     startedAt = null,
                     finishedAt = null,
                     error = if (restoredState == VideoVrState.FAILED) "上次生成失败" else null,
@@ -1562,7 +1571,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         var lastRuntimeInfo = "pending"
         _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.GENERATING)) }
         videoQueueTags.upsert(next.item.cacheKey, VideoVrState.GENERATING, next.params)
-        upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
+        upsertVideoJob(next.item, VideoVrState.GENERATING, 0.01f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
         videoNotifier.show(next.item, 0, 0, indeterminate = true, status = "准备生成")
         val started = SystemClock.uptimeMillis()
         var totalFrameTimeMs = 0L
@@ -1586,7 +1595,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                             addLog("video runtime ${next.item.displayName}: $runtime")
                         }
                         lastRuntimeInfo = runtime
-                        upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = runtime)
+                        upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = runtime)
                     },
                 ) { progress, frame, total, fps, currentFrameMs, frameTimings, pipelineStats ->
                     if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) {
@@ -1600,7 +1609,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         measuredFrameCount++
                     }
                     val avgFrameMs = if (measuredFrameCount > 0) totalFrameTimeMs / measuredFrameCount else 0L
-                    upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, currentFrameMs = currentFrameMs, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, frameTimings = frameTimings, pipelineStats = pipelineStats)
+                    upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, currentFrameMs = currentFrameMs, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, frameTimings = frameTimings, pipelineStats = pipelineStats)
                     videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
                 }
             }
@@ -1623,7 +1632,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
             refreshGeneratedLibrary()
-            upsertVideoJob(next.item, VideoVrState.READY, 1f, currentFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.currentFrameMs ?: 0L, avgFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.avgFrameMs ?: 0L, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis())
+            upsertVideoJob(next.item, VideoVrState.READY, 1f, currentFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.currentFrameMs ?: 0L, avgFrameMs = _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.avgFrameMs ?: 0L, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis())
             videoQueueTags.remove(next.item.cacheKey)
             synchronized(pausedVideoParams) {
                 pausedVideoParams.remove(next.item.cacheKey)
@@ -1641,13 +1650,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     pausedVideoParams[next.item.cacheKey] = next.params
                     activeVideoParams.remove(next.item.cacheKey)
                 }
-                upsertVideoJob(next.item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
+                upsertVideoJob(next.item, VideoVrState.PAUSED, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo)
                 addLog("video paused ${next.item.displayName}")
             } else {
                 _uiState.update { it.copy(videoStates = it.videoStates + (next.item.cacheKey to VideoVrState.FAILED), modelProgress = null) }
                 videoQueueTags.upsert(next.item.cacheKey, VideoVrState.FAILED, next.params)
                 synchronized(pausedVideoParams) { activeVideoParams.remove(next.item.cacheKey) }
-                upsertVideoJob(next.item, VideoVrState.FAILED, 1f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis(), error = error.message)
+                upsertVideoJob(next.item, VideoVrState.FAILED, 1f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, depthWorkers = next.params.depthWorkers, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, finishedAt = System.currentTimeMillis(), error = error.message)
                 videoNotifier.failed(next.item, error.message ?: "生成失败")
                 addLog("video failed ${next.item.displayName}: ${error.message}")
             }
@@ -1812,6 +1821,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         modelId: String = "",
         cacheVersion: String = "",
         modelThreads: Int = 0,
+        depthWorkers: Int = 0,
         useGpu: Boolean = false,
         runtimeInfo: String = "",
         finishedAt: Long? = null,
@@ -1834,6 +1844,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 modelId = modelId.ifBlank { previous?.modelId.orEmpty() },
                 cacheVersion = cacheVersion.ifBlank { previous?.cacheVersion.orEmpty() },
                 modelThreads = modelThreads.takeIf { it > 0 } ?: previous?.modelThreads ?: 0,
+                depthWorkers = depthWorkers.takeIf { it > 0 } ?: previous?.depthWorkers ?: 0,
                 useGpu = if (modelId.isNotBlank() || cacheVersion.isNotBlank()) useGpu else previous?.useGpu == true,
                 runtimeInfo = runtimeInfo.ifBlank { previous?.runtimeInfo.orEmpty() },
                 startedAt = previous?.startedAt ?: System.currentTimeMillis(),
@@ -2122,6 +2133,7 @@ private class SettingsStore(context: Context) {
             forceGpuNoFallback = true,
             videoModelThreads = prefs.getInt("videoModelThreads", 4),
             videoUseGpu = prefs.getBoolean("videoUseGpu", false),
+            videoDepthWorkers = prefs.getInt("videoDepthWorkers", 2).coerceIn(1, 2),
         )
     }
 
@@ -2146,6 +2158,7 @@ private class SettingsStore(context: Context) {
             .putBoolean("forceGpuNoFallback", true)
             .putInt("videoModelThreads", settings.videoModelThreads)
             .putBoolean("videoUseGpu", settings.videoUseGpu)
+            .putInt("videoDepthWorkers", settings.videoDepthWorkers)
             .apply()
     }
 }
@@ -2472,6 +2485,7 @@ private class VideoQueueTagStore(context: Context) {
             vr.gpuTestMode.name,
             vr.forceGpuNoFallback.toString(),
             cacheVersion(),
+            depthWorkers.toString(),
         ).joinToString(",") { it.replace(",", "_").replace('\t', '_').replace('\n', '_').replace('\r', '_') }
     }
 
@@ -2497,6 +2511,7 @@ private class VideoQueueTagStore(context: Context) {
                 ),
                 modelThreads = parts[9].toInt(),
                 useGpu = parts[10].toBooleanStrictOrNull() ?: false,
+                depthWorkers = parts.getOrNull(14)?.toIntOrNull()?.coerceIn(1, 2) ?: 2,
             )
         }.getOrNull()
     }
@@ -3103,6 +3118,15 @@ private class VrGenerator(
         depthSession: DepthModelSession,
         temporalSmoother: DepthTemporalSmoother,
     ): VideoSbsResult {
+        val depth = generateVideoDepth(source, params, depthSession)
+        return finishVideoSbs(depth, params, temporalSmoother)
+    }
+
+    fun generateVideoDepth(
+        source: Bitmap,
+        params: VrGenerationParams,
+        depthSession: DepthModelSession,
+    ): VideoDepthResult {
         val safeMaxLongEdge = memorySafeMaxLongEdge(source.width, source.height, params.maxLongEdge)
         val working = if (max(source.width, source.height) > safeMaxLongEdge) {
             val scale = safeMaxLongEdge.toFloat() / max(source.width, source.height).toFloat()
@@ -3113,19 +3137,35 @@ private class VrGenerator(
         val depthStart = SystemClock.uptimeMillis()
         val rawDepth = depthSession.run(working)
         val depthMs = SystemClock.uptimeMillis() - depthStart
+        return VideoDepthResult(
+            source = working,
+            rawDepth = rawDepth,
+            timings = VideoFrameTimings(depthMs = depthMs),
+        )
+    }
+
+    fun finishVideoSbs(
+        depth: VideoDepthResult,
+        params: VrGenerationParams,
+        temporalSmoother: DepthTemporalSmoother,
+    ): VideoSbsResult {
         val temporalStart = SystemClock.uptimeMillis()
-        val stableDepth = temporalSmoother.smooth(rawDepth)
+        val stableDepth = temporalSmoother.smooth(depth.rawDepth)
         val temporalMs = SystemClock.uptimeMillis() - temporalStart
         val depthPostStart = SystemClock.uptimeMillis()
         val depthSmall = smoothDepth(stableDepth, params.blurRadius, params.invertDepth)
         val depthPostMs = SystemClock.uptimeMillis() - depthPostStart
         val sbsStart = SystemClock.uptimeMillis()
-        val sbs = makeParallelSbs(working, depthSmall, params.depthScale, params.fillRadius)
+        val sbs = try {
+            makeParallelSbs(depth.source, depthSmall, params.depthScale, params.fillRadius)
+        } finally {
+            depth.source.recycle()
+        }
         val sbsMs = SystemClock.uptimeMillis() - sbsStart
         return VideoSbsResult(
             bitmap = sbs,
             timings = VideoFrameTimings(
-                depthMs = depthMs,
+                depthMs = depth.timings.depthMs,
                 temporalMs = temporalMs,
                 depthPostMs = depthPostMs,
                 sbsMs = sbsMs,
@@ -3581,6 +3621,12 @@ data class VideoSbsResult(
     val timings: VideoFrameTimings,
 )
 
+data class VideoDepthResult(
+    val source: Bitmap,
+    val rawDepth: FloatArray,
+    val timings: VideoFrameTimings,
+)
+
 private data class VideoFramePlan(
     val durationMs: Long,
     val fps: Int,
@@ -3661,7 +3707,7 @@ private class VideoVrGenerator(
         val durationMs = framePlan.durationMs
         val fps = framePlan.fps
         val totalFrames = framePlan.totalFrames
-        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames frameMode=${if (framePlan.useFrameIndex) "index" else "time"} metadataFrames=${framePlan.metadataFrameCount ?: "-"} captureFps=${framePlan.captureFps ?: "-"} version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} useGpu=${vrParams.useGpu}")
+        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames frameMode=${if (framePlan.useFrameIndex) "index" else "time"} metadataFrames=${framePlan.metadataFrameCount ?: "-"} captureFps=${framePlan.captureFps ?: "-"} version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} depthWorkers=${params.depthWorkers.coerceIn(1, 2)} useGpu=${vrParams.useGpu}")
 
         var width = 0
         var height = 0
@@ -3671,7 +3717,6 @@ private class VideoVrGenerator(
             val firstFrameCache = File(framesDir, "frame_000000.jpg")
             val firstSource = first.copy(Bitmap.Config.ARGB_8888, false)
             val firstGenerated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession, temporalSmoother).bitmap
-            firstSource.recycle()
             val cachedFirst = if (firstFrameCache.exists()) {
                 BitmapFactory.decodeFile(firstFrameCache.absolutePath)?.also { onRuntimeInfo("frame cache hit frame=0 version=$version") }
             } else {
@@ -3699,6 +3744,7 @@ private class VideoVrGenerator(
                 framePlan = framePlan,
                 version = version,
                 params = vrParams,
+                videoParams = params,
                 depthSession = depthSession,
                 temporalSmoother = temporalSmoother,
                 onModelProgress = onModelProgress,
@@ -3723,6 +3769,7 @@ private class VideoVrGenerator(
                 "cacheVersion=$version",
                 "encoderVersion=$VIDEO_ENCODER_VERSION",
                 "modelThreads=${vrParams.modelThreads}",
+                "depthWorkers=${params.depthWorkers.coerceIn(1, 2)}",
                 "useGpu=${vrParams.useGpu}",
                 "gpuTestMode=${vrParams.gpuTestMode}",
                 "forceGpuNoFallback=${vrParams.forceGpuNoFallback}",
@@ -3792,6 +3839,7 @@ private class VideoVrGenerator(
         framePlan: VideoFramePlan,
         version: String,
         params: VrGenerationParams,
+        videoParams: VideoGenerationParams,
         depthSession: DepthModelSession,
         temporalSmoother: DepthTemporalSmoother,
         onModelProgress: (Float) -> Unit,
@@ -3849,13 +3897,16 @@ private class VideoVrGenerator(
             renderer = activeRenderer
             data class FrameResult(val bitmap: Bitmap, val generatedMs: Long, val timings: VideoFrameTimings)
             data class PipelineInput(val frame: Int, val source: Bitmap?, val cachedSbs: Bitmap?, val decodeMs: Long)
+            data class PipelineDepthOutput(val frame: Int, val source: Bitmap?, val cachedSbs: Bitmap?, val depth: VideoDepthResult?, val decodeMs: Long, val depthStartedAt: Long)
             data class PipelineOutput(val frame: Int, val result: FrameResult)
 
             val decodedChannel = Channel<PipelineInput>(capacity = 2)
+            val depthChannel = Channel<PipelineDepthOutput>(capacity = 2)
             val generatedChannel = Channel<PipelineOutput>(capacity = 2)
             val decodeQueueSize = AtomicInteger(0)
             val generatedQueueSize = AtomicInteger(0)
             val cacheHits = AtomicInteger(0)
+            val depthWorkerCount = videoParams.depthWorkers.coerceIn(1, 2)
             var timingWindow = VideoFrameTimings()
             var timingWindowCount = 0
 
@@ -3941,46 +3992,118 @@ private class VideoVrGenerator(
                     }
                 }
 
+                val depthJobs = (0 until depthWorkerCount).map { workerIndex ->
+                    launch(Dispatchers.IO) {
+                        val workerSession = if (workerIndex == 0) {
+                            depthSession
+                        } else {
+                            frameGenerator.openDepthSession(params, onModelProgress, onRuntimeInfo)
+                        }
+                        try {
+                            for (inputFrame in decodedChannel) {
+                                decodeQueueSize.decrementAndGet()
+                                if (inputFrame.cachedSbs != null) {
+                                    cacheHits.incrementAndGet()
+                                    depthChannel.send(
+                                        PipelineDepthOutput(
+                                            frame = inputFrame.frame,
+                                            source = null,
+                                            cachedSbs = inputFrame.cachedSbs,
+                                            depth = null,
+                                            decodeMs = inputFrame.decodeMs,
+                                            depthStartedAt = 0L,
+                                        ),
+                                    )
+                                } else {
+                                    val source = inputFrame.source ?: error("Missing source frame ${inputFrame.frame}")
+                                    val started = SystemClock.uptimeMillis()
+                                    val depth = frameGenerator.generateVideoDepth(source, params, workerSession)
+                                    depthChannel.send(
+                                        PipelineDepthOutput(
+                                            frame = inputFrame.frame,
+                                            source = source,
+                                            cachedSbs = null,
+                                            depth = depth,
+                                            decodeMs = inputFrame.decodeMs,
+                                            depthStartedAt = started,
+                                        ),
+                                    )
+                                }
+                            }
+                        } finally {
+                            if (workerIndex != 0) workerSession.close()
+                        }
+                    }
+                }
+
+                val depthCloserJob = launch(Dispatchers.Default) {
+                    depthJobs.forEach { it.join() }
+                    depthChannel.close()
+                }
+
                 val generateJob = launch(Dispatchers.IO) {
                     try {
-                        for (inputFrame in decodedChannel) {
-                            decodeQueueSize.decrementAndGet()
-                            val started = SystemClock.uptimeMillis()
-                            val output = if (inputFrame.cachedSbs != null) {
-                                cacheHits.incrementAndGet()
-                                PipelineOutput(
-                                    inputFrame.frame,
-                                    FrameResult(
-                                        bitmap = inputFrame.cachedSbs,
-                                        generatedMs = 0L,
-                                        timings = VideoFrameTimings(decodeMs = inputFrame.decodeMs),
-                                    ),
-                                )
-                            } else {
-                                val source = inputFrame.source ?: error("Missing source frame ${inputFrame.frame}")
-                                val generatedResult = try {
-                                    frameGenerator.generateVideoSbsBitmap(source, params, depthSession, temporalSmoother)
-                                } finally {
-                                    source.recycle()
-                                }
-                                val frameCache = File(framesDir, "frame_${inputFrame.frame.toString().padStart(6, '0')}.jpg")
-                                val cacheStart = SystemClock.uptimeMillis()
-                                FileOutputStream(frameCache).use { generatedResult.bitmap.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
-                                val cacheWriteMs = SystemClock.uptimeMillis() - cacheStart
-                                PipelineOutput(
-                                    inputFrame.frame,
-                                    FrameResult(
-                                        bitmap = generatedResult.bitmap,
-                                        generatedMs = SystemClock.uptimeMillis() - started,
-                                        timings = generatedResult.timings.copy(
-                                            decodeMs = inputFrame.decodeMs,
-                                            cacheWriteMs = cacheWriteMs,
+                        val pendingDepthFrames = mutableMapOf<Int, PipelineDepthOutput>()
+                        var expectedDepthFrame = 1
+                        while (expectedDepthFrame < totalFrames) {
+                            val depthOutput = depthChannel.receiveCatching().getOrNull() ?: break
+                            pendingDepthFrames[depthOutput.frame] = depthOutput
+                            var lastWaitingFrames = pendingDepthFrames.size
+                            while (true) {
+                                val inputFrame = pendingDepthFrames.remove(expectedDepthFrame) ?: break
+                                lastWaitingFrames = pendingDepthFrames.size
+                                val started = SystemClock.uptimeMillis()
+                                val output = if (inputFrame.cachedSbs != null) {
+                                    PipelineOutput(
+                                        inputFrame.frame,
+                                        FrameResult(
+                                            bitmap = inputFrame.cachedSbs,
+                                            generatedMs = 0L,
+                                            timings = VideoFrameTimings(decodeMs = inputFrame.decodeMs),
                                         ),
-                                    ),
+                                    )
+                                } else {
+                                    val depth = inputFrame.depth ?: error("Missing depth frame ${inputFrame.frame}")
+                                    val generatedResult = frameGenerator.finishVideoSbs(depth, params, temporalSmoother)
+                                    if (inputFrame.source != depth.source) inputFrame.source?.recycle()
+                                    val frameCache = File(framesDir, "frame_${inputFrame.frame.toString().padStart(6, '0')}.jpg")
+                                    val cacheStart = SystemClock.uptimeMillis()
+                                    FileOutputStream(frameCache).use { generatedResult.bitmap.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
+                                    val cacheWriteMs = SystemClock.uptimeMillis() - cacheStart
+                                    PipelineOutput(
+                                        inputFrame.frame,
+                                        FrameResult(
+                                            bitmap = generatedResult.bitmap,
+                                            generatedMs = if (inputFrame.depthStartedAt > 0L) {
+                                                SystemClock.uptimeMillis() - inputFrame.depthStartedAt
+                                            } else {
+                                                SystemClock.uptimeMillis() - started
+                                            },
+                                            timings = generatedResult.timings.copy(
+                                                decodeMs = inputFrame.decodeMs,
+                                                cacheWriteMs = cacheWriteMs,
+                                            ),
+                                        ),
+                                    )
+                                }
+                                generatedQueueSize.incrementAndGet()
+                                generatedChannel.send(output)
+                                expectedDepthFrame++
+                            }
+                            if (lastWaitingFrames > 0) {
+                                onProgress(
+                                    expectedDepthFrame.toFloat() / totalFrames.toFloat(),
+                                    expectedDepthFrame,
+                                    totalFrames,
+                                    fps,
+                                    0L,
+                                    VideoFrameTimings(),
+                                    stats(lastWaitingFrames),
                                 )
                             }
-                            generatedQueueSize.incrementAndGet()
-                            generatedChannel.send(output)
+                        }
+                        if (expectedDepthFrame < totalFrames) {
+                            error("Depth pipeline ended before frame $expectedDepthFrame/$totalFrames")
                         }
                     } finally {
                         generatedChannel.close()
@@ -4002,10 +4125,13 @@ private class VideoVrGenerator(
                 }
                 if (expectedFrame < totalFrames) {
                     decodeJob.cancel()
+                    depthJobs.forEach { it.cancel() }
+                    depthCloserJob.cancel()
                     generateJob.cancel()
                     error("Pipeline ended before frame $expectedFrame/$totalFrames")
                 }
                 decodeJob.join()
+                depthCloserJob.join()
                 generateJob.join()
                 if (timingWindowCount > 0) {
                     val avg = averageTiming(timingWindow, timingWindowCount)
@@ -5465,6 +5591,9 @@ private fun SettingsScreen(
         SettingInt(lang.t("视频模型 CPU 线程", "Video model CPU threads"), settings.videoModelThreads, listOf(1, 2, 4, 8)) {
             onChange(settings.copy(videoModelThreads = it))
         }
+        SettingInt(lang.t("视频深度 worker 数", "Video depth workers"), settings.videoDepthWorkers, listOf(1, 2)) {
+            onChange(settings.copy(videoDepthWorkers = it))
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = settings.videoUseGpu,
@@ -5472,7 +5601,7 @@ private fun SettingsScreen(
             )
             Text(lang.t("视频生成尝试 GPU 加速", "Try GPU for video generation"))
         }
-        Text(lang.t("视频设置只影响视频 VR 生成；图片仍使用上面的图片模型设置。", "Video settings only affect video VR generation; images use the image settings above."), style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("视频深度 worker 是独立模型会话数量；2 个 worker 可能更快，也会更占显存/内存。视频设置只影响视频 VR 生成。", "Video depth workers are independent model sessions. 2 workers may be faster but use more GPU memory/RAM. Video settings only affect video VR generation."), style = MaterialTheme.typography.bodySmall)
 
         Spacer(Modifier.height(12.dp))
         Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
@@ -5844,6 +5973,7 @@ private fun DebugScreen(
                     DebugLine("Force GPU", "${videoJob?.useGpu ?: state.settings.videoUseGpu}")
                     DebugLine("Runtime", videoJob?.runtimeInfo?.ifBlank { "-" } ?: "-")
                     DebugLine("Output", videoEntry?.outputPath ?: "-")
+                    DebugLine(lang.t("深度 worker", "Depth workers"), "${videoJob?.depthWorkers?.takeIf { it > 0 } ?: state.settings.videoDepthWorkers.coerceIn(1, 2)}")
                     DebugLine("Error", videoJob?.error ?: "-")
                 }
                 DebugSection(lang.t("视频生成日志", "Video log")) {
@@ -6576,7 +6706,7 @@ private fun VrGenerationParams.cacheVersion(): String {
 }
 
 private fun VideoGenerationParams.cacheVersion(): String {
-    return "${toVrParams().cacheVersion()}_$VIDEO_ENCODER_VERSION"
+    return "${toVrParams().cacheVersion()}_dw${depthWorkers.coerceIn(1, 2)}_$VIDEO_ENCODER_VERSION"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 
