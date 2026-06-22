@@ -2,14 +2,20 @@
 
 一个本地 Android 图库应用：按“全部 / 相册 / 生成”浏览系统图片和视频，并在手机本地生成平行眼 SBS VR 缓存。
 
+## v2.31 更新
+
+- 视频队列改为最多同时生成 1 个视频，其他视频保持“队列中”，避免两个视频同时生成导致整机卡顿。
+- 视频模型选择里新增 `Video Depth Anything Small（视频专用，待导入）` 条目。
+- `Video Depth Anything` 当前只作为待导入模型显示；手机端实际运行仍需要先提供 TFLite/ONNX/MNN/QNN 等移动端模型资产和 SHA-256。
+- 修复生成视频在生成页可能不显示缩略图的问题：私有缓存视频现在用 `MediaMetadataRetriever` 直接从文件抽封面。
+- 缩略图角标改为状态色：已生成绿色、失败红色、队列中/生成中/暂停黄色、原图/未生成白色，并缩小背景贴近文字。
+
 ## v2.30 更新
 
 - 视频生成新增“视频深度 worker 数”，默认 2 个独立深度模型会话，用于并行跑原始深度推理。
 - 视频流水线调整为：解码 -> 多 depth worker 原始深度 -> 按帧序时序平滑/后处理/SBS -> 编码。
 - 时序平滑仍严格按帧号顺序执行，避免多 worker 破坏连续帧稳定性。
 - 视频缓存版本升级到 `encoderV12`，并在缓存名里加入 `dw1/dw2`，避免不同 worker 设置混用旧结果。
-- 调试页和日志显示实际 depth worker 数，便于判断当前视频到底按 1 worker 还是 2 worker 生成。
-- README 修复为 UTF-8，避免 GitHub 页面出现乱码。
 
 ## 功能
 
@@ -31,17 +37,7 @@ SBS 39ms
 编码提交 17ms
 ```
 
-说明瓶颈主要在深度模型推理。v2.30 的 `视频深度 worker 数 = 2` 会尝试并行跑两个独立模型会话；如果显存或内存吃紧，可以在设置里降回 1。
-
-如果调试页显示：
-
-```text
-GPU requested true
-Force GPU true
-Runtime ... delegateActive=true
-```
-
-说明 TFLite GPU delegate 已启用。若生成失败，可以关闭 GPU 回到 CPU 路线。
+说明瓶颈主要在深度模型推理。`视频深度 worker 数 = 2` 会尝试并行跑两个独立模型会话；如果显存或内存吃紧，可以在设置里降回 1。
 
 ## 构建
 
@@ -69,7 +65,8 @@ APK 不内置 `depth_anything_v2.tflite`。首次生成 VR 前，App 会从 GitH
 
 - Android SDK / Jetpack Compose / AndroidX / Material3：App 框架和 UI。
 - TensorFlow Lite / TFLite GPU Delegate：本地深度模型推理。
-- Depth Anything V2：深度估计模型来源。
+- Depth Anything V2：当前图片/视频逐帧深度估计模型来源。
+- Video Depth Anything：视频时序一致性深度模型方向，当前作为待导入移动端模型选项。
 - SamSeenX/ComfyUI_SSStereoscope：SBS 生成思路参考，包括深度平滑、相对视差和边缘填充。
 
 更详细说明见 [NOTICE.md](NOTICE.md)。

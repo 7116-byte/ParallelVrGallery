@@ -348,9 +348,13 @@ data class ModelSpec(
     val url: String,
     val mirrors: List<String> = emptyList(),
     val sha256: String,
+    val downloadable: Boolean = true,
+    val videoOnly: Boolean = false,
+    val noteZh: String = "",
+    val noteEn: String = "",
 )
 
-private val AvailableModels = listOf(
+private val ImageModels = listOf(
     ModelSpec(
         id = "depth_anything_v2_small_tflite",
         displayName = "Depth Anything V2 Small TFLite 518（稳定）",
@@ -376,6 +380,23 @@ private val AvailableModels = listOf(
     ),
 )
 
+private val VideoModels = ImageModels + listOf(
+    ModelSpec(
+        id = "video_depth_anything_small_pending",
+        displayName = "Video Depth Anything Small（视频专用，待导入）",
+        inputSize = 518,
+        fileName = "video_depth_anything_small.tflite",
+        url = "",
+        sha256 = "",
+        downloadable = false,
+        videoOnly = true,
+        noteZh = "官方视频时序深度模型；当前需要先导出移动端 TFLite/ONNX/MNN/QNN 资产后才能在手机本地运行。",
+        noteEn = "Official temporally consistent video depth model. A mobile TFLite/ONNX/MNN/QNN asset is required before local Android inference.",
+    ),
+)
+
+private val AvailableModels = (ImageModels + VideoModels).distinctBy { it.id }
+
 private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
@@ -387,7 +408,7 @@ private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 }
 
-private fun modelSpec(id: String): ModelSpec = AvailableModels.firstOrNull { it.id == id } ?: AvailableModels.first()
+private fun modelSpec(id: String): ModelSpec = AvailableModels.firstOrNull { it.id == id } ?: ImageModels.first()
 
 data class CacheVersionSummary(
     val version: String,
@@ -928,7 +949,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.30"
+                    val current = "v2.31"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1549,7 +1570,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun startVideoWorkers() {
         videoWorkers.removeAll { !it.isActive }
-        repeat((3 - videoWorkers.size).coerceAtLeast(0)) {
+        repeat((1 - videoWorkers.size).coerceAtLeast(0)) {
             videoWorkers += AppWorkScopes.video.launch {
                 while (true) {
                     val next = synchronized(videoPending) { videoPending.poll() } ?: break
@@ -1937,6 +1958,24 @@ private fun VideoVrState.label(lang: AppLanguage): String = when (this) {
     VideoVrState.PAUSED -> lang.t("已暂停", "Paused")
     VideoVrState.READY -> lang.t("已生成", "Ready")
     VideoVrState.FAILED -> lang.t("失败", "Failed")
+}
+
+private fun statusBadgeBackground(text: String): androidx.compose.ui.graphics.Color = when {
+    text.contains("失败", ignoreCase = true) || text.contains("Failed", ignoreCase = true) ->
+        androidx.compose.ui.graphics.Color(0xffd32f2f)
+    text.contains("已生成", ignoreCase = true) || text.contains("Ready", ignoreCase = true) ->
+        androidx.compose.ui.graphics.Color(0xff2e7d32)
+    text.contains("队列", ignoreCase = true) || text.contains("生成中", ignoreCase = true) ||
+        text.contains("暂停", ignoreCase = true) || text.contains("Queued", ignoreCase = true) ||
+        text.contains("Generating", ignoreCase = true) || text.contains("Paused", ignoreCase = true) ->
+        androidx.compose.ui.graphics.Color(0xfff9a825)
+    else -> androidx.compose.ui.graphics.Color(0xeeffffff)
+}
+
+private fun statusBadgeTextColor(text: String): androidx.compose.ui.graphics.Color = when (statusBadgeBackground(text)) {
+    androidx.compose.ui.graphics.Color(0xeeffffff),
+    androidx.compose.ui.graphics.Color(0xfff9a825) -> androidx.compose.ui.graphics.Color(0xff161616)
+    else -> androidx.compose.ui.graphics.Color.White
 }
 
 private fun imageSideCount(state: UiState, index: Int, offsetStep: Int, states: Set<VrState>): Int {
@@ -2902,6 +2941,7 @@ private class ModelManager(private val context: Context) {
 
     fun statusText(modelId: String = AvailableModels.first().id): String {
         val spec = modelSpec(modelId)
+        if (!spec.downloadable) return "模型待导入 / Model asset required"
         val modelFile = File(modelsDir, spec.fileName)
         return if (modelFile.exists()) {
             "模型已就绪 / Model ready"
@@ -2912,6 +2952,9 @@ private class ModelManager(private val context: Context) {
 
     fun ensureModel(modelId: String, onProgress: (Float) -> Unit): File {
         val spec = modelSpec(modelId)
+        if (!spec.downloadable) {
+            error("${spec.displayName} 需要先导入移动端模型资产 / Mobile model asset required")
+        }
         val modelFile = File(modelsDir, spec.fileName)
         if (modelFile.exists() && modelFile.sha256().equals(spec.sha256, ignoreCase = true)) {
             onProgress(1f)
@@ -5156,18 +5199,34 @@ private fun PhotoTile(
                 modifier = Modifier.align(Alignment.TopEnd).background(androidx.compose.ui.graphics.Color(0xcc111315)).padding(horizontal = 8.dp, vertical = 2.dp),
             )
         }
-        Text(
+        StatusBadge(
             text = statusText,
-            color = androidx.compose.ui.graphics.Color.White,
             fontSize = labelSize,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .background(androidx.compose.ui.graphics.Color(0xaa000000), RoundedCornerShape(3.dp))
-                .padding(horizontal = labelPaddingH, vertical = labelPaddingV),
+            modifier = Modifier.align(Alignment.BottomStart),
+            horizontalPadding = labelPaddingH,
+            verticalPadding = labelPaddingV,
         )
     }
+}
+
+@Composable
+private fun StatusBadge(
+    text: String,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+    modifier: Modifier = Modifier,
+    horizontalPadding: androidx.compose.ui.unit.Dp = 5.dp,
+    verticalPadding: androidx.compose.ui.unit.Dp = 2.dp,
+) {
+    Text(
+        text = text,
+        color = statusBadgeTextColor(text),
+        fontSize = fontSize,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        modifier = modifier
+            .background(statusBadgeBackground(text), RoundedCornerShape(3.dp))
+            .padding(horizontal = horizontalPadding, vertical = verticalPadding),
+    )
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -5279,13 +5338,12 @@ private fun ManageScreen(
                                 ) {
                                     AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
                                     if (item.cacheKey in selectedVideoKeys) SelectionBadge()
-                                    Text(
+                                    StatusBadge(
                                         text = "${videoState.label(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}%  当前${job?.currentFrameMs ?: 0}ms 平均${job?.avgFrameMs ?: 0}ms",
-                                        color = androidx.compose.ui.graphics.Color.White,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        maxLines = 2,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.align(Alignment.BottomStart).background(androidx.compose.ui.graphics.Color(0x99000000)).padding(5.dp),
+                                        fontSize = (12 - columnFontReduction(state.generatedColumns)).coerceAtLeast(8).sp,
+                                        modifier = Modifier.align(Alignment.BottomStart),
+                                        horizontalPadding = 4.dp,
+                                        verticalPadding = 2.dp,
                                     )
                                 }
                             }
@@ -5531,6 +5589,7 @@ private fun SettingsScreen(
             title = lang.t("图片模型选择", "Image model"),
             selectedModelId = settings.imageModelId,
             lang = lang,
+            models = ImageModels,
             onSelect = { spec -> onChange(settings.copy(imageModelId = spec.id, depthResolution = spec.inputSize)) },
         )
         Text(lang.t("实验模型首次使用会单独下载；如果模型输入输出不兼容，会在日志里显示失败原因。", "Experimental models download separately on first use. Shape incompatibility is reported in logs."), style = MaterialTheme.typography.bodySmall)
@@ -5586,6 +5645,7 @@ private fun SettingsScreen(
             title = lang.t("视频模型选择", "Video model"),
             selectedModelId = settings.videoModelId,
             lang = lang,
+            models = VideoModels,
             onSelect = { spec -> onChange(settings.copy(videoModelId = spec.id)) },
         )
         SettingInt(lang.t("视频模型 CPU 线程", "Video model CPU threads"), settings.videoModelThreads, listOf(1, 2, 4, 8)) {
@@ -5656,15 +5716,23 @@ private fun ModelPicker(
     title: String,
     selectedModelId: String,
     lang: AppLanguage,
+    models: List<ModelSpec>,
     onSelect: (ModelSpec) -> Unit,
 ) {
     Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
     Spacer(Modifier.height(6.dp))
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        AvailableModels.forEach { spec ->
+        models.forEach { spec ->
             val selected = selectedModelId == spec.id
             val buttonModifier = Modifier.fillMaxWidth()
-            if (selected) {
+            if (!spec.downloadable) {
+                OutlinedButton(onClick = {}, enabled = false, modifier = buttonModifier) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text(lang.t(spec.noteZh, spec.noteEn), style = MaterialTheme.typography.labelSmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            } else if (selected) {
                 Button(onClick = { onSelect(spec) }, modifier = buttonModifier) {
                     Text(spec.displayName, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 }
@@ -5676,7 +5744,7 @@ private fun ModelPicker(
         }
     }
     Text(
-        lang.t("当前选择会在首次生成前自动下载。", "The selected model downloads automatically before first generation."),
+        lang.t("可用模型会在首次生成前自动下载；待导入模型需要先提供移动端资产和 SHA-256。", "Available models download automatically before first generation. Pending models need a mobile asset and SHA-256 first."),
         style = MaterialTheme.typography.bodySmall,
     )
     Spacer(Modifier.height(10.dp))
@@ -6256,7 +6324,15 @@ private fun AsyncMediaThumbnail(kind: MediaKind, uri: Uri, maxSide: Int, content
     LaunchedEffect(uri, maxSide) {
         bitmap = withContext(Dispatchers.IO) {
             runCatching {
-                if (Build.VERSION.SDK_INT >= 29) {
+                if (uri.scheme == "file" && kind == MediaKind.VIDEO) {
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(requireNotNull(uri.path) { "Missing video file path" })
+                        retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    } finally {
+                        retriever.release()
+                    }
+                } else if (Build.VERSION.SDK_INT >= 29) {
                     context.contentResolver.loadThumbnail(uri, Size(safeSide, safeSide), null)
                 } else if (kind == MediaKind.IMAGE) {
                     decodeScaledBitmap(context, uri, safeSide)
