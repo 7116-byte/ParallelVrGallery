@@ -2,6 +2,14 @@
 
 一个本地 Android 图库应用：按“全部 / 相册 / 生成”浏览系统图片和视频，并在手机本地生成平行眼 SBS VR 缓存。
 
+## v2.26 更新
+
+- 恢复 GPU 加速尝试：不再只试一种 TFLite GPU 配置，而是依次尝试 `accurate-unset / accurate-opengl / accurate-opencl / best`。
+- 默认先用禁止精度损失的 GPU 精确模式，目标是保留 GPU 速度，同时避免深度输出全黑或语义错乱。
+- GPU 输出异常时先切换下一个 GPU 模式，所有 GPU 模式都失败后才回退 CPU。
+- 调试日志会显示 `gpuMode`、`tflite gpu recovered mode=...`，用于判断哪种 GPU 后端真正可用。
+- 图片缓存版本升级到 `depthV4`，视频缓存版本升级到 `encoderV8`，隔离旧 CPU 回退缓存。
+
 ## v2.25 更新
 
 - GPU 深度增加可信度校验：第一次 GPU 推理会和 CPU 参考深度做相似度对比。

@@ -154,6 +154,7 @@ import kotlinx.coroutines.withContext
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.gpu.GpuDelegateFactory
 import java.io.File
 import java.io.Closeable
 import java.io.FileInputStream
@@ -359,8 +360,8 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
-private const val IMAGE_GENERATOR_VERSION = "depthV3"
-private const val VIDEO_ENCODER_VERSION = "encoderV7"
+private const val IMAGE_GENERATOR_VERSION = "depthV4"
+private const val VIDEO_ENCODER_VERSION = "encoderV8"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -898,7 +899,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.25"
+                    val current = "v2.26"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3240,6 +3241,13 @@ private data class DepthCompareResult(
     val correlation: Float,
 )
 
+private enum class GpuMode {
+    ACCURATE_UNSET,
+    ACCURATE_OPENGL,
+    ACCURATE_OPENCL,
+    BEST_COMPAT,
+}
+
 class DepthModelSession(
     modelFile: File,
     private val modelThreads: Int,
@@ -3252,51 +3260,29 @@ class DepthModelSession(
     private var interpreter: Interpreter
     private var delegateActive = false
     private var gpuValidated = false
+    private var activeGpuMode: GpuMode? = null
     private val threadCount = modelThreads.coerceIn(1, 8)
     private val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
     private val pixels = IntArray(inputSize * inputSize)
     private val output = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 4).order(ByteOrder.nativeOrder())
 
     init {
-        val options = Interpreter.Options().setNumThreads(threadCount)
         val gpuDiagnostics = mutableListOf<String>()
         gpuDiagnostics += "device=${Build.MANUFACTURER}/${Build.MODEL} sdk=${Build.VERSION.SDK_INT}"
         if (!useGpu) {
             gpuDiagnostics += "gpu=disabled"
+            interpreter = Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
         } else {
-            var compatibility: CompatibilityList? = null
-            val compatibilityResult = runCatching {
-                CompatibilityList().also { compatibility = it }
-            }
-            val compatible = compatibilityResult.getOrNull()?.isDelegateSupportedOnThisDevice
+            val compatibilityResult = runCatching { CompatibilityList() }
+            val compatibility = compatibilityResult.getOrNull()
+            val compatible = compatibility?.isDelegateSupportedOnThisDevice
             gpuDiagnostics += "compat=${compatible ?: "unknown"}"
-            compatibilityResult.exceptionOrNull()?.let { error ->
-                gpuDiagnostics += "compatError=${error.shortMessage()}"
-            }
-            runCatching {
-                val delegateOptions = if (compatible == true) compatibility?.bestOptionsForThisDevice else null
-                gpuDelegate = if (delegateOptions != null) GpuDelegate(delegateOptions) else GpuDelegate()
-                options.addDelegate(gpuDelegate)
-                gpuDiagnostics += "delegateCreate=ok"
-            }.onFailure { error ->
-                gpuDiagnostics += "delegateCreate=failed:${error.shortMessage()}"
-                gpuDelegate?.close()
-                gpuDelegate = null
-            }.also {
-                runCatching { compatibility?.close() }
-            }
+            compatibilityResult.exceptionOrNull()?.let { error -> gpuDiagnostics += "compatError=${error.shortMessage()}" }
+            interpreter = createFirstGpuInterpreter(compatibility, gpuDiagnostics)
+                ?: Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
+            runCatching { compatibility?.close() }
         }
-        interpreter = runCatching { Interpreter(model, options) }.onSuccess {
-            delegateActive = gpuDelegate != null
-            gpuDiagnostics += "interpreterCreate=ok"
-        }.getOrElse { error ->
-            gpuDiagnostics += "interpreterCreate=failed:${error.shortMessage()}"
-            gpuDelegate?.close()
-            gpuDelegate = null
-            onRuntimeInfo("tflite gpu delegate fallback: ${error.shortMessage()}")
-            Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
-        }
-        onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=$delegateActive reusedSession=true ${gpuDiagnostics.joinToString(" ")}")
+        onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=$delegateActive gpuMode=${activeGpuMode ?: "CPU"} reusedSession=true ${gpuDiagnostics.joinToString(" ")}")
     }
 
     @Synchronized
@@ -3313,34 +3299,129 @@ class DepthModelSession(
         input.rewind()
         var normalized = runInterpreterAndRead()
         if ((!normalized.range.isFinite() || normalized.range <= 0.0001f) && useGpu && delegateActive) {
-            onRuntimeInfo("tflite gpu output flat range=${normalized.range}; fallback cpu threads=$threadCount")
-            runCatching { interpreter.close() }
-            gpuDelegate?.close()
-            gpuDelegate = null
-            delegateActive = false
-            interpreter = Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
-            input.rewind()
-            normalized = runInterpreterAndRead()
-            onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=flatOutput cpuRange=${normalized.range}")
+            onRuntimeInfo("tflite gpu output flat range=${normalized.range}; trying next gpu mode")
+            normalized = tryRecoverGpu(null, reason = "flatOutput") ?: fallbackToCpu("flatOutput").also { normalized = it }
         }
         if (useGpu && delegateActive && !gpuValidated) {
             val cpuReference = runCpuReferenceAndRead()
             val quality = compareDepthMaps(normalized.values, cpuReference.values)
             if (quality.meanAbs > 0.18f || quality.correlation < 0.65f) {
-                onRuntimeInfo("tflite gpu validation failed meanAbs=${quality.meanAbs.format3()} corr=${quality.correlation.format3()}; fallback cpu threads=$threadCount")
-                runCatching { interpreter.close() }
-                gpuDelegate?.close()
-                gpuDelegate = null
-                delegateActive = false
-                interpreter = Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
-                normalized = cpuReference
-                onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=validation cpuRange=${normalized.range}")
+                onRuntimeInfo("tflite gpu validation failed mode=$activeGpuMode meanAbs=${quality.meanAbs.format3()} corr=${quality.correlation.format3()}; trying next gpu mode")
+                normalized = tryRecoverGpu(cpuReference, reason = "validation") ?: fallbackToCpu("validation", cpuReference)
             } else {
-                onRuntimeInfo("tflite gpu validation ok meanAbs=${quality.meanAbs.format3()} corr=${quality.correlation.format3()}")
+                onRuntimeInfo("tflite gpu validation ok mode=$activeGpuMode meanAbs=${quality.meanAbs.format3()} corr=${quality.correlation.format3()}")
             }
             gpuValidated = true
         }
         return normalized.values
+    }
+
+    private fun createFirstGpuInterpreter(compatibility: CompatibilityList?, diagnostics: MutableList<String>): Interpreter? {
+        for (mode in GpuMode.entries) {
+            val created = runCatching { createGpuInterpreter(mode, compatibility) }
+            created.onSuccess {
+                diagnostics += "gpuMode=$mode"
+                diagnostics += "interpreterCreate=ok"
+                return it
+            }.onFailure { error ->
+                diagnostics += "gpuMode=$mode failed:${error.shortMessage()}"
+            }
+        }
+        gpuDelegate?.close()
+        gpuDelegate = null
+        delegateActive = false
+        activeGpuMode = null
+        diagnostics += "gpuAllModesFailed"
+        return null
+    }
+
+    private fun createGpuInterpreter(mode: GpuMode, compatibility: CompatibilityList?): Interpreter {
+        runCatching { interpreter.close() }
+        gpuDelegate?.close()
+        gpuDelegate = null
+        val options = Interpreter.Options().setNumThreads(threadCount)
+        val delegateOptions = gpuOptions(mode, compatibility)
+        val delegate = GpuDelegate(delegateOptions)
+        options.addDelegate(delegate)
+        val gpuInterpreter = runCatching {
+            Interpreter(model, options)
+        }.getOrElse { error ->
+            delegate.close()
+            throw error
+        }
+        gpuDelegate = delegate
+        delegateActive = true
+        activeGpuMode = mode
+        return gpuInterpreter
+    }
+
+    private fun gpuOptions(mode: GpuMode, compatibility: CompatibilityList?): GpuDelegate.Options {
+        val options = when (mode) {
+            GpuMode.BEST_COMPAT -> compatibility?.bestOptionsForThisDevice ?: GpuDelegate.Options()
+            else -> GpuDelegate.Options()
+        }
+        when (mode) {
+            GpuMode.ACCURATE_UNSET -> {
+                options.setPrecisionLossAllowed(false)
+                options.setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+            }
+            GpuMode.ACCURATE_OPENGL -> {
+                options.setPrecisionLossAllowed(false)
+                options.setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+                options.setForceBackend(GpuDelegateFactory.Options.GpuBackend.OPENGL)
+            }
+            GpuMode.ACCURATE_OPENCL -> {
+                options.setPrecisionLossAllowed(false)
+                options.setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+                options.setForceBackend(GpuDelegateFactory.Options.GpuBackend.OPENCL)
+            }
+            GpuMode.BEST_COMPAT -> Unit
+        }
+        return options
+    }
+
+    private fun tryRecoverGpu(cpuReference: DepthRunResult?, reason: String): DepthRunResult? {
+        val start = activeGpuMode?.let { GpuMode.entries.indexOf(it) } ?: -1
+        for (mode in GpuMode.entries.drop(start + 1)) {
+            val created = runCatching { createGpuInterpreter(mode, null) }
+            if (created.isFailure) {
+                onRuntimeInfo("tflite gpu mode=$mode create failed after $reason: ${created.exceptionOrNull()?.shortMessage()}")
+                continue
+            }
+            input.rewind()
+            val result = runInterpreterAndRead()
+            if (!result.range.isFinite() || result.range <= 0.0001f) {
+                onRuntimeInfo("tflite gpu mode=$mode flat after $reason range=${result.range}")
+                continue
+            }
+            if (cpuReference != null) {
+                val quality = compareDepthMaps(result.values, cpuReference.values)
+                if (quality.meanAbs > 0.18f || quality.correlation < 0.65f) {
+                    onRuntimeInfo("tflite gpu mode=$mode validation failed meanAbs=${quality.meanAbs.format3()} corr=${quality.correlation.format3()}")
+                    continue
+                }
+                onRuntimeInfo("tflite gpu recovered mode=$mode after $reason meanAbs=${quality.meanAbs.format3()} corr=${quality.correlation.format3()} range=${result.range}")
+            } else {
+                onRuntimeInfo("tflite gpu recovered mode=$mode after $reason range=${result.range}")
+            }
+            gpuValidated = cpuReference != null
+            return result
+        }
+        return null
+    }
+
+    private fun fallbackToCpu(reason: String, reference: DepthRunResult? = null): DepthRunResult {
+        onRuntimeInfo("tflite gpu fallback cpu reason=$reason threads=$threadCount")
+        runCatching { interpreter.close() }
+        gpuDelegate?.close()
+        gpuDelegate = null
+        delegateActive = false
+        activeGpuMode = null
+        interpreter = Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
+        input.rewind()
+        val result = reference ?: runInterpreterAndRead()
+        onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false gpuMode=CPU reusedSession=true gpuFallback=$reason cpuRange=${result.range}")
+        return result
     }
 
     private fun runInterpreterAndRead(): DepthRunResult {
