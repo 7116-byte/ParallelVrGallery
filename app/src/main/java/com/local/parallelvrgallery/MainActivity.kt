@@ -267,7 +267,7 @@ data class VrGenerationParams(
     val maxLongEdge: Int = 6000,
     val modelThreads: Int = 4,
     val useGpu: Boolean = false,
-    val gpuTestMode: GpuTestMode = GpuTestMode.AUTO,
+    val gpuTestMode: GpuTestMode = GpuTestMode.ACCURATE_UNSET,
     val forceGpuNoFallback: Boolean = false,
     val inpaintMode: String = "FOREGROUND_FILL",
     val quality: Int = 94,
@@ -278,7 +278,7 @@ data class VideoGenerationParams(
     val modelThreads: Int = 4,
     val useGpu: Boolean = false,
 ) {
-    fun toVrParams(): VrGenerationParams = vr.copy(modelThreads = modelThreads, useGpu = useGpu)
+    fun toVrParams(): VrGenerationParams = vr.copy(modelThreads = modelThreads, useGpu = useGpu, forceGpuNoFallback = useGpu)
 }
 
 enum class AppLanguage {
@@ -310,7 +310,7 @@ data class AppSettings(
     val modelThreads: Int = 4,
     val useGpu: Boolean = false,
     val gpuTestMode: GpuTestMode = GpuTestMode.AUTO,
-    val forceGpuNoFallback: Boolean = false,
+    val forceGpuNoFallback: Boolean = true,
     val videoModelThreads: Int = 4,
     val videoUseGpu: Boolean = false,
 ) {
@@ -324,11 +324,11 @@ data class AppSettings(
         modelThreads = modelThreads,
         useGpu = useGpu,
         gpuTestMode = gpuTestMode,
-        forceGpuNoFallback = forceGpuNoFallback,
+        forceGpuNoFallback = useGpu,
     )
 
     fun toVideoParams(): VideoGenerationParams = VideoGenerationParams(
-        vr = toParams().copy(depthModel = videoModelId),
+        vr = toParams().copy(depthModel = videoModelId, useGpu = videoUseGpu, forceGpuNoFallback = videoUseGpu),
         modelThreads = videoModelThreads,
         useGpu = videoUseGpu,
     )
@@ -374,8 +374,8 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
-private const val IMAGE_GENERATOR_VERSION = "depthV5"
-private const val VIDEO_ENCODER_VERSION = "encoderV9"
+private const val IMAGE_GENERATOR_VERSION = "depthV6"
+private const val VIDEO_ENCODER_VERSION = "encoderV10"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -913,7 +913,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.27"
+                    val current = "v2.28"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -2105,8 +2105,8 @@ private class SettingsStore(context: Context) {
             generationWorkers = prefs.getInt("generationWorkers", 1),
             modelThreads = prefs.getInt("modelThreads", 4),
             useGpu = prefs.getBoolean("useGpu", false),
-            gpuTestMode = runCatching { GpuTestMode.valueOf(prefs.getString("gpuTestMode", GpuTestMode.AUTO.name) ?: GpuTestMode.AUTO.name) }.getOrDefault(GpuTestMode.AUTO),
-            forceGpuNoFallback = prefs.getBoolean("forceGpuNoFallback", false),
+            gpuTestMode = runCatching { GpuTestMode.valueOf(prefs.getString("gpuTestMode", GpuTestMode.ACCURATE_UNSET.name) ?: GpuTestMode.ACCURATE_UNSET.name) }.getOrDefault(GpuTestMode.ACCURATE_UNSET),
+            forceGpuNoFallback = true,
             videoModelThreads = prefs.getInt("videoModelThreads", 4),
             videoUseGpu = prefs.getBoolean("videoUseGpu", false),
         )
@@ -2130,7 +2130,7 @@ private class SettingsStore(context: Context) {
             .putInt("modelThreads", settings.modelThreads)
             .putBoolean("useGpu", settings.useGpu)
             .putString("gpuTestMode", settings.gpuTestMode.name)
-            .putBoolean("forceGpuNoFallback", settings.forceGpuNoFallback)
+            .putBoolean("forceGpuNoFallback", true)
             .putInt("videoModelThreads", settings.videoModelThreads)
             .putBoolean("videoUseGpu", settings.videoUseGpu)
             .apply()
@@ -2478,7 +2478,7 @@ private class VideoQueueTagStore(context: Context) {
                     modelThreads = parts[9].toInt(),
                     useGpu = parts[10].toBooleanStrictOrNull() ?: false,
                     gpuTestMode = parts.getOrNull(11)?.let { runCatching { GpuTestMode.valueOf(it) }.getOrNull() } ?: GpuTestMode.AUTO,
-                    forceGpuNoFallback = parts.getOrNull(12)?.toBooleanStrictOrNull() ?: false,
+                    forceGpuNoFallback = parts[10].toBooleanStrictOrNull() ?: false,
                     inpaintMode = parts[7],
                     quality = parts[8].toInt(),
                 ),
@@ -5307,23 +5307,16 @@ private fun SettingsScreen(
             )
             Text(lang.t("尝试 GPU 加速", "Try GPU acceleration"))
         }
-        Text(lang.t("GPU 后端测试模式", "GPU backend test mode"), fontWeight = FontWeight.Bold)
+        Text(lang.t("GPU 加速模式选择", "GPU acceleration mode"), fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(6.dp))
         GpuModePicker(settings.gpuTestMode, lang) {
             onChange(settings.copy(gpuTestMode = it))
         }
         Spacer(Modifier.height(6.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.forceGpuNoFallback,
-                onCheckedChange = { onChange(settings.copy(forceGpuNoFallback = it)) },
-            )
-            Text(lang.t("强制 GPU，不回退 CPU", "Force GPU, no CPU fallback"))
-        }
         Text(
             lang.t(
-                "强制模式用于测试：GPU 输出错误也会继续生成或失败，不会偷偷切 CPU；日志会显示 gpuMode、range 和错误。",
-                "Force mode is for testing: bad GPU output still generates or fails without CPU fallback. Logs show gpuMode, range, and errors.",
+                "开启 GPU 后会强制使用所选 GPU 模式；失败或输出异常不会偷偷切 CPU。关闭 GPU 才会恢复 CPU。",
+                "When GPU is enabled, the selected GPU mode is forced. Failures or bad output will not silently fall back to CPU. Disable GPU to use CPU.",
             ),
             style = MaterialTheme.typography.bodySmall,
         )
@@ -5710,7 +5703,7 @@ private fun DebugScreen(
                     DebugLine("Threads", "${videoJob?.modelThreads ?: state.settings.videoModelThreads}")
                     DebugLine("GPU requested", "${videoJob?.useGpu ?: state.settings.videoUseGpu}")
                     DebugLine("GPU mode", state.settings.gpuTestMode.name)
-                    DebugLine("Force GPU", "${state.settings.forceGpuNoFallback}")
+                    DebugLine("Force GPU", "${videoJob?.useGpu ?: state.settings.videoUseGpu}")
                     DebugLine("Runtime", videoJob?.runtimeInfo?.ifBlank { "-" } ?: "-")
                     DebugLine("Output", videoEntry?.outputPath ?: "-")
                     DebugLine("Error", videoJob?.error ?: "-")
@@ -5730,7 +5723,7 @@ private fun DebugScreen(
                     DebugLine("Threads", "${state.settings.modelThreads}")
                     DebugLine("GPU requested", "${state.settings.useGpu}")
                     DebugLine("GPU mode", state.settings.gpuTestMode.name)
-                    DebugLine("Force GPU", "${state.settings.forceGpuNoFallback}")
+                    DebugLine("Force GPU", "${state.settings.useGpu}")
                     DebugLine("Error", job?.error ?: "-")
                 }
                 DebugSection(lang.t("性能诊断", "Performance")) {
