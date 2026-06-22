@@ -359,8 +359,8 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
-private const val IMAGE_GENERATOR_VERSION = "depthV2"
-private const val VIDEO_ENCODER_VERSION = "encoderV6"
+private const val IMAGE_GENERATOR_VERSION = "depthV3"
+private const val VIDEO_ENCODER_VERSION = "encoderV7"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -898,7 +898,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.24"
+                    val current = "v2.25"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3235,6 +3235,11 @@ private data class DepthRunResult(
     val range: Float,
 )
 
+private data class DepthCompareResult(
+    val meanAbs: Float,
+    val correlation: Float,
+)
+
 class DepthModelSession(
     modelFile: File,
     private val modelThreads: Int,
@@ -3246,6 +3251,7 @@ class DepthModelSession(
     private var gpuDelegate: GpuDelegate? = null
     private var interpreter: Interpreter
     private var delegateActive = false
+    private var gpuValidated = false
     private val threadCount = modelThreads.coerceIn(1, 8)
     private val input = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
     private val pixels = IntArray(inputSize * inputSize)
@@ -3317,6 +3323,23 @@ class DepthModelSession(
             normalized = runInterpreterAndRead()
             onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=flatOutput cpuRange=${normalized.range}")
         }
+        if (useGpu && delegateActive && !gpuValidated) {
+            val cpuReference = runCpuReferenceAndRead()
+            val quality = compareDepthMaps(normalized.values, cpuReference.values)
+            if (quality.meanAbs > 0.18f || quality.correlation < 0.65f) {
+                onRuntimeInfo("tflite gpu validation failed meanAbs=${quality.meanAbs.format3()} corr=${quality.correlation.format3()}; fallback cpu threads=$threadCount")
+                runCatching { interpreter.close() }
+                gpuDelegate?.close()
+                gpuDelegate = null
+                delegateActive = false
+                interpreter = Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
+                normalized = cpuReference
+                onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=validation cpuRange=${normalized.range}")
+            } else {
+                onRuntimeInfo("tflite gpu validation ok meanAbs=${quality.meanAbs.format3()} corr=${quality.correlation.format3()}")
+            }
+            gpuValidated = true
+        }
         return normalized.values
     }
 
@@ -3337,12 +3360,29 @@ class DepthModelSession(
             interpreter.run(input, output)
             onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=runFailure")
         }
+        return readDepthOutput(output)
+    }
+
+    private fun runCpuReferenceAndRead(): DepthRunResult {
+        val cpuOutput = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 4).order(ByteOrder.nativeOrder())
+        val cpu = Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
+        return try {
+            input.rewind()
+            cpuOutput.clear()
+            cpu.run(input, cpuOutput)
+            readDepthOutput(cpuOutput)
+        } finally {
+            runCatching { cpu.close() }
+        }
+    }
+
+    private fun readDepthOutput(buffer: ByteBuffer): DepthRunResult {
         val flat = FloatArray(inputSize * inputSize)
         var minValue = Float.MAX_VALUE
         var maxValue = -Float.MAX_VALUE
-        output.rewind()
+        buffer.rewind()
         for (i in flat.indices) {
-            val value = output.getFloat().takeIf { it.isFinite() } ?: 0f
+            val value = buffer.getFloat().takeIf { it.isFinite() } ?: 0f
             flat[i] = value
             minValue = min(minValue, value)
             maxValue = max(maxValue, value)
@@ -3353,6 +3393,38 @@ class DepthModelSession(
             flat[i] = (flat[i] - minValue) / range
         }
         return DepthRunResult(flat, rawRange)
+    }
+
+    private fun compareDepthMaps(a: FloatArray, b: FloatArray): DepthCompareResult {
+        var count = 0
+        var absSum = 0f
+        var sumA = 0f
+        var sumB = 0f
+        var sumAA = 0f
+        var sumBB = 0f
+        var sumAB = 0f
+        var i = 0
+        val step = 8
+        while (i < a.size && i < b.size) {
+            val av = a[i]
+            val bv = b[i]
+            absSum += abs(av - bv)
+            sumA += av
+            sumB += bv
+            sumAA += av * av
+            sumBB += bv * bv
+            sumAB += av * bv
+            count++
+            i += step
+        }
+        if (count == 0) return DepthCompareResult(1f, 0f)
+        val meanAbs = absSum / count.toFloat()
+        val numerator = sumAB - (sumA * sumB / count.toFloat())
+        val denomA = sumAA - (sumA * sumA / count.toFloat())
+        val denomB = sumBB - (sumB * sumB / count.toFloat())
+        val denominator = sqrt(max(0f, denomA) * max(0f, denomB))
+        val correlation = if (denominator > 0.000001f) numerator / denominator else 0f
+        return DepthCompareResult(meanAbs, correlation)
     }
 
     override fun close() {
@@ -6200,6 +6272,8 @@ private fun Throwable.shortMessage(): String {
     val message = message?.replace('\n', ' ')?.replace('\r', ' ')?.take(180)
     return if (message.isNullOrBlank()) type else "$type:$message"
 }
+
+private fun Float.format3(): String = "%.3f".format(Locale.US, this)
 
 private fun File.sha256(): String {
     val digest = MessageDigest.getInstance("SHA-256")
