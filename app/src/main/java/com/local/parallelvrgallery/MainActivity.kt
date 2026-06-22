@@ -359,7 +359,7 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
-private const val VIDEO_ENCODER_VERSION = "encoderV4"
+private const val VIDEO_ENCODER_VERSION = "encoderV5"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -591,6 +591,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (_uiState.value.hasPermission) {
             loadPhotos()
         }
+    }
+
+    override fun onCleared() {
+        generator.close()
+        super.onCleared()
     }
 
     fun onPermissionChanged(imageGranted: Boolean, videoGranted: Boolean, notificationGranted: Boolean) {
@@ -892,7 +897,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.22"
+                    val current = "v2.23"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -2914,7 +2919,10 @@ private class VrGenerator(
     private val context: Context,
     private val cache: VrCacheManager,
     private val modelManager: ModelManager,
-) {
+) : Closeable {
+    private val imageSessionLock = Any()
+    private val imageSessions = linkedMapOf<String, DepthModelSession>()
+
     fun generate(
         photo: PhotoItem,
         params: VrGenerationParams,
@@ -2931,8 +2939,10 @@ private class VrGenerator(
         }
 
         mark("start name=${photo.displayName} size=${photo.size} modified=${photo.modifiedTime}")
-        val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress)
-        mark("model ready path=${modelFile.absolutePath} sha256=${modelFile.sha256()}")
+        val depthSession = sharedImageDepthSession(params, onModelProgress) { runtime ->
+            mark(runtime)
+        }
+        mark("model session ready key=${imageSessionKey(params)}")
         onProgress(0.12f)
 
         val decodeMaxLongEdge = memorySafeMaxLongEdge(photo.width, photo.height, params.maxLongEdge)
@@ -2949,9 +2959,7 @@ private class VrGenerator(
         onProgress(0.25f)
 
         val depthStart = System.currentTimeMillis()
-        val rawDepth = runDepthModel(original, modelFile, params.modelThreads, params.useGpu) { runtime ->
-            mark(runtime)
-        }
+        val rawDepth = depthSession.run(original)
         val modelMs = System.currentTimeMillis() - depthStart
         mark("model inference ${modelMs}ms")
         val depthPostStart = System.currentTimeMillis()
@@ -3088,6 +3096,24 @@ private class VrGenerator(
         )
     }
 
+    private fun imageSessionKey(params: VrGenerationParams): String {
+        return "${params.depthModel}|threads=${params.modelThreads.coerceIn(1, 8)}|gpu=${params.useGpu}"
+    }
+
+    private fun sharedImageDepthSession(
+        params: VrGenerationParams,
+        onModelProgress: (Float) -> Unit,
+        onRuntimeInfo: (String) -> Unit,
+    ): DepthModelSession {
+        val key = imageSessionKey(params)
+        synchronized(imageSessionLock) {
+            imageSessions[key]?.let { return it }
+            val session = openDepthSession(params, onModelProgress, onRuntimeInfo)
+            imageSessions[key] = session
+            return session
+        }
+    }
+
     fun openDepthSession(
         params: VrGenerationParams,
         onModelProgress: (Float) -> Unit = {},
@@ -3121,6 +3147,13 @@ private class VrGenerator(
     ): FloatArray {
         return DepthModelSession(modelFile, modelThreads, useGpu, onRuntimeInfo ?: {}).use { session ->
             session.run(bitmap)
+        }
+    }
+
+    override fun close() {
+        synchronized(imageSessionLock) {
+            imageSessions.values.forEach { session -> runCatching { session.close() } }
+            imageSessions.clear()
         }
     }
 
@@ -3312,9 +3345,19 @@ data class VideoSbsResult(
     val timings: VideoFrameTimings,
 )
 
+private data class VideoFramePlan(
+    val durationMs: Long,
+    val fps: Int,
+    val totalFrames: Int,
+    val useFrameIndex: Boolean,
+    val metadataFrameCount: Int?,
+    val captureFps: Int?,
+)
+
 class DepthTemporalSmoother(
     private val previousWeight: Float = 0.62f,
     private val sceneCutThreshold: Float = 0.20f,
+    private val localMotionThreshold: Float = 0.08f,
 ) {
     private var previous: FloatArray? = null
 
@@ -3337,9 +3380,12 @@ class DepthTemporalSmoother(
             previous = current.copyOf()
             return current
         }
-        val currentWeight = 1f - previousWeight
         for (index in current.indices) {
-            current[index] = prev[index] * previousWeight + current[index] * currentWeight
+            val diff = abs(current[index] - prev[index])
+            val stableRatio = (1f - diff / localMotionThreshold).coerceIn(0f, 1f)
+            val localPreviousWeight = previousWeight * stableRatio * stableRatio
+            val localCurrentWeight = 1f - localPreviousWeight
+            current[index] = prev[index] * localPreviousWeight + current[index] * localCurrentWeight
         }
         previous = current.copyOf()
         return current
@@ -3375,16 +3421,17 @@ private class VideoVrGenerator(
 
         val retriever = MediaMetadataRetriever()
         retriever.setDataSource(context, item.uri)
-        val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()?.coerceAtLeast(1L) ?: 1L
-        val fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()?.roundToInt()?.coerceIn(1, 60) ?: 30
-        val totalFrames = ((durationMs / 1000f) * fps).roundToInt().coerceAtLeast(1)
-        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} useGpu=${vrParams.useGpu}")
+        val framePlan = buildFramePlan(retriever)
+        val durationMs = framePlan.durationMs
+        val fps = framePlan.fps
+        val totalFrames = framePlan.totalFrames
+        mark("start video=${item.displayName} durationMs=$durationMs fps=$fps frames=$totalFrames frameMode=${if (framePlan.useFrameIndex) "index" else "time"} metadataFrames=${framePlan.metadataFrameCount ?: "-"} captureFps=${framePlan.captureFps ?: "-"} version=$version model=${vrParams.depthModel} threads=${vrParams.modelThreads} useGpu=${vrParams.useGpu}")
 
         var width = 0
         var height = 0
         val temporalSmoother = DepthTemporalSmoother()
         frameGenerator.openDepthSession(vrParams, onModelProgress, onRuntimeInfo).use { depthSession ->
-            val first = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST) ?: error("Unable to decode first video frame")
+            val first = decodeVideoFrame(retriever, 0, framePlan) ?: error("Unable to decode first video frame")
             val firstFrameCache = File(framesDir, "frame_000000.jpg")
             val firstSource = first.copy(Bitmap.Config.ARGB_8888, false)
             val firstGenerated = frameGenerator.generateVideoSbsBitmap(firstSource, vrParams, depthSession, temporalSmoother).bitmap
@@ -3413,6 +3460,7 @@ private class VideoVrGenerator(
                 height = height,
                 fps = fps,
                 totalFrames = totalFrames,
+                framePlan = framePlan,
                 version = version,
                 params = vrParams,
                 depthSession = depthSession,
@@ -3431,6 +3479,9 @@ private class VideoVrGenerator(
                 "height=$height",
                 "durationMs=$durationMs",
                 "fps=$fps",
+                "frameMode=${if (framePlan.useFrameIndex) "index" else "time"}",
+                "metadataFrameCount=${framePlan.metadataFrameCount ?: 0}",
+                "captureFps=${framePlan.captureFps ?: 0}",
                 "source=${item.displayName}",
                 "depthModel=${vrParams.depthModel}",
                 "cacheVersion=$version",
@@ -3445,6 +3496,51 @@ private class VideoVrGenerator(
         return cache.findEntry(item) ?: error("Video output cache missing")
     }
 
+    private fun buildFramePlan(retriever: MediaMetadataRetriever): VideoFramePlan {
+        val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            ?.toLongOrNull()
+            ?.coerceAtLeast(1L)
+            ?: 1L
+        val captureFps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+            ?.toFloatOrNull()
+            ?.roundToInt()
+            ?.coerceIn(1, 60)
+        val metadataFrameCount = if (Build.VERSION.SDK_INT >= 28) {
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)
+                ?.toIntOrNull()
+                ?.takeIf { it > 0 }
+        } else {
+            null
+        }
+        val derivedFps = metadataFrameCount
+            ?.let { ((it * 1000f) / durationMs.toFloat()).roundToInt().coerceIn(1, 60) }
+        val fps = captureFps ?: derivedFps ?: 30
+        val totalFrames = metadataFrameCount ?: ((durationMs / 1000f) * fps).roundToInt().coerceAtLeast(1)
+        return VideoFramePlan(
+            durationMs = durationMs,
+            fps = fps,
+            totalFrames = totalFrames,
+            useFrameIndex = metadataFrameCount != null && Build.VERSION.SDK_INT >= 28,
+            metadataFrameCount = metadataFrameCount,
+            captureFps = captureFps,
+        )
+    }
+
+    private fun decodeVideoFrame(
+        retriever: MediaMetadataRetriever,
+        frame: Int,
+        plan: VideoFramePlan,
+    ): Bitmap? {
+        if (plan.useFrameIndex && Build.VERSION.SDK_INT >= 28) {
+            runCatching {
+                retriever.getFrameAtIndex(frame.coerceIn(0, plan.totalFrames - 1))
+            }.getOrNull()?.let { return it }
+        }
+        val timeUs = frame * 1_000_000L / plan.fps
+        return retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+            ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+    }
+
     private fun encodeVideo(
         item: GalleryItem,
         retriever: MediaMetadataRetriever,
@@ -3455,6 +3551,7 @@ private class VideoVrGenerator(
         height: Int,
         fps: Int,
         totalFrames: Int,
+        framePlan: VideoFramePlan,
         version: String,
         params: VrGenerationParams,
         depthSession: DepthModelSession,
@@ -3522,9 +3619,7 @@ private class VideoVrGenerator(
                 }
                 val started = SystemClock.uptimeMillis()
                 val decodeStart = SystemClock.uptimeMillis()
-                val timeUs = frame * 1_000_000L / fps
-                val bitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                    ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                val bitmap = decodeVideoFrame(retriever, frame, framePlan)
                     ?: return null
                 val decodeMs = SystemClock.uptimeMillis() - decodeStart
                 val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
