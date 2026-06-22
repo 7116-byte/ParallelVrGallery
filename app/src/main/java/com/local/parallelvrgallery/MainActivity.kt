@@ -359,7 +359,8 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
-private const val VIDEO_ENCODER_VERSION = "encoderV5"
+private const val IMAGE_GENERATOR_VERSION = "depthV2"
+private const val VIDEO_ENCODER_VERSION = "encoderV6"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -897,7 +898,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.23"
+                    val current = "v2.24"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -3229,6 +3230,11 @@ private class VrGenerator(
     }
 }
 
+private data class DepthRunResult(
+    val values: FloatArray,
+    val range: Float,
+)
+
 class DepthModelSession(
     modelFile: File,
     private val modelThreads: Int,
@@ -3299,6 +3305,22 @@ class DepthModelSession(
             input.putFloat(Color.blue(pixel) / 255f)
         }
         input.rewind()
+        var normalized = runInterpreterAndRead()
+        if ((!normalized.range.isFinite() || normalized.range <= 0.0001f) && useGpu && delegateActive) {
+            onRuntimeInfo("tflite gpu output flat range=${normalized.range}; fallback cpu threads=$threadCount")
+            runCatching { interpreter.close() }
+            gpuDelegate?.close()
+            gpuDelegate = null
+            delegateActive = false
+            interpreter = Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
+            input.rewind()
+            normalized = runInterpreterAndRead()
+            onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=flatOutput cpuRange=${normalized.range}")
+        }
+        return normalized.values
+    }
+
+    private fun runInterpreterAndRead(): DepthRunResult {
         output.clear()
         runCatching {
             interpreter.run(input, output)
@@ -3315,22 +3337,22 @@ class DepthModelSession(
             interpreter.run(input, output)
             onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=false reusedSession=true gpuFallback=runFailure")
         }
-
         val flat = FloatArray(inputSize * inputSize)
         var minValue = Float.MAX_VALUE
         var maxValue = -Float.MAX_VALUE
         output.rewind()
         for (i in flat.indices) {
-            val value = output.getFloat()
+            val value = output.getFloat().takeIf { it.isFinite() } ?: 0f
             flat[i] = value
             minValue = min(minValue, value)
             maxValue = max(maxValue, value)
         }
-        val range = max(0.0001f, maxValue - minValue)
+        val rawRange = maxValue - minValue
+        val range = if (rawRange.isFinite()) max(0.0001f, rawRange) else 0.0001f
         for (i in flat.indices) {
             flat[i] = (flat[i] - minValue) / range
         }
-        return flat
+        return DepthRunResult(flat, rawRange)
     }
 
     override fun close() {
@@ -3514,7 +3536,7 @@ private class VideoVrGenerator(
         }
         val derivedFps = metadataFrameCount
             ?.let { ((it * 1000f) / durationMs.toFloat()).roundToInt().coerceIn(1, 60) }
-        val fps = captureFps ?: derivedFps ?: 30
+        val fps = derivedFps ?: captureFps ?: 30
         val totalFrames = metadataFrameCount ?: ((durationMs / 1000f) * fps).roundToInt().coerceAtLeast(1)
         return VideoFramePlan(
             durationMs = durationMs,
@@ -6164,7 +6186,7 @@ private fun VrGenerationParams.cacheVersion(): String {
     val scale = depthScale.roundToInt()
     val invert = if (invertDepth) "inv1" else "inv0"
     val gpu = if (useGpu) "gpu1" else "gpu0"
-    return "${depthModel}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_$gpu"
+    return "${depthModel}_${IMAGE_GENERATOR_VERSION}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_$gpu"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 
