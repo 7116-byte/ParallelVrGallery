@@ -267,6 +267,8 @@ data class VrGenerationParams(
     val maxLongEdge: Int = 6000,
     val modelThreads: Int = 4,
     val useGpu: Boolean = false,
+    val gpuTestMode: GpuTestMode = GpuTestMode.AUTO,
+    val forceGpuNoFallback: Boolean = false,
     val inpaintMode: String = "FOREGROUND_FILL",
     val quality: Int = 94,
 )
@@ -284,6 +286,14 @@ enum class AppLanguage {
     EN,
 }
 
+enum class GpuTestMode {
+    AUTO,
+    ACCURATE_UNSET,
+    ACCURATE_OPENGL,
+    ACCURATE_OPENCL,
+    BEST_COMPAT,
+}
+
 data class AppSettings(
     val language: AppLanguage = AppLanguage.ZH,
     val imageModelId: String = "depth_anything_v2_small_tflite",
@@ -299,6 +309,8 @@ data class AppSettings(
     val generationWorkers: Int = 1,
     val modelThreads: Int = 4,
     val useGpu: Boolean = false,
+    val gpuTestMode: GpuTestMode = GpuTestMode.AUTO,
+    val forceGpuNoFallback: Boolean = false,
     val videoModelThreads: Int = 4,
     val videoUseGpu: Boolean = false,
 ) {
@@ -311,6 +323,8 @@ data class AppSettings(
         maxLongEdge = maxLongEdge,
         modelThreads = modelThreads,
         useGpu = useGpu,
+        gpuTestMode = gpuTestMode,
+        forceGpuNoFallback = forceGpuNoFallback,
     )
 
     fun toVideoParams(): VideoGenerationParams = VideoGenerationParams(
@@ -360,8 +374,8 @@ private const val GENERATED_VR_PREFIX = "PVG_VR_"
 private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
-private const val IMAGE_GENERATOR_VERSION = "depthV4"
-private const val VIDEO_ENCODER_VERSION = "encoderV8"
+private const val IMAGE_GENERATOR_VERSION = "depthV5"
+private const val VIDEO_ENCODER_VERSION = "encoderV9"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -899,7 +913,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.26"
+                    val current = "v2.27"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -2091,6 +2105,8 @@ private class SettingsStore(context: Context) {
             generationWorkers = prefs.getInt("generationWorkers", 1),
             modelThreads = prefs.getInt("modelThreads", 4),
             useGpu = prefs.getBoolean("useGpu", false),
+            gpuTestMode = runCatching { GpuTestMode.valueOf(prefs.getString("gpuTestMode", GpuTestMode.AUTO.name) ?: GpuTestMode.AUTO.name) }.getOrDefault(GpuTestMode.AUTO),
+            forceGpuNoFallback = prefs.getBoolean("forceGpuNoFallback", false),
             videoModelThreads = prefs.getInt("videoModelThreads", 4),
             videoUseGpu = prefs.getBoolean("videoUseGpu", false),
         )
@@ -2113,6 +2129,8 @@ private class SettingsStore(context: Context) {
             .putInt("generationWorkers", settings.generationWorkers)
             .putInt("modelThreads", settings.modelThreads)
             .putBoolean("useGpu", settings.useGpu)
+            .putString("gpuTestMode", settings.gpuTestMode.name)
+            .putBoolean("forceGpuNoFallback", settings.forceGpuNoFallback)
             .putInt("videoModelThreads", settings.videoModelThreads)
             .putBoolean("videoUseGpu", settings.videoUseGpu)
             .apply()
@@ -2438,6 +2456,8 @@ private class VideoQueueTagStore(context: Context) {
             vr.quality.toString(),
             modelThreads.toString(),
             useGpu.toString(),
+            vr.gpuTestMode.name,
+            vr.forceGpuNoFallback.toString(),
             cacheVersion(),
         ).joinToString(",") { it.replace(",", "_").replace('\t', '_').replace('\n', '_').replace('\r', '_') }
     }
@@ -2457,6 +2477,8 @@ private class VideoQueueTagStore(context: Context) {
                     maxLongEdge = parts[6].toInt(),
                     modelThreads = parts[9].toInt(),
                     useGpu = parts[10].toBooleanStrictOrNull() ?: false,
+                    gpuTestMode = parts.getOrNull(11)?.let { runCatching { GpuTestMode.valueOf(it) }.getOrNull() } ?: GpuTestMode.AUTO,
+                    forceGpuNoFallback = parts.getOrNull(12)?.toBooleanStrictOrNull() ?: false,
                     inpaintMode = parts[7],
                     quality = parts[8].toInt(),
                 ),
@@ -3099,7 +3121,7 @@ private class VrGenerator(
     }
 
     private fun imageSessionKey(params: VrGenerationParams): String {
-        return "${params.depthModel}|threads=${params.modelThreads.coerceIn(1, 8)}|gpu=${params.useGpu}"
+        return "${params.depthModel}|threads=${params.modelThreads.coerceIn(1, 8)}|gpu=${params.useGpu}|gpuMode=${params.gpuTestMode}|force=${params.forceGpuNoFallback}"
     }
 
     private fun sharedImageDepthSession(
@@ -3122,7 +3144,7 @@ private class VrGenerator(
         onRuntimeInfo: (String) -> Unit = {},
     ): DepthModelSession {
         val modelFile = modelManager.ensureModel(params.depthModel, onModelProgress)
-        return DepthModelSession(modelFile, params.modelThreads, params.useGpu, onRuntimeInfo)
+        return DepthModelSession(modelFile, params.modelThreads, params.useGpu, params.gpuTestMode, params.forceGpuNoFallback, onRuntimeInfo)
     }
 
     private fun memorySafeMaxLongEdge(width: Int, height: Int, requested: Int): Int {
@@ -3147,7 +3169,7 @@ private class VrGenerator(
         useGpu: Boolean,
         onRuntimeInfo: ((String) -> Unit)? = null,
     ): FloatArray {
-        return DepthModelSession(modelFile, modelThreads, useGpu, onRuntimeInfo ?: {}).use { session ->
+        return DepthModelSession(modelFile, modelThreads, useGpu, GpuTestMode.AUTO, false, onRuntimeInfo ?: {}).use { session ->
             session.run(bitmap)
         }
     }
@@ -3252,6 +3274,8 @@ class DepthModelSession(
     modelFile: File,
     private val modelThreads: Int,
     private val useGpu: Boolean,
+    private val gpuTestMode: GpuTestMode,
+    private val forceGpuNoFallback: Boolean,
     private val onRuntimeInfo: (String) -> Unit = {},
 ) : Closeable {
     private val inputSize = 518
@@ -3279,10 +3303,14 @@ class DepthModelSession(
             gpuDiagnostics += "compat=${compatible ?: "unknown"}"
             compatibilityResult.exceptionOrNull()?.let { error -> gpuDiagnostics += "compatError=${error.shortMessage()}" }
             interpreter = createFirstGpuInterpreter(compatibility, gpuDiagnostics)
-                ?: Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
+                ?: if (forceGpuNoFallback) {
+                    error("Forced GPU failed: ${gpuDiagnostics.joinToString(" ")}")
+                } else {
+                    Interpreter(model, Interpreter.Options().setNumThreads(threadCount))
+                }
             runCatching { compatibility?.close() }
         }
-        onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu delegateActive=$delegateActive gpuMode=${activeGpuMode ?: "CPU"} reusedSession=true ${gpuDiagnostics.joinToString(" ")}")
+        onRuntimeInfo("tflite runtime threads=$threadCount requestedGpu=$useGpu forceGpu=$forceGpuNoFallback delegateActive=$delegateActive gpuMode=${activeGpuMode ?: "CPU"} reusedSession=true ${gpuDiagnostics.joinToString(" ")}")
     }
 
     @Synchronized
@@ -3299,10 +3327,12 @@ class DepthModelSession(
         input.rewind()
         var normalized = runInterpreterAndRead()
         if ((!normalized.range.isFinite() || normalized.range <= 0.0001f) && useGpu && delegateActive) {
-            onRuntimeInfo("tflite gpu output flat range=${normalized.range}; trying next gpu mode")
-            normalized = tryRecoverGpu(null, reason = "flatOutput") ?: fallbackToCpu("flatOutput").also { normalized = it }
+            onRuntimeInfo("tflite gpu output flat mode=$activeGpuMode range=${normalized.range} forceGpu=$forceGpuNoFallback")
+            if (!forceGpuNoFallback) {
+                normalized = tryRecoverGpu(null, reason = "flatOutput") ?: fallbackToCpu("flatOutput")
+            }
         }
-        if (useGpu && delegateActive && !gpuValidated) {
+        if (useGpu && delegateActive && !gpuValidated && !forceGpuNoFallback) {
             val cpuReference = runCpuReferenceAndRead()
             val quality = compareDepthMaps(normalized.values, cpuReference.values)
             if (quality.meanAbs > 0.18f || quality.correlation < 0.65f) {
@@ -3313,11 +3343,15 @@ class DepthModelSession(
             }
             gpuValidated = true
         }
+        if (useGpu && delegateActive && forceGpuNoFallback && !gpuValidated) {
+            onRuntimeInfo("tflite forced gpu mode=$activeGpuMode outputRange=${normalized.range} noCpuValidation=true")
+            gpuValidated = true
+        }
         return normalized.values
     }
 
     private fun createFirstGpuInterpreter(compatibility: CompatibilityList?, diagnostics: MutableList<String>): Interpreter? {
-        for (mode in GpuMode.entries) {
+        for (mode in gpuModeCandidates()) {
             val created = runCatching { createGpuInterpreter(mode, compatibility) }
             created.onSuccess {
                 diagnostics += "gpuMode=$mode"
@@ -3380,9 +3414,19 @@ class DepthModelSession(
         return options
     }
 
+    private fun gpuModeCandidates(): List<GpuMode> {
+        return when (gpuTestMode) {
+            GpuTestMode.AUTO -> GpuMode.entries
+            GpuTestMode.ACCURATE_UNSET -> listOf(GpuMode.ACCURATE_UNSET)
+            GpuTestMode.ACCURATE_OPENGL -> listOf(GpuMode.ACCURATE_OPENGL)
+            GpuTestMode.ACCURATE_OPENCL -> listOf(GpuMode.ACCURATE_OPENCL)
+            GpuTestMode.BEST_COMPAT -> listOf(GpuMode.BEST_COMPAT)
+        }
+    }
+
     private fun tryRecoverGpu(cpuReference: DepthRunResult?, reason: String): DepthRunResult? {
         val start = activeGpuMode?.let { GpuMode.entries.indexOf(it) } ?: -1
-        for (mode in GpuMode.entries.drop(start + 1)) {
+        for (mode in gpuModeCandidates().filter { GpuMode.entries.indexOf(it) > start }) {
             val created = runCatching { createGpuInterpreter(mode, null) }
             if (created.isFailure) {
                 onRuntimeInfo("tflite gpu mode=$mode create failed after $reason: ${created.exceptionOrNull()?.shortMessage()}")
@@ -3430,6 +3474,10 @@ class DepthModelSession(
             interpreter.run(input, output)
         }.onFailure { error ->
             if (!useGpu || !delegateActive) throw error
+            if (forceGpuNoFallback) {
+                onRuntimeInfo("tflite forced gpu run failed mode=$activeGpuMode error=${error.shortMessage()}")
+                throw error
+            }
             onRuntimeInfo("tflite gpu run failed; fallback cpu threads=$threadCount error=${error.shortMessage()}")
             runCatching { interpreter.close() }
             gpuDelegate?.close()
@@ -3663,6 +3711,8 @@ private class VideoVrGenerator(
                 "encoderVersion=$VIDEO_ENCODER_VERSION",
                 "modelThreads=${vrParams.modelThreads}",
                 "useGpu=${vrParams.useGpu}",
+                "gpuTestMode=${vrParams.gpuTestMode}",
+                "forceGpuNoFallback=${vrParams.forceGpuNoFallback}",
                 "maxLongEdge=${vrParams.maxLongEdge}",
             ).joinToString("\n"),
             Charsets.UTF_8,
@@ -5257,7 +5307,26 @@ private fun SettingsScreen(
             )
             Text(lang.t("尝试 GPU 加速", "Try GPU acceleration"))
         }
-        Text(lang.t("GPU 会尝试使用 TFLite GPU Delegate；不兼容时自动回退 CPU。", "GPU uses TFLite GPU Delegate when compatible and falls back to CPU if needed."), style = MaterialTheme.typography.bodySmall)
+        Text(lang.t("GPU 后端测试模式", "GPU backend test mode"), fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        GpuModePicker(settings.gpuTestMode, lang) {
+            onChange(settings.copy(gpuTestMode = it))
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = settings.forceGpuNoFallback,
+                onCheckedChange = { onChange(settings.copy(forceGpuNoFallback = it)) },
+            )
+            Text(lang.t("强制 GPU，不回退 CPU", "Force GPU, no CPU fallback"))
+        }
+        Text(
+            lang.t(
+                "强制模式用于测试：GPU 输出错误也会继续生成或失败，不会偷偷切 CPU；日志会显示 gpuMode、range 和错误。",
+                "Force mode is for testing: bad GPU output still generates or fails without CPU fallback. Logs show gpuMode, range, and errors.",
+            ),
+            style = MaterialTheme.typography.bodySmall,
+        )
         Spacer(Modifier.height(12.dp))
 
         SettingsSectionTitle(lang.t("视频生成设置", "Video generation"))
@@ -5300,6 +5369,31 @@ private fun SettingsSectionTitle(title: String) {
     HorizontalDivider(Modifier.padding(vertical = 10.dp))
     Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
     Spacer(Modifier.height(10.dp))
+}
+
+@Composable
+private fun GpuModePicker(selected: GpuTestMode, lang: AppLanguage, onSelect: (GpuTestMode) -> Unit) {
+    val options = listOf(
+        GpuTestMode.AUTO to lang.t("自动尝试全部", "Auto try all"),
+        GpuTestMode.ACCURATE_UNSET to lang.t("精确模式", "Accurate"),
+        GpuTestMode.ACCURATE_OPENGL to lang.t("强制 OpenGL", "Force OpenGL"),
+        GpuTestMode.ACCURATE_OPENCL to lang.t("强制 OpenCL", "Force OpenCL"),
+        GpuTestMode.BEST_COMPAT to lang.t("系统推荐", "System best"),
+    )
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        options.forEach { (mode, label) ->
+            val modifier = Modifier.fillMaxWidth()
+            if (selected == mode) {
+                Button(onClick = { onSelect(mode) }, modifier = modifier) {
+                    Text(label)
+                }
+            } else {
+                OutlinedButton(onClick = { onSelect(mode) }, modifier = modifier) {
+                    Text(label)
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -5615,6 +5709,8 @@ private fun DebugScreen(
                     DebugLine("Cache", videoJob?.cacheVersion?.ifBlank { "-" } ?: "-")
                     DebugLine("Threads", "${videoJob?.modelThreads ?: state.settings.videoModelThreads}")
                     DebugLine("GPU requested", "${videoJob?.useGpu ?: state.settings.videoUseGpu}")
+                    DebugLine("GPU mode", state.settings.gpuTestMode.name)
+                    DebugLine("Force GPU", "${state.settings.forceGpuNoFallback}")
                     DebugLine("Runtime", videoJob?.runtimeInfo?.ifBlank { "-" } ?: "-")
                     DebugLine("Output", videoEntry?.outputPath ?: "-")
                     DebugLine("Error", videoJob?.error ?: "-")
@@ -5633,6 +5729,8 @@ private fun DebugScreen(
                     DebugLine("Model", state.settings.imageModelId)
                     DebugLine("Threads", "${state.settings.modelThreads}")
                     DebugLine("GPU requested", "${state.settings.useGpu}")
+                    DebugLine("GPU mode", state.settings.gpuTestMode.name)
+                    DebugLine("Force GPU", "${state.settings.forceGpuNoFallback}")
                     DebugLine("Error", job?.error ?: "-")
                 }
                 DebugSection(lang.t("性能诊断", "Performance")) {
@@ -6319,6 +6417,8 @@ private fun VrGenerationParams.toJson(photo: PhotoItem, source: Bitmap, output: 
           "maxLongEdge": $maxLongEdge,
           "modelThreads": $modelThreads,
           "useGpu": $useGpu,
+          "gpuTestMode": "$gpuTestMode",
+          "forceGpuNoFallback": $forceGpuNoFallback,
           "inpaintMode": "$inpaintMode",
           "quality": $quality,
           "timings": {
@@ -6339,7 +6439,8 @@ private fun VrGenerationParams.cacheVersion(): String {
     val scale = depthScale.roundToInt()
     val invert = if (invertDepth) "inv1" else "inv0"
     val gpu = if (useGpu) "gpu1" else "gpu0"
-    return "${depthModel}_${IMAGE_GENERATOR_VERSION}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_$gpu"
+    val force = if (forceGpuNoFallback) "force1" else "force0"
+    return "${depthModel}_${IMAGE_GENERATOR_VERSION}_s${scale}_b${blurRadius}_f${fillRadius}_${invert}_m${maxLongEdge}_t${modelThreads}_${gpu}_${gpuTestMode}_$force"
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
 }
 
