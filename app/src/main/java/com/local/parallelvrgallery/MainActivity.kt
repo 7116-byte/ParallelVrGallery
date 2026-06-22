@@ -145,11 +145,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
@@ -170,6 +172,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.PriorityQueue
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.math.abs
@@ -375,7 +378,7 @@ private const val INITIAL_MEDIA_LIMIT = 1800
 private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
-private const val VIDEO_ENCODER_VERSION = "encoderV10"
+private const val VIDEO_ENCODER_VERSION = "encoderV11"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -434,6 +437,14 @@ data class VideoVrJob(
     val finishedAt: Long? = null,
     val error: String? = null,
     val frameTimings: VideoFrameTimings = VideoFrameTimings(),
+    val pipelineStats: VideoPipelineStats = VideoPipelineStats(),
+)
+
+data class VideoPipelineStats(
+    val decodeQueue: Int = 0,
+    val generatedQueue: Int = 0,
+    val waitingFrames: Int = 0,
+    val cacheHits: Int = 0,
 )
 
 data class VideoFrameTimings(
@@ -913,7 +924,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.28"
+                    val current = "v2.29"
                     if (latest == current) {
                         Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
                     } else {
@@ -1577,7 +1588,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         lastRuntimeInfo = runtime
                         upsertVideoJob(next.item, VideoVrState.GENERATING, _uiState.value.videoJobs.firstOrNull { it.item.cacheKey == next.item.cacheKey }?.progress ?: 0f, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = runtime)
                     },
-                ) { progress, frame, total, fps, currentFrameMs, frameTimings ->
+                ) { progress, frame, total, fps, currentFrameMs, frameTimings, pipelineStats ->
                     if (!isCurrentVideoRun(next.item.cacheKey, next.runToken)) {
                         throw VideoStaleException()
                     }
@@ -1589,7 +1600,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         measuredFrameCount++
                     }
                     val avgFrameMs = if (measuredFrameCount > 0) totalFrameTimeMs / measuredFrameCount else 0L
-                    upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, currentFrameMs = currentFrameMs, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, frameTimings = frameTimings)
+                    upsertVideoJob(next.item, VideoVrState.GENERATING, progress, frame, total, fps, currentFrameMs = currentFrameMs, avgFrameMs = avgFrameMs, modelId = vrParams.depthModel, cacheVersion = videoCacheVersion, modelThreads = vrParams.modelThreads, useGpu = vrParams.useGpu, runtimeInfo = lastRuntimeInfo, frameTimings = frameTimings, pipelineStats = pipelineStats)
                     videoNotifier.show(next.item, frame, total, indeterminate = false, status = "生成中")
                 }
             }
@@ -1806,6 +1817,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         finishedAt: Long? = null,
         error: String? = null,
         frameTimings: VideoFrameTimings = VideoFrameTimings(),
+        pipelineStats: VideoPipelineStats = VideoPipelineStats(),
     ) {
         _uiState.update { current ->
             val previous = current.videoJobs.firstOrNull { it.item.cacheKey == item.cacheKey }
@@ -1828,6 +1840,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 finishedAt = finishedAt,
                 error = error,
                 frameTimings = if (frameTimings.totalMs > 0L) frameTimings else previous?.frameTimings ?: VideoFrameTimings(),
+                pipelineStats = if (pipelineStats != VideoPipelineStats()) pipelineStats else previous?.pipelineStats ?: VideoPipelineStats(),
             )
             current.copy(
                 videoStates = current.videoStates + (item.cacheKey to state),
@@ -3625,7 +3638,7 @@ private class VideoVrGenerator(
         params: VideoGenerationParams,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit = {},
-        onProgress: (Float, Int, Int, Int, Long, VideoFrameTimings) -> Unit,
+        onProgress: (Float, Int, Int, Int, Long, VideoFrameTimings, VideoPipelineStats) -> Unit,
     ): VideoCacheEntry {
         val vrParams = params.toVrParams()
         val version = params.cacheVersion()
@@ -3783,7 +3796,7 @@ private class VideoVrGenerator(
         temporalSmoother: DepthTemporalSmoother,
         onModelProgress: (Float) -> Unit,
         onRuntimeInfo: (String) -> Unit,
-        onProgress: (Float, Int, Int, Int, Long, VideoFrameTimings) -> Unit,
+        onProgress: (Float, Int, Int, Int, Long, VideoFrameTimings, VideoPipelineStats) -> Unit,
         mark: (String) -> Unit,
     ) {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
@@ -3835,39 +3848,52 @@ private class VideoVrGenerator(
             val activeRenderer = InputSurfaceRenderer(surface, width, height)
             renderer = activeRenderer
             data class FrameResult(val bitmap: Bitmap, val generatedMs: Long, val timings: VideoFrameTimings)
+            data class PipelineInput(val frame: Int, val source: Bitmap?, val cachedSbs: Bitmap?, val decodeMs: Long)
+            data class PipelineOutput(val frame: Int, val result: FrameResult)
 
-            fun cachedOrGenerateFrame(frame: Int): FrameResult? {
-                val frameCache = File(framesDir, "frame_${frame.toString().padStart(6, '0')}.jpg")
-                BitmapFactory.decodeFile(frameCache.absolutePath)?.let {
-                    onRuntimeInfo("frame cache hit frame=$frame version=$version")
-                    return FrameResult(it, 0L, VideoFrameTimings())
-                }
-                val started = SystemClock.uptimeMillis()
-                val decodeStart = SystemClock.uptimeMillis()
-                val bitmap = decodeVideoFrame(retriever, frame, framePlan)
-                    ?: return null
-                val decodeMs = SystemClock.uptimeMillis() - decodeStart
-                val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-                val generatedResult = frameGenerator.generateVideoSbsBitmap(source, params, depthSession, temporalSmoother)
-                source.recycle()
-                val generated = generatedResult.bitmap
-                val cacheStart = SystemClock.uptimeMillis()
-                FileOutputStream(frameCache).use { generated.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
-                val cacheWriteMs = SystemClock.uptimeMillis() - cacheStart
-                bitmap.recycle()
-                val timings = generatedResult.timings.copy(
-                    decodeMs = decodeMs,
-                    cacheWriteMs = cacheWriteMs,
+            val decodedChannel = Channel<PipelineInput>(capacity = 2)
+            val generatedChannel = Channel<PipelineOutput>(capacity = 2)
+            val decodeQueueSize = AtomicInteger(0)
+            val generatedQueueSize = AtomicInteger(0)
+            val cacheHits = AtomicInteger(0)
+            var timingWindow = VideoFrameTimings()
+            var timingWindowCount = 0
+
+            fun stats(waitingFrames: Int): VideoPipelineStats {
+                return VideoPipelineStats(
+                    decodeQueue = decodeQueueSize.get().coerceAtLeast(0),
+                    generatedQueue = generatedQueueSize.get().coerceAtLeast(0),
+                    waitingFrames = waitingFrames,
+                    cacheHits = cacheHits.get(),
                 )
-                return FrameResult(generated, SystemClock.uptimeMillis() - started, timings)
             }
 
-            for (frame in 0 until totalFrames) {
-                val frameResult = if (frame == 0) {
-                    FrameResult(firstSbs, 0L, VideoFrameTimings())
-                } else {
-                    cachedOrGenerateFrame(frame) ?: continue
-                }
+            fun addTiming(a: VideoFrameTimings, b: VideoFrameTimings): VideoFrameTimings {
+                return VideoFrameTimings(
+                    decodeMs = a.decodeMs + b.decodeMs,
+                    depthMs = a.depthMs + b.depthMs,
+                    temporalMs = a.temporalMs + b.temporalMs,
+                    depthPostMs = a.depthPostMs + b.depthPostMs,
+                    sbsMs = a.sbsMs + b.sbsMs,
+                    cacheWriteMs = a.cacheWriteMs + b.cacheWriteMs,
+                    encodeMs = a.encodeMs + b.encodeMs,
+                )
+            }
+
+            fun averageTiming(total: VideoFrameTimings, count: Int): VideoFrameTimings {
+                if (count <= 0) return VideoFrameTimings()
+                return VideoFrameTimings(
+                    decodeMs = total.decodeMs / count,
+                    depthMs = total.depthMs / count,
+                    temporalMs = total.temporalMs / count,
+                    depthPostMs = total.depthPostMs / count,
+                    sbsMs = total.sbsMs / count,
+                    cacheWriteMs = total.cacheWriteMs / count,
+                    encodeMs = total.encodeMs / count,
+                )
+            }
+
+            fun encodeFrame(frame: Int, frameResult: FrameResult, waitingFrames: Int) {
                 val sbs = frameResult.bitmap
                 val presentationTimeUs = frame * 1_000_000L / fps
                 val encodeStart = SystemClock.uptimeMillis()
@@ -3877,7 +3903,114 @@ private class VideoVrGenerator(
                 val encodeMs = SystemClock.uptimeMillis() - encodeStart
                 val timings = frameResult.timings.copy(encodeMs = encodeMs)
                 val effectiveMs = frameResult.generatedMs.takeIf { it > 0L } ?: timings.totalMs
-                onProgress((frame + 1).toFloat() / totalFrames.toFloat(), frame + 1, totalFrames, fps, effectiveMs, timings)
+                timingWindow = addTiming(timingWindow, timings)
+                timingWindowCount++
+                if (timingWindowCount >= 30) {
+                    val avg = averageTiming(timingWindow, timingWindowCount)
+                    mark("pipeline avg ${timingWindowCount} frames decode=${avg.decodeMs} depth=${avg.depthMs} temporal=${avg.temporalMs} depthPost=${avg.depthPostMs} sbs=${avg.sbsMs} cache=${avg.cacheWriteMs} encode=${avg.encodeMs} cacheHits=${cacheHits.get()}")
+                    timingWindow = VideoFrameTimings()
+                    timingWindowCount = 0
+                }
+                onProgress((frame + 1).toFloat() / totalFrames.toFloat(), frame + 1, totalFrames, fps, effectiveMs, timings, stats(waitingFrames))
+            }
+
+            runBlocking {
+                val decodeJob = launch(Dispatchers.IO) {
+                    try {
+                        for (frame in 1 until totalFrames) {
+                            val frameCache = File(framesDir, "frame_${frame.toString().padStart(6, '0')}.jpg")
+                            val decodeStart = SystemClock.uptimeMillis()
+                            val cached = BitmapFactory.decodeFile(frameCache.absolutePath)
+                            if (cached != null) {
+                                val decodeMs = SystemClock.uptimeMillis() - decodeStart
+                                onRuntimeInfo("frame cache hit frame=$frame version=$version")
+                                decodeQueueSize.incrementAndGet()
+                                decodedChannel.send(PipelineInput(frame, source = null, cachedSbs = cached, decodeMs = decodeMs))
+                                continue
+                            }
+                            val bitmap = decodeVideoFrame(retriever, frame, framePlan)
+                                ?: error("Unable to decode video frame $frame")
+                            val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                            bitmap.recycle()
+                            val decodeMs = SystemClock.uptimeMillis() - decodeStart
+                            decodeQueueSize.incrementAndGet()
+                            decodedChannel.send(PipelineInput(frame, source = source, cachedSbs = null, decodeMs = decodeMs))
+                        }
+                    } finally {
+                        decodedChannel.close()
+                    }
+                }
+
+                val generateJob = launch(Dispatchers.IO) {
+                    try {
+                        for (inputFrame in decodedChannel) {
+                            decodeQueueSize.decrementAndGet()
+                            val started = SystemClock.uptimeMillis()
+                            val output = if (inputFrame.cachedSbs != null) {
+                                cacheHits.incrementAndGet()
+                                PipelineOutput(
+                                    inputFrame.frame,
+                                    FrameResult(
+                                        bitmap = inputFrame.cachedSbs,
+                                        generatedMs = 0L,
+                                        timings = VideoFrameTimings(decodeMs = inputFrame.decodeMs),
+                                    ),
+                                )
+                            } else {
+                                val source = inputFrame.source ?: error("Missing source frame ${inputFrame.frame}")
+                                val generatedResult = try {
+                                    frameGenerator.generateVideoSbsBitmap(source, params, depthSession, temporalSmoother)
+                                } finally {
+                                    source.recycle()
+                                }
+                                val frameCache = File(framesDir, "frame_${inputFrame.frame.toString().padStart(6, '0')}.jpg")
+                                val cacheStart = SystemClock.uptimeMillis()
+                                FileOutputStream(frameCache).use { generatedResult.bitmap.compress(Bitmap.CompressFormat.JPEG, params.quality, it) }
+                                val cacheWriteMs = SystemClock.uptimeMillis() - cacheStart
+                                PipelineOutput(
+                                    inputFrame.frame,
+                                    FrameResult(
+                                        bitmap = generatedResult.bitmap,
+                                        generatedMs = SystemClock.uptimeMillis() - started,
+                                        timings = generatedResult.timings.copy(
+                                            decodeMs = inputFrame.decodeMs,
+                                            cacheWriteMs = cacheWriteMs,
+                                        ),
+                                    ),
+                                )
+                            }
+                            generatedQueueSize.incrementAndGet()
+                            generatedChannel.send(output)
+                        }
+                    } finally {
+                        generatedChannel.close()
+                    }
+                }
+
+                encodeFrame(0, FrameResult(firstSbs, 0L, VideoFrameTimings()), waitingFrames = 0)
+                val pendingFrames = mutableMapOf<Int, FrameResult>()
+                var expectedFrame = 1
+                while (expectedFrame < totalFrames) {
+                    val output = generatedChannel.receiveCatching().getOrNull() ?: break
+                    generatedQueueSize.decrementAndGet()
+                    pendingFrames[output.frame] = output.result
+                    while (true) {
+                        val nextResult = pendingFrames.remove(expectedFrame) ?: break
+                        encodeFrame(expectedFrame, nextResult, waitingFrames = pendingFrames.size)
+                        expectedFrame++
+                    }
+                }
+                if (expectedFrame < totalFrames) {
+                    decodeJob.cancel()
+                    generateJob.cancel()
+                    error("Pipeline ended before frame $expectedFrame/$totalFrames")
+                }
+                decodeJob.join()
+                generateJob.join()
+                if (timingWindowCount > 0) {
+                    val avg = averageTiming(timingWindow, timingWindowCount)
+                    mark("pipeline avg ${timingWindowCount} frames decode=${avg.decodeMs} depth=${avg.depthMs} temporal=${avg.temporalMs} depthPost=${avg.depthPostMs} sbs=${avg.sbsMs} cache=${avg.cacheWriteMs} encode=${avg.encodeMs} cacheHits=${cacheHits.get()}")
+                }
             }
             drain(end = true)
             if (audio != null && audioTrack >= 0 && muxerStarted) {
@@ -5690,6 +5823,11 @@ private fun DebugScreen(
                     DebugLine("FPS", "${videoJob?.fps ?: videoEntry?.fps ?: 30}")
                     DebugLine(lang.t("当前有效帧", "Current active frame"), "${videoJob?.currentFrameMs ?: 0}ms")
                     DebugLine(lang.t("平均有效帧", "Avg active frame"), "${videoJob?.avgFrameMs ?: 0}ms")
+                    val pipeline = videoJob?.pipelineStats ?: VideoPipelineStats()
+                    DebugLine(lang.t("解码队列", "Decode queue"), "${pipeline.decodeQueue}")
+                    DebugLine(lang.t("生成队列", "Generated queue"), "${pipeline.generatedQueue}")
+                    DebugLine(lang.t("等待编码", "Encode waiting"), "${pipeline.waitingFrames}")
+                    DebugLine(lang.t("缓存命中", "Cache hits"), "${pipeline.cacheHits}")
                     val timings = videoJob?.frameTimings ?: VideoFrameTimings()
                     DebugLine(lang.t("取帧", "Decode"), "${timings.decodeMs}ms")
                     DebugLine(lang.t("深度推理", "Depth"), "${timings.depthMs}ms")
