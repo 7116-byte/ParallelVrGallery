@@ -38,6 +38,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
 import android.provider.MediaStore
 import android.util.Size
 import android.view.MotionEvent
@@ -97,6 +98,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -521,6 +523,10 @@ data class UiState(
     val albumDetailColumns: Int = 5,
     val generatedColumns: Int = 5,
     val expandedGeneratedVersions: Set<String> = emptySet(),
+    val generatedImageScrollIndex: Int = 0,
+    val generatedImageScrollOffset: Int = 0,
+    val generatedVideoScrollIndex: Int = 0,
+    val generatedVideoScrollOffset: Int = 0,
     val allOffset: Int = 0,
     val allLoading: Boolean = false,
     val allExhausted: Boolean = false,
@@ -550,7 +556,11 @@ data class UiState(
     val recentGenerations: List<LastGenerationInfo> = emptyList(),
     val updateStatus: String? = null,
     val updateUrl: String? = null,
+    val updateVersion: String? = null,
     val updateAvailable: Boolean = false,
+    val updateDownloading: Boolean = false,
+    val updateDownloadProgress: Float = 0f,
+    val updateApkPath: String? = null,
 )
 
 private data class MediaSnapshot(
@@ -562,6 +572,13 @@ private data class MediaSnapshot(
     val managedItems: List<ManagedCacheItem>,
     val videoEntries: Map<String, VideoCacheEntry>,
     val cacheVersions: List<CacheVersionSummary>,
+)
+
+private data class UpdateCheckResult(
+    val status: String,
+    val url: String?,
+    val version: String?,
+    val available: Boolean,
 )
 
 private sealed class TimelineCell {
@@ -869,6 +886,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun setGeneratedScroll(tab: String, index: Int, offset: Int) {
+        _uiState.update {
+            when (tab) {
+                "videos" -> it.copy(generatedVideoScrollIndex = index.coerceAtLeast(0), generatedVideoScrollOffset = offset.coerceAtLeast(0))
+                else -> it.copy(generatedImageScrollIndex = index.coerceAtLeast(0), generatedImageScrollOffset = offset.coerceAtLeast(0))
+            }
+        }
+    }
+
     fun toggleGeneratedVersion(version: String) {
         _uiState.update {
             val expanded = it.expandedGeneratedVersions
@@ -933,7 +959,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun checkForUpdates() {
         val lang = _uiState.value.settings.language
-        _uiState.update { it.copy(updateStatus = lang.t("正在检查更新...", "Checking for updates..."), updateUrl = null, updateAvailable = false) }
+        _uiState.update {
+            it.copy(
+                updateStatus = lang.t("正在检查更新...", "Checking for updates..."),
+                updateUrl = null,
+                updateVersion = null,
+                updateAvailable = false,
+                updateDownloading = false,
+                updateDownloadProgress = 0f,
+                updateApkPath = null,
+            )
+        }
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
@@ -949,18 +985,117 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.31"
-                    if (latest == current) {
-                        Triple(lang.t("已是最新版本：$current", "Already up to date: $current"), null, false)
+                    val current = "v2.32"
+                    if (compareVersionTags(latest, current) <= 0) {
+                        UpdateCheckResult(lang.t("已是最新版本：$current", "Already up to date: $current"), null, latest, false)
                     } else {
-                        Triple(lang.t("发现新版本：$latest，当前：$current", "New version: $latest, current: $current"), url, url != null)
+                        UpdateCheckResult(lang.t("发现新版本：$latest，当前：$current", "New version: $latest, current: $current"), url, latest, url != null)
                     }
                 }.getOrElse { error ->
-                    Triple(lang.t("检查更新失败：${error.message}", "Update check failed: ${error.message}"), null, false)
+                    UpdateCheckResult(lang.t("检查更新失败：${error.message}", "Update check failed: ${error.message}"), null, null, false)
                 }
             }
-            _uiState.update { it.copy(updateStatus = result.first, updateUrl = result.second, updateAvailable = result.third) }
+            _uiState.update {
+                it.copy(
+                    updateStatus = result.status,
+                    updateUrl = result.url,
+                    updateVersion = result.version,
+                    updateAvailable = result.available,
+                )
+            }
         }
+    }
+
+    fun downloadUpdateApk() {
+        val state = _uiState.value
+        val lang = state.settings.language
+        val url = state.updateUrl ?: return
+        val version = state.updateVersion?.takeIf { it.isNotBlank() } ?: "latest"
+        _uiState.update {
+            it.copy(
+                updateDownloading = true,
+                updateDownloadProgress = 0f,
+                updateStatus = lang.t("正在下载更新 0%", "Downloading update 0%"),
+                updateApkPath = null,
+            )
+        }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val updatesDir = File(app.getExternalFilesDir(null), "updates").also { it.mkdirs() }
+                    val output = File(updatesDir, "ParallelVrGallery-$version.apk")
+                    if (output.exists()) output.delete()
+                    val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 15000
+                        readTimeout = 30000
+                        requestMethod = "GET"
+                    }
+                    connection.connect()
+                    if (connection.responseCode !in 200..299) error("HTTP ${connection.responseCode}")
+                    val total = connection.contentLengthLong.coerceAtLeast(1L)
+                    var readTotal = 0L
+                    connection.inputStream.use { input ->
+                        FileOutputStream(output).use { fileOut ->
+                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read <= 0) break
+                                fileOut.write(buffer, 0, read)
+                                readTotal += read
+                                val progress = (readTotal.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+                                _uiState.update {
+                                    it.copy(
+                                        updateDownloadProgress = progress,
+                                        updateStatus = lang.t("正在下载更新 ${(progress * 100f).roundToInt()}%", "Downloading update ${(progress * 100f).roundToInt()}%"),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    output
+                }
+            }
+            result.onSuccess { file ->
+                _uiState.update {
+                    it.copy(
+                        updateDownloading = false,
+                        updateDownloadProgress = 1f,
+                        updateApkPath = file.absolutePath,
+                        updateStatus = lang.t("更新下载完成，点击安装", "Update downloaded. Tap Install."),
+                    )
+                }
+            }.onFailure { error ->
+                _uiState.update {
+                    it.copy(
+                        updateDownloading = false,
+                        updateStatus = lang.t("下载更新失败：${error.message}", "Update download failed: ${error.message}"),
+                    )
+                }
+            }
+        }
+    }
+
+    fun installDownloadedUpdate(context: Context) {
+        val lang = _uiState.value.settings.language
+        val path = _uiState.value.updateApkPath ?: return
+        val file = File(path)
+        if (!file.exists()) {
+            _uiState.update { it.copy(updateStatus = lang.t("安装包不存在，请重新下载", "APK missing. Download again."), updateApkPath = null) }
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 26 && !context.packageManager.canRequestPackageInstalls()) {
+            val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            _uiState.update { it.copy(updateStatus = lang.t("请允许本应用安装未知应用，然后返回点击安装", "Allow this app to install unknown apps, then return and tap Install.")) }
+            return
+        }
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
     }
 
     fun updateSettings(settings: AppSettings) {
@@ -1960,21 +2095,26 @@ private fun VideoVrState.label(lang: AppLanguage): String = when (this) {
     VideoVrState.FAILED -> lang.t("失败", "Failed")
 }
 
-private fun statusBadgeBackground(text: String): androidx.compose.ui.graphics.Color = when {
-    text.contains("失败", ignoreCase = true) || text.contains("Failed", ignoreCase = true) ->
-        androidx.compose.ui.graphics.Color(0xffd32f2f)
-    text.contains("已生成", ignoreCase = true) || text.contains("Ready", ignoreCase = true) ->
-        androidx.compose.ui.graphics.Color(0xff2e7d32)
-    text.contains("队列", ignoreCase = true) || text.contains("生成中", ignoreCase = true) ||
-        text.contains("暂停", ignoreCase = true) || text.contains("Queued", ignoreCase = true) ||
-        text.contains("Generating", ignoreCase = true) || text.contains("Paused", ignoreCase = true) ->
-        androidx.compose.ui.graphics.Color(0xfff9a825)
-    else -> androidx.compose.ui.graphics.Color(0xeeffffff)
+private fun VideoVrState.shortLabel(lang: AppLanguage): String = when (this) {
+    VideoVrState.NORMAL -> lang.t("未生成", "Normal")
+    VideoVrState.QUEUED -> lang.t("队列", "Queued")
+    VideoVrState.GENERATING -> lang.t("生成", "Gen")
+    VideoVrState.PAUSED -> lang.t("暂停", "Paused")
+    VideoVrState.READY -> lang.t("完成", "Ready")
+    VideoVrState.FAILED -> lang.t("失败", "Failed")
 }
 
-private fun statusBadgeTextColor(text: String): androidx.compose.ui.graphics.Color = when (statusBadgeBackground(text)) {
-    androidx.compose.ui.graphics.Color(0xeeffffff),
-    androidx.compose.ui.graphics.Color(0xfff9a825) -> androidx.compose.ui.graphics.Color(0xff161616)
+private fun statusBadgeTextColor(text: String): androidx.compose.ui.graphics.Color = when {
+    text.contains("失败", ignoreCase = true) || text.contains("Failed", ignoreCase = true) ->
+        androidx.compose.ui.graphics.Color(0xffd32f2f)
+    text.contains("已生成", ignoreCase = true) || text.contains("完成", ignoreCase = true) ||
+        text.contains("Ready", ignoreCase = true) ->
+        androidx.compose.ui.graphics.Color(0xff2e7d32)
+    text.contains("队列", ignoreCase = true) || text.contains("生成", ignoreCase = true) ||
+        text.contains("暂停", ignoreCase = true) || text.contains("Queued", ignoreCase = true) ||
+        text.contains("Gen", ignoreCase = true) || text.contains("Generating", ignoreCase = true) ||
+        text.contains("Paused", ignoreCase = true) ->
+        androidx.compose.ui.graphics.Color(0xffffc107)
     else -> androidx.compose.ui.graphics.Color.White
 }
 
@@ -4524,6 +4664,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onTabChange = viewModel::setGeneratedTab,
                 onToggleVersion = viewModel::toggleGeneratedVersion,
                 onSetGeneratedColumns = { viewModel.setPageColumns("generated", it) },
+                onGeneratedScroll = viewModel::setGeneratedScroll,
                 onDeleteVersion = viewModel::deleteCacheVersion,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
@@ -4541,12 +4682,14 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 updateStatus = state.updateStatus,
                 updateUrl = state.updateUrl,
                 updateAvailable = state.updateAvailable,
+                updateDownloading = state.updateDownloading,
+                updateDownloadProgress = state.updateDownloadProgress,
+                updateApkPath = state.updateApkPath,
                 onBack = viewModel::closeSettings,
                 onChange = viewModel::updateSettings,
                 onCheckUpdate = viewModel::checkForUpdates,
-                onOpenUpdate = { url ->
-                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                },
+                onDownloadUpdate = viewModel::downloadUpdateApk,
+                onInstallUpdate = { viewModel.installDownloadedUpdate(context) },
             )
             AppScreen.Debug -> DebugScreen(
                 state = state,
@@ -4572,6 +4715,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSetTab = viewModel::setHomeTab,
                 onSetGeneratedTab = viewModel::setGeneratedTab,
                 onSetPageColumns = viewModel::setPageColumns,
+                onGeneratedScroll = viewModel::setGeneratedScroll,
                 onToggleGeneratedVersion = viewModel::toggleGeneratedVersion,
                 onOpenAlbum = viewModel::openAlbum,
                 onCloseAlbum = viewModel::closeAlbum,
@@ -4632,6 +4776,7 @@ private fun GalleryScreen(
     onSetTab: (String) -> Unit,
     onSetGeneratedTab: (String) -> Unit,
     onSetPageColumns: (String, Int) -> Unit,
+    onGeneratedScroll: (String, Int, Int) -> Unit,
     onToggleGeneratedVersion: (String) -> Unit,
     onOpenAlbum: (String) -> Unit,
     onCloseAlbum: () -> Unit,
@@ -4727,7 +4872,7 @@ private fun GalleryScreen(
                     CircularProgressIndicator()
                 }
             } else if (state.homeTab == "generated") {
-                Box(Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp)) {
+                Box(Modifier.fillMaxSize().padding(padding)) {
                     ManageScreen(
                         state = state,
                         embedded = true,
@@ -4736,6 +4881,7 @@ private fun GalleryScreen(
                         onTabChange = onSetGeneratedTab,
                         onToggleVersion = onToggleGeneratedVersion,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
+                        onGeneratedScroll = onGeneratedScroll,
                         onDeleteVersion = onDeleteVersion,
                         onOpenGenerated = onOpenGenerated,
                         onOpenGeneratedVideo = onOpenGeneratedVideo,
@@ -4750,7 +4896,7 @@ private fun GalleryScreen(
                     )
                 }
             } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
-                Box(Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp)) {
+                Box(Modifier.fillMaxSize().padding(padding)) {
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(state.albumListColumns),
                         state = albumListGridState,
@@ -4826,7 +4972,7 @@ private fun GalleryScreen(
                     } else {
                         null
                     },
-                    modifier = Modifier.fillMaxSize().padding(padding).padding(bottom = 78.dp),
+                    modifier = Modifier.fillMaxSize().padding(padding),
                 )
             }
         }
@@ -4837,7 +4983,7 @@ private fun GalleryScreen(
                 selectedKeys = emptySet()
                 onSetTab(it)
             },
-            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 18.dp),
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
         )
     }
 }
@@ -5049,7 +5195,7 @@ private fun GridScrollbar(
 private fun HomeBottomNav(current: String, lang: AppLanguage, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
     Row(
         modifier = modifier
-            .background(androidx.compose.ui.graphics.Color.White, RoundedCornerShape(34.dp))
+            .background(androidx.compose.ui.graphics.Color(0xccffffff), RoundedCornerShape(34.dp))
             .padding(6.dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -5061,7 +5207,7 @@ private fun HomeBottomNav(current: String, lang: AppLanguage, onSelect: (String)
         ).forEach { (key, label) ->
             val selected = key == current
             Surface(
-                color = if (selected) androidx.compose.ui.graphics.Color(0xff6650a4) else androidx.compose.ui.graphics.Color.Transparent,
+                color = if (selected) androidx.compose.ui.graphics.Color(0xcc6650a4) else androidx.compose.ui.graphics.Color.Transparent,
                 shape = RoundedCornerShape(28.dp),
                 modifier = Modifier
                     .clip(RoundedCornerShape(28.dp))
@@ -5087,7 +5233,7 @@ private fun RoundedPillTabs(
 ) {
     Row(
         modifier = modifier
-            .background(androidx.compose.ui.graphics.Color.White, RoundedCornerShape(28.dp))
+            .background(androidx.compose.ui.graphics.Color(0xccffffff), RoundedCornerShape(28.dp))
             .padding(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -5095,7 +5241,7 @@ private fun RoundedPillTabs(
         options.forEach { (key, label) ->
             val active = key == selected
             Surface(
-                color = if (active) androidx.compose.ui.graphics.Color(0xfff0eaff) else androidx.compose.ui.graphics.Color.Transparent,
+                color = if (active) androidx.compose.ui.graphics.Color(0x99e9ddff) else androidx.compose.ui.graphics.Color.Transparent,
                 shape = RoundedCornerShape(24.dp),
                 modifier = Modifier
                     .clip(RoundedCornerShape(24.dp))
@@ -5216,15 +5362,16 @@ private fun StatusBadge(
     modifier: Modifier = Modifier,
     horizontalPadding: androidx.compose.ui.unit.Dp = 5.dp,
     verticalPadding: androidx.compose.ui.unit.Dp = 2.dp,
+    maxLines: Int = 1,
 ) {
     Text(
         text = text,
         color = statusBadgeTextColor(text),
         fontSize = fontSize,
-        maxLines = 2,
+        fontWeight = FontWeight.Bold,
+        maxLines = maxLines,
         overflow = TextOverflow.Ellipsis,
         modifier = modifier
-            .background(statusBadgeBackground(text), RoundedCornerShape(3.dp))
             .padding(horizontal = horizontalPadding, vertical = verticalPadding),
     )
 }
@@ -5239,6 +5386,7 @@ private fun ManageScreen(
     onTabChange: (String) -> Unit,
     onToggleVersion: (String) -> Unit,
     onSetGeneratedColumns: (Int) -> Unit,
+    onGeneratedScroll: (String, Int, Int) -> Unit,
     onDeleteVersion: (String) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
     onOpenGeneratedVideo: (Int) -> Unit,
@@ -5277,7 +5425,14 @@ private fun ManageScreen(
         )
         Spacer(Modifier.height(8.dp))
         if (tab == "videos") {
-            val videoGridState = rememberLazyGridState()
+            val videoGridState = rememberLazyGridState(
+                initialFirstVisibleItemIndex = state.generatedVideoScrollIndex.coerceAtLeast(0),
+                initialFirstVisibleItemScrollOffset = state.generatedVideoScrollOffset.coerceAtLeast(0),
+            )
+            LaunchedEffect(videoGridState) {
+                snapshotFlow { videoGridState.firstVisibleItemIndex to videoGridState.firstVisibleItemScrollOffset }
+                    .collect { (index, offset) -> onGeneratedScroll("videos", index, offset) }
+            }
             val videos = state.photos.filter { item ->
                 item.kind == MediaKind.VIDEO &&
                     ((state.videoStates[item.cacheKey] ?: VideoVrState.NORMAL) != VideoVrState.NORMAL ||
@@ -5339,11 +5494,11 @@ private fun ManageScreen(
                                     AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
                                     if (item.cacheKey in selectedVideoKeys) SelectionBadge()
                                     StatusBadge(
-                                        text = "${videoState.label(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}%  当前${job?.currentFrameMs ?: 0}ms 平均${job?.avgFrameMs ?: 0}ms",
-                                        fontSize = (12 - columnFontReduction(state.generatedColumns)).coerceAtLeast(8).sp,
+                                        text = "${videoState.shortLabel(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}% 当前${job?.currentFrameMs ?: 0}ms 均${job?.avgFrameMs ?: 0}ms",
+                                        fontSize = (10 - columnFontReduction(state.generatedColumns)).coerceAtLeast(7).sp,
                                         modifier = Modifier.align(Alignment.BottomStart),
-                                        horizontalPadding = 4.dp,
-                                        verticalPadding = 2.dp,
+                                        horizontalPadding = 2.dp,
+                                        verticalPadding = 1.dp,
                                     )
                                 }
                             }
@@ -5370,7 +5525,14 @@ private fun ManageScreen(
             if (state.cacheVersions.isEmpty()) {
                 Text(lang.t("暂无已生成图片", "No generated images yet"))
             } else {
-                val imageGridState = rememberLazyGridState()
+                val imageGridState = rememberLazyGridState(
+                    initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
+                    initialFirstVisibleItemScrollOffset = state.generatedImageScrollOffset.coerceAtLeast(0),
+                )
+                LaunchedEffect(imageGridState) {
+                    snapshotFlow { imageGridState.firstVisibleItemIndex to imageGridState.firstVisibleItemScrollOffset }
+                        .collect { (index, offset) -> onGeneratedScroll("images", index, offset) }
+                }
                 Box(Modifier.fillMaxSize()) {
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(state.generatedColumns),
@@ -5521,10 +5683,14 @@ private fun SettingsScreen(
     updateStatus: String?,
     updateUrl: String?,
     updateAvailable: Boolean,
+    updateDownloading: Boolean,
+    updateDownloadProgress: Float,
+    updateApkPath: String?,
     onBack: () -> Unit,
     onChange: (AppSettings) -> Unit,
     onCheckUpdate: () -> Unit,
-    onOpenUpdate: (String) -> Unit,
+    onDownloadUpdate: () -> Unit,
+    onInstallUpdate: () -> Unit,
 ) {
     val lang = settings.language
     Column(
@@ -5562,10 +5728,20 @@ private fun SettingsScreen(
             Spacer(Modifier.height(6.dp))
             Text(it, style = MaterialTheme.typography.bodySmall)
         }
-        if (updateAvailable) updateUrl?.let { url ->
+        if (updateDownloading) {
             Spacer(Modifier.height(6.dp))
-            Button(onClick = { onOpenUpdate(url) }) {
+            LinearProgressIndicator(progress = { updateDownloadProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+        }
+        if (updateAvailable && updateApkPath == null && !updateDownloading) updateUrl?.let {
+            Spacer(Modifier.height(6.dp))
+            Button(onClick = onDownloadUpdate) {
                 Text(lang.t("下载更新", "Download update"))
+            }
+        }
+        if (updateApkPath != null && !updateDownloading) {
+            Spacer(Modifier.height(6.dp))
+            Button(onClick = onInstallUpdate) {
+                Text(lang.t("安装更新", "Install update"))
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -6793,6 +6969,18 @@ private fun Throwable.shortMessage(): String {
 }
 
 private fun Float.format3(): String = "%.3f".format(Locale.US, this)
+
+private fun compareVersionTags(left: String, right: String): Int {
+    val a = left.trim().removePrefix("v").split('.').map { it.toIntOrNull() ?: 0 }
+    val b = right.trim().removePrefix("v").split('.').map { it.toIntOrNull() ?: 0 }
+    val size = max(a.size, b.size)
+    for (index in 0 until size) {
+        val av = a.getOrElse(index) { 0 }
+        val bv = b.getOrElse(index) { 0 }
+        if (av != bv) return av.compareTo(bv)
+    }
+    return 0
+}
 
 private fun File.sha256(): String {
     val digest = MessageDigest.getInstance("SHA-256")

@@ -29,7 +29,8 @@
 - 上游项目：https://github.com/DepthAnything/Video-Depth-Anything
 - 论文页面：https://arxiv.org/abs/2501.12375
 - 用途：视频时序一致性深度估计方向。v2.31 先在视频模型选择中作为“待导入”模型显示。
-- 说明：当前 Android 推理链路还需要 TFLite/ONNX/MNN/QNN 等移动端模型资产后才能本地运行；不会直接下载 PyTorch checkpoint。
+- 说明：当前 Android 推理链路还需要 TFLite/ONNX/MNN/QNN 等移动端模型资产后才能本地运行；不会把 PyTorch checkpoint 标记为 App 可运行模型。
+- v2.32 转换记录：Small 权重已下载到本机临时目录，SHA-256 为 `13379300B739E659F076A59D52E9801BD8D38C541A7E71F73BBCA4DCFB013609`；因本机缺少 Python/PyTorch/TensorFlow 转换链，未上传模型资产。
 - 许可提醒：官方 Small 模型为 Apache-2.0；Base/Large 为 CC-BY-NC-4.0，后续导入模型时需要按实际权重许可处理。
 
 ## SamSeenX/ComfyUI_SSStereoscope
