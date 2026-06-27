@@ -405,7 +405,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.37"
+private const val CURRENT_VERSION_TAG = "v2.38"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -521,6 +521,7 @@ data class UiState(
     val manageOpen: Boolean = false,
     val homeTab: String = "all",
     val generatedTab: String = "images",
+    val selectedGeneratedVersion: String? = null,
     val allColumns: Int = 5,
     val albumListColumns: Int = 5,
     val albumDetailColumns: Int = 5,
@@ -804,7 +805,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun openGeneratedPhoto(index: Int, entry: VrCacheEntry? = null) {
         val photo = _uiState.value.photos.getOrNull(index)
         _uiState.update {
-            val keys = it.managedCacheItems.map { item -> item.photoItem.cacheKey }.toSet()
+            val scopedItems = if (entry != null) {
+                it.managedCacheItems.filter { item -> item.entry.version == entry.version }
+            } else {
+                it.managedCacheItems
+            }
+            val keys = scopedItems.map { item -> item.photoItem.cacheKey }.toSet()
+            val scopedEntries = scopedItems.associate { item -> item.photoItem.cacheKey to item.entry }
             val origin = if (it.manageOpen) ViewerOrigin.MANAGE_MODAL else ViewerOrigin.GENERATED_TAB
             it.copy(
                 selectedIndex = index,
@@ -814,10 +821,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageOpen = false,
                 homeTab = if (origin == ViewerOrigin.GENERATED_TAB) "generated" else it.homeTab,
                 generatedTab = "images",
+                selectedGeneratedVersion = entry?.version ?: it.selectedGeneratedVersion,
                 viewerOrigin = origin,
                 manageViewerKeys = keys + listOfNotNull(photo?.cacheKey),
                 viewerScopeKeys = keys + listOfNotNull(photo?.cacheKey),
-                entries = if (photo != null && entry != null) it.entries + (photo.cacheKey to entry) else it.entries,
+                entries = if (photo != null && entry != null) it.entries + scopedEntries + (photo.cacheKey to entry) else it.entries,
                 message = null,
             )
         }
@@ -873,6 +881,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             it.copy(
                 homeTab = tab,
                 manageOpen = false,
+                selectedGeneratedVersion = if (tab == "generated") it.selectedGeneratedVersion else null,
             )
         }
         rebalanceQueueForActiveSource()
@@ -880,7 +889,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun setGeneratedTab(tab: String) {
-        _uiState.update { it.copy(generatedTab = tab) }
+        _uiState.update { it.copy(generatedTab = tab, selectedGeneratedVersion = if (tab == "images") it.selectedGeneratedVersion else null) }
+    }
+
+    fun openGeneratedVersion(version: String) {
+        _uiState.update { it.copy(generatedTab = "images", selectedGeneratedVersion = version) }
+    }
+
+    fun closeGeneratedVersion() {
+        _uiState.update { it.copy(selectedGeneratedVersion = null) }
     }
 
     fun setPageColumns(page: String, columns: Int) {
@@ -4857,6 +4874,9 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     BackHandler(enabled = screen is AppScreen.Viewer) { viewModel.closeViewer() }
     BackHandler(enabled = screen is AppScreen.Manage) { viewModel.closeManage() }
     BackHandler(enabled = screen is AppScreen.Settings) { viewModel.closeSettings() }
+    BackHandler(enabled = screen is AppScreen.Gallery && state.homeTab == "generated" && state.selectedGeneratedVersion != null) {
+        viewModel.closeGeneratedVersion()
+    }
     BackHandler(enabled = screen is AppScreen.Gallery && state.homeTab == "albums" && state.selectedAlbumId != null) {
         viewModel.closeAlbum()
     }
@@ -4875,6 +4895,8 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 selectedTab = state.generatedTab,
                 onTabChange = viewModel::setGeneratedTab,
                 onToggleVersion = viewModel::toggleGeneratedVersion,
+                onOpenVersion = viewModel::openGeneratedVersion,
+                onCloseVersion = viewModel::closeGeneratedVersion,
                 onSetGeneratedColumns = { viewModel.setPageColumns("generated", it) },
                 onGeneratedScroll = viewModel::setGeneratedScroll,
                 onDeleteVersion = viewModel::deleteCacheVersion,
@@ -4929,6 +4951,8 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSetPageColumns = viewModel::setPageColumns,
                 onGeneratedScroll = viewModel::setGeneratedScroll,
                 onToggleGeneratedVersion = viewModel::toggleGeneratedVersion,
+                onOpenGeneratedVersion = viewModel::openGeneratedVersion,
+                onCloseGeneratedVersion = viewModel::closeGeneratedVersion,
                 onOpenAlbum = viewModel::openAlbum,
                 onCloseAlbum = viewModel::closeAlbum,
                 onLoadMoreAll = viewModel::loadMoreAllMedia,
@@ -4990,6 +5014,8 @@ private fun GalleryScreen(
     onSetPageColumns: (String, Int) -> Unit,
     onGeneratedScroll: (String, Int, Int) -> Unit,
     onToggleGeneratedVersion: (String) -> Unit,
+    onOpenGeneratedVersion: (String) -> Unit,
+    onCloseGeneratedVersion: () -> Unit,
     onOpenAlbum: (String) -> Unit,
     onCloseAlbum: () -> Unit,
     onLoadMoreAll: () -> Unit,
@@ -5079,6 +5105,8 @@ private fun GalleryScreen(
                         selectedTab = state.generatedTab,
                         onTabChange = onSetGeneratedTab,
                         onToggleVersion = onToggleGeneratedVersion,
+                        onOpenVersion = onOpenGeneratedVersion,
+                        onCloseVersion = onCloseGeneratedVersion,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
                         onGeneratedScroll = onGeneratedScroll,
                         onDeleteVersion = onDeleteVersion,
@@ -5188,14 +5216,22 @@ private fun GalleryScreen(
                         val title = when {
                             state.homeTab == "albums" && state.selectedAlbumId != null -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Album")
                             state.homeTab == "albums" -> lang.t("相册", "Albums")
-                            state.homeTab == "generated" -> lang.t("生成", "Generated")
                             else -> lang.t("全部", "All")
                         }
                         if (state.homeTab == "albums" && state.selectedAlbumId != null) {
                             OutlinedButton(onClick = onCloseAlbum) { Text(lang.t("返回", "Back")) }
                             Spacer(Modifier.width(8.dp))
                         }
-                        Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        if (state.homeTab == "generated") {
+                            RoundedPillTabs(
+                                options = listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
+                                selected = state.generatedTab,
+                                onSelect = onSetGeneratedTab,
+                            )
+                            Spacer(Modifier.weight(1f))
+                        } else {
+                            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        }
                         OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
                         Spacer(Modifier.width(8.dp))
                         OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
@@ -5628,6 +5664,8 @@ private fun ManageScreen(
     selectedTab: String,
     onTabChange: (String) -> Unit,
     onToggleVersion: (String) -> Unit,
+    onOpenVersion: (String) -> Unit,
+    onCloseVersion: () -> Unit,
     onSetGeneratedColumns: (Int) -> Unit,
     onGeneratedScroll: (String, Int, Int) -> Unit,
     onDeleteVersion: (String) -> Unit,
@@ -5646,12 +5684,22 @@ private fun ManageScreen(
     val tab = selectedTab
     var selectedImageKeys by remember { mutableStateOf(setOf<String>()) }
     var selectedVideoKeys by remember { mutableStateOf(setOf<String>()) }
+    LaunchedEffect(tab, state.selectedGeneratedVersion) {
+        selectedImageKeys = emptySet()
+        selectedVideoKeys = emptySet()
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
             .then(if (embedded) Modifier else Modifier.statusBarsPadding())
-            .padding(if (embedded) 0.dp else 16.dp),
+            .padding(
+                if (embedded) {
+                    androidx.compose.foundation.layout.PaddingValues(start = 12.dp, top = 96.dp, end = 12.dp, bottom = 96.dp)
+                } else {
+                    androidx.compose.foundation.layout.PaddingValues(16.dp)
+                },
+            ),
     ) {
         if (!embedded) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -5661,12 +5709,14 @@ private fun ManageScreen(
             }
             Spacer(Modifier.height(16.dp))
         }
-        RoundedPillTabs(
-            options = listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
-            selected = tab,
-            onSelect = onTabChange,
-        )
-        Spacer(Modifier.height(8.dp))
+        if (!embedded) {
+            RoundedPillTabs(
+                options = listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
+                selected = tab,
+                onSelect = onTabChange,
+            )
+            Spacer(Modifier.height(8.dp))
+        }
         if (tab == "videos") {
             val videoGridState = rememberLazyGridState(
                 initialFirstVisibleItemIndex = state.generatedVideoScrollIndex.coerceAtLeast(0),
@@ -5752,84 +5802,91 @@ private fun ManageScreen(
                 }
             }
         } else {
-            if (selectedImageKeys.isNotEmpty()) {
-                val selectedItems = state.managedCacheItems.filter { "${it.entry.photoKey}|${it.entry.version}" in selectedImageKeys }
-                val selectedIndexes = selectedItems.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }.takeIf { it >= 0 } }.distinct()
-                ManageSelectionActions(
-                    count = selectedImageKeys.size,
-                    lang = lang,
-                    onClear = { selectedImageKeys = emptySet() },
-                    onSave = { onSaveImages(selectedIndexes); selectedImageKeys = emptySet() },
-                    onRegenerate = { onRegenerateImages(selectedIndexes); selectedImageKeys = emptySet() },
-                    onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
-                )
-                Spacer(Modifier.height(8.dp))
-            }
             if (state.cacheVersions.isEmpty()) {
                 Text(lang.t("暂无已生成图片", "No generated images yet"))
             } else {
-                val imageGridState = rememberLazyGridState(
-                    initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
-                    initialFirstVisibleItemScrollOffset = state.generatedImageScrollOffset.coerceAtLeast(0),
-                )
-                LaunchedEffect(imageGridState) {
-                    snapshotFlow { imageGridState.firstVisibleItemIndex to imageGridState.firstVisibleItemScrollOffset }
-                        .collect { (index, offset) -> onGeneratedScroll("images", index, offset) }
-                }
-                Box(Modifier.fillMaxSize()) {
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(state.generatedColumns),
-                        state = imageGridState,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(androidx.compose.ui.graphics.Color.White)
-                            .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
-                            .padding(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        state.cacheVersions.forEach { summary ->
-                            val items = state.managedCacheItems.filter { it.entry.version == summary.version }
-                            val expanded = summary.version in state.expandedGeneratedVersions
-                            item(
-                                key = "version_header_${summary.version}",
-                                span = { GridItemSpan(maxLineSpan) },
-                            ) {
-                                Column(
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .background(androidx.compose.ui.graphics.Color(0xfff5f6f7), RoundedCornerShape(8.dp))
-                                        .padding(10.dp),
-                                ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(
-                                            text = lang.t("版本：${summary.version}", "Version: ${summary.version}"),
-                                            fontWeight = FontWeight.Bold,
-                                            maxLines = 2,
-                                            overflow = TextOverflow.Ellipsis,
-                                            modifier = Modifier.weight(1f),
-                                        )
-                                        Spacer(Modifier.width(8.dp))
-                                        OutlinedButton(onClick = { onToggleVersion(summary.version) }) {
-                                            Text(if (expanded) lang.t("收起", "Collapse") else lang.t("展开", "Expand"))
-                                        }
-                                    }
-                                    Spacer(Modifier.height(6.dp))
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(
-                                            text = lang.t("${summary.count} 张  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB", "${summary.count} images  ${(summary.bytes / 1024f / 1024f).roundToInt()} MB"),
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = androidx.compose.ui.graphics.Color(0xff555555),
-                                            modifier = Modifier.weight(1f),
-                                        )
-                                        OutlinedButton(onClick = { onDeleteVersion(summary.version) }) {
-                                            Text(lang.t("删除", "Delete"))
-                                        }
-                                    }
-                                }
+                val selectedVersion = state.selectedGeneratedVersion
+                if (selectedVersion == null) {
+                    val versionGridState = rememberLazyGridState(
+                        initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
+                        initialFirstVisibleItemScrollOffset = state.generatedImageScrollOffset.coerceAtLeast(0),
+                    )
+                    LaunchedEffect(versionGridState) {
+                        snapshotFlow { versionGridState.firstVisibleItemIndex to versionGridState.firstVisibleItemScrollOffset }
+                            .collect { (index, offset) -> onGeneratedScroll("images", index, offset) }
+                    }
+                    Box(Modifier.fillMaxSize()) {
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(state.generatedColumns.coerceIn(2, 6)),
+                            state = versionGridState,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(androidx.compose.ui.graphics.Color.White)
+                                .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                                .padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(14.dp),
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        ) {
+                            items(state.cacheVersions, key = { it.version }) { summary ->
+                                val items = state.managedCacheItems.filter { it.entry.version == summary.version }
+                                val cover = items.maxByOrNull { it.entry.createdAt }
+                                GeneratedVersionTile(
+                                    summary = summary,
+                                    cover = cover,
+                                    lang = lang,
+                                    onOpen = { onOpenVersion(summary.version) },
+                                    onDelete = { onDeleteVersion(summary.version) },
+                                )
                             }
-                            if (expanded) {
-                                items(items, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
+                        }
+                        GridScrollbar(versionGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
+                        GridToTopButton(versionGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+                    }
+                } else {
+                    val itemsInVersion = state.managedCacheItems.filter { it.entry.version == selectedVersion }
+                    val imageGridState = rememberLazyGridState()
+                    Column(Modifier.fillMaxSize()) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedButton(onClick = onCloseVersion) { Text(lang.t("返回", "Back")) }
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                text = selectedVersion,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            OutlinedButton(onClick = { onDeleteVersion(selectedVersion); onCloseVersion() }) { Text(lang.t("删除", "Delete")) }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        if (selectedImageKeys.isNotEmpty()) {
+                            val selectedItems = itemsInVersion.filter { "${it.entry.photoKey}|${it.entry.version}" in selectedImageKeys }
+                            val selectedIndexes = selectedItems.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }.takeIf { it >= 0 } }.distinct()
+                            ManageSelectionActions(
+                                count = selectedImageKeys.size,
+                                lang = lang,
+                                onClear = { selectedImageKeys = emptySet() },
+                                onSave = { onSaveImages(selectedIndexes); selectedImageKeys = emptySet() },
+                                onRegenerate = { onRegenerateImages(selectedIndexes); selectedImageKeys = emptySet() },
+                                onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
+                            )
+                            Spacer(Modifier.height(8.dp))
+                        }
+                        Box(Modifier.fillMaxSize()) {
+                            LazyVerticalGrid(
+                                columns = GridCells.Fixed(state.generatedColumns),
+                                state = imageGridState,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(androidx.compose.ui.graphics.Color.White)
+                                    .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
+                                    .padding(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                items(itemsInVersion, key = { "${it.entry.photoKey}_${it.entry.version}" }) { item ->
                                     val index = state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }
                                     val selectionKey = "${item.entry.photoKey}|${item.entry.version}"
                                     Box(
@@ -5854,13 +5911,70 @@ private fun ManageScreen(
                                     }
                                 }
                             }
+                            GridScrollbar(imageGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
+                            GridToTopButton(imageGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
                         }
                     }
-                    GridScrollbar(imageGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                    GridToTopButton(imageGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
                 }
             }
         }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun GeneratedVersionTile(
+    summary: CacheVersionSummary,
+    cover: ManagedCacheItem?,
+    lang: AppLanguage,
+    onOpen: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(onClick = onOpen, onLongClick = onDelete),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f)
+                .background(androidx.compose.ui.graphics.Color(0xff16191c), RoundedCornerShape(6.dp))
+                .clip(RoundedCornerShape(6.dp)),
+        ) {
+            if (cover != null) {
+                GeneratedSbsThumbnail(File(cover.entry.outputPath), 420, ContentScale.Crop, Modifier.fillMaxSize(), lang)
+            } else {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(lang.t("暂无预览", "No preview"), color = androidx.compose.ui.graphics.Color.White)
+                }
+            }
+            Text(
+                text = lang.t("${summary.count} 张", "${summary.count} images"),
+                color = androidx.compose.ui.graphics.Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .background(androidx.compose.ui.graphics.Color(0x99000000))
+                    .padding(horizontal = 6.dp, vertical = 3.dp),
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = summary.version,
+            color = androidx.compose.ui.graphics.Color(0xff222222),
+            fontWeight = FontWeight.Bold,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            text = lang.t("${(summary.bytes / 1024f / 1024f).roundToInt()} MB，长按删除", "${(summary.bytes / 1024f / 1024f).roundToInt()} MB, long press delete"),
+            style = MaterialTheme.typography.bodySmall,
+            color = androidx.compose.ui.graphics.Color(0xff666666),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
