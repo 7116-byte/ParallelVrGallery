@@ -405,7 +405,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.40"
+private const val CURRENT_VERSION_TAG = "v2.41"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -514,6 +514,8 @@ data class UiState(
     val manageViewerKeys: Set<String> = emptySet(),
     val viewerScopeKeys: Set<String> = emptySet(),
     val viewerScopeOrderedKeys: List<String> = emptyList(),
+    val viewerQueueSource: String? = null,
+    val viewerQueueAlbumId: String? = null,
     val galleryAnchorIndex: Int = 0,
     val galleryScrollIndex: Int = 0,
     val galleryScrollOffset: Int = 0,
@@ -648,6 +650,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val currentPending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
     private val videoPending = PriorityQueue<VideoQueuedJob>(compareBy<VideoQueuedJob> { it.sequence })
     private val paused = linkedMapOf<String, QueuedJob>()
+    private val autoPausedKeys = mutableSetOf<String>()
     private val pausedVideos = mutableSetOf<String>()
     private val pausedVideoParams = mutableMapOf<String, VideoGenerationParams>()
     private val activeVideoParams = mutableMapOf<String, VideoGenerationParams>()
@@ -788,6 +791,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun openPhoto(index: Int, firstVisibleIndex: Int, firstVisibleOffset: Int, scopeKeys: List<String>) {
         val item = _uiState.value.photos.getOrNull(index)
+        val queueContext = activeQueueContext(_uiState.value)
         _uiState.update {
             it.copy(
                 selectedIndex = index,
@@ -800,6 +804,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageViewerKeys = emptySet(),
                 viewerScopeKeys = scopeKeys.toSet(),
                 viewerScopeOrderedKeys = scopeKeys,
+                viewerQueueSource = queueContext.source.name,
+                viewerQueueAlbumId = queueContext.albumId,
                 message = null,
             )
         }
@@ -830,6 +836,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageViewerKeys = keys + listOfNotNull(photo?.cacheKey),
                 viewerScopeKeys = keys + listOfNotNull(photo?.cacheKey),
                 viewerScopeOrderedKeys = scopedItems.map { item -> item.photoItem.cacheKey } + listOfNotNull(photo?.cacheKey),
+                viewerQueueSource = QueueSource.GENERATED.name,
+                viewerQueueAlbumId = null,
                 entries = if (photo != null && entry != null) it.entries + scopedEntries + (photo.cacheKey to entry) else it.entries,
                 message = null,
             )
@@ -857,6 +865,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageViewerKeys = keys,
                 viewerScopeKeys = keys,
                 viewerScopeOrderedKeys = keys.toList(),
+                viewerQueueSource = QueueSource.GENERATED.name,
+                viewerQueueAlbumId = null,
                 message = null,
             )
         }
@@ -876,6 +886,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 manageViewerKeys = emptySet(),
                 viewerScopeKeys = emptySet(),
                 viewerScopeOrderedKeys = emptyList(),
+                viewerQueueSource = null,
+                viewerQueueAlbumId = null,
                 galleryAnchorIndex = currentIndex,
             )
         }
@@ -1337,7 +1349,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun stopVr() {
         synchronized(pending) { pending.clear() }
         synchronized(currentPending) { currentPending.clear() }
-        synchronized(paused) { paused.clear() }
+        synchronized(paused) {
+            paused.clear()
+            autoPausedKeys.clear()
+        }
         queueTags.clearActive()
         _uiState.update { it.copy(vrMode = false, modelProgress = null) }
         addLog("vr stopped; generated caches kept")
@@ -1627,10 +1642,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
         synchronized(pending) {
             val keep = targets.map { photos[it.first].cacheKey }.toSet()
-            val toPause = pending.filter { sameQueueSource(it, queueContext) && it.photo.cacheKey !in keep }
+            val toPause = pending.filter { it.photo.cacheKey !in keep }
             pending.removeAll(toPause.toSet())
             toPause.forEach { job ->
                 paused[job.photo.cacheKey] = job
+                autoPausedKeys += job.photo.cacheKey
                 queueTags.upsert(job, VrState.PAUSED)
                 markState(job.photo.cacheKey, VrState.PAUSED)
                 upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
@@ -1653,7 +1669,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val queueContext = context ?: activeQueueContext(_uiState.value)
         val job = QueuedJob(photo, priority = 0, sequence = sequence++, source = queueContext.source, albumId = queueContext.albumId)
         synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
-        synchronized(paused) { paused.remove(photo.cacheKey) }
+        synchronized(paused) {
+            paused.remove(photo.cacheKey)
+            autoPausedKeys.remove(photo.cacheKey)
+        }
         synchronized(currentPending) {
             currentPending.removeAll { it.photo.cacheKey == photo.cacheKey }
             currentPending.add(job)
@@ -1683,7 +1702,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
         val job = QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
         synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
-        synchronized(paused) { paused.remove(photo.cacheKey) }
+        synchronized(paused) {
+            paused.remove(photo.cacheKey)
+            autoPausedKeys.remove(photo.cacheKey)
+        }
         synchronized(pending) { pending.add(job) }
         queueTags.upsert(job, VrState.QUEUED)
         markState(photo.cacheKey, VrState.QUEUED)
@@ -1700,10 +1722,16 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun activeQueueContext(state: UiState): QueueContext = when {
-        state.homeTab == "generated" || state.manageOpen -> QueueContext(QueueSource.GENERATED, null)
-        state.homeTab == "albums" && state.selectedAlbumId != null -> QueueContext(QueueSource.ALBUM, state.selectedAlbumId)
-        else -> QueueContext(QueueSource.ALL, null)
+    private fun activeQueueContext(state: UiState): QueueContext {
+        val viewerSource = state.viewerQueueSource?.let { runCatching { QueueSource.valueOf(it) }.getOrNull() }
+        if (state.vrMode && state.viewerOrigin == ViewerOrigin.NORMAL && viewerSource != null) {
+            return QueueContext(viewerSource, state.viewerQueueAlbumId)
+        }
+        return when {
+            state.homeTab == "generated" || state.manageOpen -> QueueContext(QueueSource.GENERATED, null)
+            state.homeTab == "albums" && state.selectedAlbumId != null -> QueueContext(QueueSource.ALBUM, state.selectedAlbumId)
+            else -> QueueContext(QueueSource.ALL, null)
+        }
     }
 
     private fun sameQueueSource(job: QueuedJob, context: QueueContext): Boolean {
@@ -1711,7 +1739,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun jobAllowedInCurrentContext(job: QueuedJob, state: UiState): Boolean {
-        if (state.homeTab == "generated" || state.manageOpen) return true
+        if (state.vrMode && state.viewerOrigin == ViewerOrigin.NORMAL && state.viewerScopeOrderedKeys.isNotEmpty() && job.photo.cacheKey !in state.viewerScopeOrderedKeys) {
+            return false
+        }
         return sameQueueSource(job, activeQueueContext(state))
     }
 
@@ -1726,6 +1756,31 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    private fun pollAllowedCurrentJob(): QueuedJob? {
+        val state = _uiState.value
+        val deferred = mutableListOf<QueuedJob>()
+        val allowed = synchronized(currentPending) {
+            var candidate = currentPending.poll()
+            while (candidate != null && !jobAllowedInCurrentContext(candidate, state)) {
+                deferred += candidate
+                candidate = currentPending.poll()
+            }
+            candidate
+        }
+        if (deferred.isNotEmpty()) {
+            synchronized(paused) {
+                deferred.forEach { job ->
+                    paused[job.photo.cacheKey] = job
+                    autoPausedKeys += job.photo.cacheKey
+                    queueTags.upsert(job, VrState.PAUSED)
+                    markState(job.photo.cacheKey, VrState.PAUSED)
+                    upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
+                }
+            }
+        }
+        return allowed
+    }
+
     private fun rebalanceQueueForActiveSource() {
         val state = _uiState.value
         val disallowed = synchronized(pending) {
@@ -1737,6 +1792,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             synchronized(paused) {
                 disallowed.forEach { job ->
                     paused[job.photo.cacheKey] = job
+                    autoPausedKeys += job.photo.cacheKey
                     queueTags.upsert(job, VrState.PAUSED)
                     markState(job.photo.cacheKey, VrState.PAUSED)
                     upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
@@ -1744,8 +1800,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
         }
         val restored = synchronized(paused) {
-            val items = paused.values.filter { jobAllowedInCurrentContext(it, state) }
-            items.forEach { paused.remove(it.photo.cacheKey) }
+            val items = paused.values.filter { it.photo.cacheKey in autoPausedKeys && jobAllowedInCurrentContext(it, state) }
+            items.forEach {
+                paused.remove(it.photo.cacheKey)
+                autoPausedKeys.remove(it.photo.cacheKey)
+            }
             items
         }
         if (restored.isNotEmpty()) {
@@ -1869,7 +1928,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     synchronized(currentPending) { currentPending.clear() }
                     break
                 }
-                val next = synchronized(currentPending) { currentPending.poll() }
+                val next = pollAllowedCurrentJob()
                 if (next == null) {
                     if (idleChecks++ < 3) {
                         delay(50)
@@ -2095,6 +2154,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
         result.onSuccess { entry ->
             queueTags.remove(next.photo.cacheKey)
+            synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
             markReady(next.photo.cacheKey, entry)
             upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis())
             addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
@@ -2111,6 +2171,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
         }.onFailure { error ->
+            synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
             queueTags.upsert(next, VrState.FAILED)
             markState(next.photo.cacheKey, VrState.FAILED)
             upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
@@ -5110,6 +5171,7 @@ private fun GalleryScreen(
     )
     val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
     val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
+    val topContentPadding = 96.dp
     val topBarScrollOffset = when {
         state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
         state.homeTab == "generated" && state.selectedGeneratedVersion != null -> {
@@ -5120,7 +5182,8 @@ private fun GalleryScreen(
         state.homeTab == "albums" && state.selectedAlbumId == null -> albumListGridState.firstVisibleItemIndex * 240 + albumListGridState.firstVisibleItemScrollOffset
         else -> gridState.firstVisibleItemIndex * 240 + gridState.firstVisibleItemScrollOffset
     }
-    val topBarAlpha = (0.96f - (topBarScrollOffset / 180f).coerceIn(0f, 0.48f)).coerceIn(0.48f, 0.96f)
+    val topBarOverlap = (topBarScrollOffset - topContentPadding.value).coerceAtLeast(0f)
+    val topBarAlpha = (0.98f - (topBarOverlap / 180f).coerceIn(0f, 0.48f)).coerceIn(0.5f, 0.98f)
 
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
@@ -5142,6 +5205,7 @@ private fun GalleryScreen(
                         onToggleVersion = onToggleGeneratedVersion,
                         onOpenVersion = onOpenGeneratedVersion,
                         onCloseVersion = onCloseGeneratedVersion,
+                        contentTopPadding = topContentPadding,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
                         onGeneratedScroll = onGeneratedScroll,
                         onGeneratedVersionScroll = onGeneratedVersionScroll,
@@ -5170,7 +5234,7 @@ private fun GalleryScreen(
                                 onColumns = { onSetPageColumns("albumList", it) },
                                 onPinchActivity = { lastPinchAt = System.currentTimeMillis() },
                             ),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(14.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = topContentPadding, end = 14.dp, bottom = 14.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
@@ -5235,6 +5299,7 @@ private fun GalleryScreen(
                     } else {
                         null
                     },
+                    contentTopPadding = topContentPadding,
                     modifier = Modifier.fillMaxSize().padding(padding),
                 )
             }
@@ -5317,6 +5382,7 @@ private fun TimelineGrid(
     onItemLongClick: (PhotoItem) -> Unit,
     onNearEnd: () -> Unit,
     footerText: String?,
+    contentTopPadding: androidx.compose.ui.unit.Dp = 8.dp,
     modifier: Modifier = Modifier,
 ) {
     val restoreRenderLimit = min(items.size, max(1200, gridState.firstVisibleItemIndex + 400))
@@ -5360,7 +5426,7 @@ private fun TimelineGrid(
             modifier = Modifier
                 .fillMaxSize()
                 .discreteColumnPinch(columns = columns, onColumns = onColumns),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 8.dp, top = contentTopPadding, end = 8.dp, bottom = 8.dp),
             verticalArrangement = Arrangement.spacedBy(3.dp),
             horizontalArrangement = Arrangement.spacedBy(3.dp),
         ) {
@@ -5702,6 +5768,7 @@ private fun ManageScreen(
     onToggleVersion: (String) -> Unit,
     onOpenVersion: (String) -> Unit,
     onCloseVersion: () -> Unit,
+    contentTopPadding: androidx.compose.ui.unit.Dp = 0.dp,
     onSetGeneratedColumns: (Int) -> Unit,
     onGeneratedScroll: (String, Int, Int) -> Unit,
     onGeneratedVersionScroll: (String, Int, Int) -> Unit,
@@ -5792,7 +5859,7 @@ private fun ManageScreen(
                             .fillMaxSize()
                             .background(androidx.compose.ui.graphics.Color.White)
                             .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
-                            .padding(8.dp),
+                            .padding(start = 8.dp, top = if (embedded) contentTopPadding else 8.dp, end = 8.dp, bottom = 8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
@@ -5860,7 +5927,7 @@ private fun ManageScreen(
                                 .fillMaxSize()
                                 .background(androidx.compose.ui.graphics.Color.White)
                                 .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns)
-                                .padding(10.dp),
+                                .padding(start = 10.dp, top = if (embedded) contentTopPadding else 10.dp, end = 10.dp, bottom = 10.dp),
                             verticalArrangement = Arrangement.spacedBy(14.dp),
                             horizontalArrangement = Arrangement.spacedBy(14.dp),
                         ) {
@@ -5889,7 +5956,11 @@ private fun ManageScreen(
                         snapshotFlow { imageGridState.firstVisibleItemIndex to imageGridState.firstVisibleItemScrollOffset }
                             .collect { (index, offset) -> onGeneratedVersionScroll(selectedVersion, index, offset) }
                     }
-                    Column(Modifier.fillMaxSize()) {
+                    Column(
+                        Modifier
+                            .fillMaxSize()
+                            .padding(top = if (embedded) contentTopPadding else 0.dp),
+                    ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             OutlinedButton(onClick = onCloseVersion) { Text(lang.t("返回", "Back")) }
                             Spacer(Modifier.width(10.dp))
