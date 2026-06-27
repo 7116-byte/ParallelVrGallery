@@ -406,7 +406,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.46"
+private const val CURRENT_VERSION_TAG = "v2.47"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -1414,9 +1414,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 .map { it.entry.photoKey }
                 .toSet()
             cache.deleteVersion(version)
-            clearImageQueueForKeys(affectedKeys)
             val photos = _uiState.value.photos
             val entries = photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey }
+            if (entries.isEmpty()) clearAllImageQueues() else clearImageQueueForKeys(affectedKeys)
             _uiState.update {
                 it.copy(
                     entries = entries,
@@ -1516,9 +1516,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch(Dispatchers.IO) {
             val deletedKeys = entries.map { it.entry.photoKey }.toSet()
             entries.forEach { cache.deleteEntry(it.entry) }
-            clearImageQueueForKeys(deletedKeys)
             val photos = _uiState.value.photos
             val currentEntries = photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey }
+            if (currentEntries.isEmpty()) clearAllImageQueues() else clearImageQueueForKeys(deletedKeys)
             _uiState.update {
                 it.copy(
                     entries = currentEntries,
@@ -1547,6 +1547,24 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             )
         }
         addLog("cleared image queue keys=${keys.size}")
+    }
+
+    private fun clearAllImageQueues() {
+        synchronized(pending) { pending.clear() }
+        synchronized(currentPending) { currentPending.clear() }
+        synchronized(paused) {
+            paused.clear()
+            autoPausedKeys.clear()
+        }
+        queueTags.clearAll()
+        _uiState.update {
+            it.copy(
+                states = emptyMap(),
+                jobs = emptyList(),
+                modelProgress = null,
+            )
+        }
+        addLog("cleared all image queues")
     }
 
     fun regenerateImages(indexes: List<Int>) {
@@ -1656,16 +1674,47 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val window = state.activePrefetchWindow.coerceAtMost(8)
         val desiredCount = window * 2
         val targets = mutableListOf<Pair<Int, Int>>()
+        val targetKeys = mutableSetOf<String>()
         if (includeCurrent) {
             promoteCurrentImageForVr(index, queueContext)
         }
-        var distance = 1
-        while (targets.size < desiredCount && distance <= window && distance < scopeIndices.size) {
-            val next = scopeIndices.getOrNull(scopePosition + distance)
-            val prev = scopeIndices.getOrNull(scopePosition - distance)
-            if (next != null && photos[next].kind == MediaKind.IMAGE && cache.findEntry(photos[next], currentVersion) == null) targets += next to distance * 2 - 1
-            if (targets.size < desiredCount && prev != null && photos[prev].kind == MediaKind.IMAGE && cache.findEntry(photos[prev], currentVersion) == null) targets += prev to distance * 2
-            distance++
+        fun eligibleAt(position: Int): Int? {
+            val photoIndex = scopeIndices.getOrNull(position) ?: return null
+            val photo = photos[photoIndex]
+            if (photo.kind != MediaKind.IMAGE) return null
+            if (photo.cacheKey in targetKeys) return null
+            if (cache.findEntry(photo, currentVersion) != null) return null
+            return photoIndex
+        }
+        fun stealFrom(offsetStep: Int): Int? {
+            var distance = 1
+            while (distance <= window) {
+                val candidate = eligibleAt(scopePosition + offsetStep * distance)
+                if (candidate != null) return candidate
+                distance++
+            }
+            return null
+        }
+        fun addTarget(photoIndex: Int): Boolean {
+            if (targets.size >= desiredCount) return false
+            val key = photos[photoIndex].cacheKey
+            if (!targetKeys.add(key)) return false
+            targets += photoIndex to targets.size + 1
+            return true
+        }
+        fun fillSlot(preferredOffsetStep: Int, distance: Int) {
+            val preferred = eligibleAt(scopePosition + preferredOffsetStep * distance)
+            if (preferred != null) {
+                addTarget(preferred)
+            } else {
+                stealFrom(-preferredOffsetStep)?.let { addTarget(it) }
+            }
+        }
+        for (distance in 1..window) {
+            if (targets.size >= desiredCount) break
+            fillSlot(preferredOffsetStep = -1, distance = distance)
+            if (targets.size >= desiredCount) break
+            fillSlot(preferredOffsetStep = 1, distance = distance)
         }
 
         synchronized(pending) {
@@ -2912,6 +2961,11 @@ private class QueueTagStore(context: Context) {
     @Synchronized
     fun clearActive() {
         write(load().filter { it.state == VrState.FAILED })
+    }
+
+    @Synchronized
+    fun clearAll() {
+        write(emptyList())
     }
 
     private fun write(tags: List<QueueTag>) {
