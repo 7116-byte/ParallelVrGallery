@@ -406,7 +406,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.48"
+private const val CURRENT_VERSION_TAG = "v2.49"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -1687,13 +1687,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (includeCurrent) {
             promoteCurrentImageForVr(index, queueContext)
         }
-        val occupiedStates = setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED)
+        val occupiedStates = setOf(VrState.QUEUED, VrState.GENERATING)
         fun eligibleAt(position: Int): Int? {
             val photoIndex = scopeIndices.getOrNull(position) ?: return null
             val photo = photos[photoIndex]
             if (photo.kind != MediaKind.IMAGE) return null
             if (photo.cacheKey in targetKeys) return null
-            if ((state.states[photo.cacheKey] ?: VrState.NORMAL) in occupiedStates) return null
+            val itemState = state.states[photo.cacheKey] ?: VrState.NORMAL
+            if (itemState in occupiedStates) return null
+            if (itemState == VrState.PAUSED && synchronized(paused) { photo.cacheKey !in autoPausedKeys }) return null
             if (cache.findEntry(photo, currentVersion) != null) return null
             return photoIndex
         }
@@ -1814,16 +1816,28 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val existingState = _uiState.value.states[photo.cacheKey]
         if (!force && existingState == VrState.GENERATING) return
         if (!force && !current && existingState == VrState.QUEUED) return
+        val resumableAutoPaused = !force && !current && existingState == VrState.PAUSED && synchronized(paused) { photo.cacheKey in autoPausedKeys && paused.containsKey(photo.cacheKey) }
+        if (!force && !current && existingState == VrState.PAUSED && !resumableAutoPaused) return
         val queueContext = context ?: activeQueueContext(_uiState.value)
         if (current) {
             promoteCurrentImageForVr(index, queueContext)
             return
         }
-        val job = QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
+        val job = if (resumableAutoPaused) {
+            synchronized(paused) {
+                val old = paused.remove(photo.cacheKey)
+                autoPausedKeys.remove(photo.cacheKey)
+                old?.copy(priority = priority, sequence = sequence++) ?: QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
+            }
+        } else {
+            QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
+        }
         synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
-        synchronized(paused) {
-            paused.remove(photo.cacheKey)
-            autoPausedKeys.remove(photo.cacheKey)
+        if (!resumableAutoPaused) {
+            synchronized(paused) {
+                paused.remove(photo.cacheKey)
+                autoPausedKeys.remove(photo.cacheKey)
+            }
         }
         synchronized(pending) { pending.add(job) }
         queueTags.upsert(job, VrState.QUEUED)
