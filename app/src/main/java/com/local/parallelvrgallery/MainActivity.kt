@@ -406,7 +406,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.50"
+private const val CURRENT_VERSION_TAG = "v2.51"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -662,6 +662,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val videoPending = PriorityQueue<VideoQueuedJob>(compareBy<VideoQueuedJob> { it.sequence })
     private val paused = linkedMapOf<String, QueuedJob>()
     private val autoPausedKeys = mutableSetOf<String>()
+    private val sourcePausedKeys = mutableSetOf<String>()
     private val pausedVideos = mutableSetOf<String>()
     private val pausedVideoParams = mutableMapOf<String, VideoGenerationParams>()
     private val activeVideoParams = mutableMapOf<String, VideoGenerationParams>()
@@ -882,6 +883,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun closeViewer() {
+        val wasNormalViewer = _uiState.value.viewerOrigin == ViewerOrigin.NORMAL
+        if (wasNormalViewer) {
+            clearQueuedImagePrefetch()
+        }
         _uiState.update {
             val currentIndex = it.selectedIndex ?: it.galleryAnchorIndex
             val returnToManage = it.viewerOrigin == ViewerOrigin.MANAGE_MODAL
@@ -897,11 +902,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 viewerScopeOrderedKeys = emptyList(),
                 viewerQueueSource = null,
                 viewerQueueAlbumId = null,
+                vrMode = if (wasNormalViewer) false else it.vrMode,
+                prefetchSlotState = PrefetchSlotState(),
                 galleryAnchorIndex = currentIndex,
             )
         }
-        rebalanceQueueForActiveSource()
-        startWorker()
+        if (!wasNormalViewer) {
+            rebalanceQueueForActiveSource()
+            startWorker()
+        }
     }
 
     fun setHomeTab(tab: String) {
@@ -1362,10 +1371,41 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         synchronized(paused) {
             paused.clear()
             autoPausedKeys.clear()
+            sourcePausedKeys.clear()
         }
         queueTags.clearActive()
         _uiState.update { it.copy(vrMode = false, modelProgress = null, prefetchSlotState = PrefetchSlotState()) }
         addLog("vr stopped; generated caches kept")
+    }
+
+    private fun clearQueuedImagePrefetch() {
+        val active = activeKey
+        val queuedKeys = mutableSetOf<String>()
+        synchronized(pending) {
+            queuedKeys += pending.map { it.photo.cacheKey }
+            pending.clear()
+        }
+        synchronized(currentPending) {
+            queuedKeys += currentPending.map { it.photo.cacheKey }
+            currentPending.clear()
+        }
+        synchronized(paused) {
+            queuedKeys += paused.keys
+            paused.clear()
+            autoPausedKeys.clear()
+            sourcePausedKeys.clear()
+        }
+        queuedKeys.remove(active)
+        queuedKeys.forEach { queueTags.remove(it) }
+        if (queuedKeys.isNotEmpty()) {
+            _uiState.update {
+                it.copy(
+                    states = it.states - queuedKeys,
+                    jobs = it.jobs.filterNot { job -> job.photoItem.cacheKey in queuedKeys },
+                )
+            }
+        }
+        addLog("viewer closed; cleared queued prefetch=${queuedKeys.size}")
     }
 
     fun retry(index: Int) {
@@ -1547,6 +1587,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         synchronized(paused) {
             keys.forEach { paused.remove(it) }
             autoPausedKeys.removeAll(keys)
+            sourcePausedKeys.removeAll(keys)
         }
         keys.forEach { queueTags.remove(it) }
         _uiState.update {
@@ -1564,6 +1605,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         synchronized(paused) {
             paused.clear()
             autoPausedKeys.clear()
+            sourcePausedKeys.clear()
         }
         queueTags.clearAll()
         _uiState.update {
@@ -1793,6 +1835,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         synchronized(paused) {
             paused.remove(photo.cacheKey)
             autoPausedKeys.remove(photo.cacheKey)
+            sourcePausedKeys.remove(photo.cacheKey)
         }
         synchronized(currentPending) {
             currentPending.removeAll { it.photo.cacheKey == photo.cacheKey }
@@ -1827,6 +1870,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             synchronized(paused) {
                 val old = paused.remove(photo.cacheKey)
                 autoPausedKeys.remove(photo.cacheKey)
+                sourcePausedKeys.remove(photo.cacheKey)
                 old?.copy(priority = priority, sequence = sequence++) ?: QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
             }
         } else {
@@ -1837,6 +1881,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             synchronized(paused) {
                 paused.remove(photo.cacheKey)
                 autoPausedKeys.remove(photo.cacheKey)
+                sourcePausedKeys.remove(photo.cacheKey)
             }
         }
         synchronized(pending) { pending.add(job) }
@@ -1913,6 +1958,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 deferred.forEach { job ->
                     paused[job.photo.cacheKey] = job
                     autoPausedKeys += job.photo.cacheKey
+                    sourcePausedKeys += job.photo.cacheKey
                     queueTags.upsert(job, VrState.PAUSED)
                     markState(job.photo.cacheKey, VrState.PAUSED)
                     upsertJob(job.photo, job.priority, VrState.PAUSED, 0f, source = job.source, albumId = job.albumId)
@@ -1940,6 +1986,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 allDisallowed.forEach { job ->
                     paused[job.photo.cacheKey] = job
                     autoPausedKeys += job.photo.cacheKey
+                    sourcePausedKeys += job.photo.cacheKey
                     queueTags.upsert(job, VrState.PAUSED)
                     markState(job.photo.cacheKey, VrState.PAUSED)
                     upsertJob(job.photo, job.priority, VrState.PAUSED, 0f, source = job.source, albumId = job.albumId)
@@ -1947,11 +1994,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
         }
         val restored = synchronized(paused) {
-            val items = paused.values.filter { it.photo.cacheKey in autoPausedKeys && jobAllowedInCurrentContext(it, state) }
+            val requiredPausedKeys = if (isGeneratedQueueSurface(state)) sourcePausedKeys else autoPausedKeys
+            val items = paused.values.filter { it.photo.cacheKey in requiredPausedKeys && jobAllowedInCurrentContext(it, state) }
             val keepAutoPaused = isGeneratedQueueSurface(state)
             items.forEach {
                 paused.remove(it.photo.cacheKey)
-                if (!keepAutoPaused) autoPausedKeys.remove(it.photo.cacheKey)
+                if (!keepAutoPaused) {
+                    autoPausedKeys.remove(it.photo.cacheKey)
+                    sourcePausedKeys.remove(it.photo.cacheKey)
+                }
             }
             items
         }
