@@ -284,7 +284,7 @@ data class VideoGenerationParams(
     val useGpu: Boolean = false,
     val depthWorkers: Int = 2,
 ) {
-    fun toVrParams(): VrGenerationParams = vr.copy(modelThreads = modelThreads, useGpu = useGpu, forceGpuNoFallback = false)
+    fun toVrParams(): VrGenerationParams = vr.copy(modelThreads = modelThreads, useGpu = useGpu, forceGpuNoFallback = useGpu)
 }
 
 enum class AppLanguage {
@@ -316,7 +316,7 @@ data class AppSettings(
     val modelThreads: Int = 4,
     val useGpu: Boolean = false,
     val gpuTestMode: GpuTestMode = GpuTestMode.AUTO,
-    val forceGpuNoFallback: Boolean = false,
+    val forceGpuNoFallback: Boolean = true,
     val videoModelThreads: Int = 4,
     val videoUseGpu: Boolean = false,
     val videoDepthWorkers: Int = 2,
@@ -331,11 +331,11 @@ data class AppSettings(
         modelThreads = modelThreads,
         useGpu = useGpu,
         gpuTestMode = gpuTestMode,
-        forceGpuNoFallback = false,
+        forceGpuNoFallback = useGpu,
     )
 
     fun toVideoParams(): VideoGenerationParams = VideoGenerationParams(
-        vr = toParams().copy(depthModel = videoModelId, useGpu = videoUseGpu, forceGpuNoFallback = false),
+        vr = toParams().copy(depthModel = videoModelId, useGpu = videoUseGpu, forceGpuNoFallback = videoUseGpu),
         modelThreads = videoModelThreads,
         useGpu = videoUseGpu,
         depthWorkers = videoDepthWorkers,
@@ -405,7 +405,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.36"
+private const val CURRENT_VERSION_TAG = "v2.37"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -2499,7 +2499,7 @@ private class SettingsStore(context: Context) {
             modelThreads = prefs.getInt("modelThreads", 4),
             useGpu = prefs.getBoolean("useGpu", false),
             gpuTestMode = runCatching { GpuTestMode.valueOf(prefs.getString("gpuTestMode", GpuTestMode.ACCURATE_UNSET.name) ?: GpuTestMode.ACCURATE_UNSET.name) }.getOrDefault(GpuTestMode.ACCURATE_UNSET),
-            forceGpuNoFallback = false,
+            forceGpuNoFallback = true,
             videoModelThreads = prefs.getInt("videoModelThreads", 4),
             videoUseGpu = prefs.getBoolean("videoUseGpu", false),
             videoDepthWorkers = prefs.getInt("videoDepthWorkers", 2).coerceIn(1, 2),
@@ -2524,7 +2524,7 @@ private class SettingsStore(context: Context) {
             .putInt("modelThreads", settings.modelThreads)
             .putBoolean("useGpu", settings.useGpu)
             .putString("gpuTestMode", settings.gpuTestMode.name)
-            .putBoolean("forceGpuNoFallback", false)
+            .putBoolean("forceGpuNoFallback", true)
             .putInt("videoModelThreads", settings.videoModelThreads)
             .putBoolean("videoUseGpu", settings.videoUseGpu)
             .putInt("videoDepthWorkers", settings.videoDepthWorkers)
@@ -3292,15 +3292,18 @@ private class ModelManager(private val context: Context) {
         }
 
         val tmp = File(modelsDir, "${spec.fileName}.download")
-        val urls = (listOf(spec.url) + spec.mirrors).distinct()
+        val urls = modelDownloadUrls(spec)
         val errors = mutableListOf<String>()
         for ((urlIndex, modelUrl) in urls.withIndex()) {
             if (tmp.exists()) tmp.delete()
             runCatching {
                 val connection = (URL(modelUrl).openConnection() as HttpURLConnection).apply {
                     connectTimeout = 15000
-                    readTimeout = 30000
+                    readTimeout = 60000
                     requestMethod = "GET"
+                    instanceFollowRedirects = true
+                    setRequestProperty("User-Agent", "ParallelVrGallery/$CURRENT_VERSION_TAG")
+                    setRequestProperty("Accept", "application/octet-stream,*/*")
                 }
                 connection.connect()
                 if (connection.responseCode !in 200..299) {
@@ -3332,12 +3335,31 @@ private class ModelManager(private val context: Context) {
                 onProgress(1f)
                 return modelFile
             }.onFailure { error ->
-                errors += "${modelUrl.substringBefore("?")}: ${error.message}"
+                errors += "${modelUrl.hostLabel()}: ${error.shortMessage()}"
             }
         }
         if (tmp.exists()) tmp.delete()
         error("模型下载失败，所有下载源均不可用 / Model download failed: ${errors.joinToString(" | ")}")
     }
+
+    private fun modelDownloadUrls(spec: ModelSpec): List<String> {
+        val direct = listOf(spec.url) + spec.mirrors
+        val generatedMirrors = if (spec.url.contains("github.com/$GITHUB_REPO/releases/download/")) {
+            listOf(
+                "https://gh-proxy.com/${spec.url}",
+                "https://ghproxy.net/${spec.url}",
+            )
+        } else {
+            emptyList()
+        }
+        return (direct + generatedMirrors)
+            .filter { it.isNotBlank() }
+            .distinct()
+    }
+
+    private fun String.hostLabel(): String = runCatching { URL(this).host }
+        .getOrDefault(this.substringBefore('/'))
+        .removePrefix("www.")
 }
 
 private class VrGenerator(
