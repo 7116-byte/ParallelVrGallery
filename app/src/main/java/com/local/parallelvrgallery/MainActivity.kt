@@ -406,7 +406,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.49"
+private const val CURRENT_VERSION_TAG = "v2.50"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -1878,8 +1878,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun jobAllowedInCurrentContext(job: QueuedJob, state: UiState): Boolean {
         if (isGeneratedQueueSurface(state)) {
-            if (sameQueueSource(job, QueueContext(QueueSource.GENERATED, null))) return true
-            return job.source != QueueSource.GENERATED && synchronized(paused) { job.photo.cacheKey in autoPausedKeys }
+            return sameQueueSource(job, QueueContext(QueueSource.GENERATED, null))
         }
         if (state.vrMode && state.viewerOrigin == ViewerOrigin.NORMAL && state.viewerScopeOrderedKeys.isNotEmpty() && job.photo.cacheKey !in state.viewerScopeOrderedKeys) {
             return false
