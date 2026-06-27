@@ -284,7 +284,7 @@ data class VideoGenerationParams(
     val useGpu: Boolean = false,
     val depthWorkers: Int = 2,
 ) {
-    fun toVrParams(): VrGenerationParams = vr.copy(modelThreads = modelThreads, useGpu = useGpu, forceGpuNoFallback = useGpu)
+    fun toVrParams(): VrGenerationParams = vr.copy(modelThreads = modelThreads, useGpu = useGpu, forceGpuNoFallback = false)
 }
 
 enum class AppLanguage {
@@ -316,7 +316,7 @@ data class AppSettings(
     val modelThreads: Int = 4,
     val useGpu: Boolean = false,
     val gpuTestMode: GpuTestMode = GpuTestMode.AUTO,
-    val forceGpuNoFallback: Boolean = true,
+    val forceGpuNoFallback: Boolean = false,
     val videoModelThreads: Int = 4,
     val videoUseGpu: Boolean = false,
     val videoDepthWorkers: Int = 2,
@@ -331,11 +331,11 @@ data class AppSettings(
         modelThreads = modelThreads,
         useGpu = useGpu,
         gpuTestMode = gpuTestMode,
-        forceGpuNoFallback = useGpu,
+        forceGpuNoFallback = false,
     )
 
     fun toVideoParams(): VideoGenerationParams = VideoGenerationParams(
-        vr = toParams().copy(depthModel = videoModelId, useGpu = videoUseGpu, forceGpuNoFallback = videoUseGpu),
+        vr = toParams().copy(depthModel = videoModelId, useGpu = videoUseGpu, forceGpuNoFallback = false),
         modelThreads = videoModelThreads,
         useGpu = videoUseGpu,
         depthWorkers = videoDepthWorkers,
@@ -985,7 +985,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.33"
+                    val current = "v2.34"
                     if (compareVersionTags(latest, current) <= 0) {
                         UpdateCheckResult(lang.t("已是最新版本：$current", "Already up to date: $current"), null, latest, false)
                     } else {
@@ -1130,8 +1130,13 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
             return
         }
-        if (_uiState.value.vrMode) {
+        val currentState = _uiState.value.states[item.cacheKey] ?: VrState.NORMAL
+        if (_uiState.value.vrMode && currentState == VrState.READY) {
             stopVr()
+        } else if (_uiState.value.vrMode) {
+            enqueuePhoto(index, priority = 0, force = currentState == VrState.FAILED, current = true)
+            startCurrentWorker()
+            startWorker()
         } else {
             _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow) }
             enqueueWindow(index, includeCurrent = true)
@@ -2309,7 +2314,7 @@ private class SettingsStore(context: Context) {
             modelThreads = prefs.getInt("modelThreads", 4),
             useGpu = prefs.getBoolean("useGpu", false),
             gpuTestMode = runCatching { GpuTestMode.valueOf(prefs.getString("gpuTestMode", GpuTestMode.ACCURATE_UNSET.name) ?: GpuTestMode.ACCURATE_UNSET.name) }.getOrDefault(GpuTestMode.ACCURATE_UNSET),
-            forceGpuNoFallback = true,
+            forceGpuNoFallback = false,
             videoModelThreads = prefs.getInt("videoModelThreads", 4),
             videoUseGpu = prefs.getBoolean("videoUseGpu", false),
             videoDepthWorkers = prefs.getInt("videoDepthWorkers", 2).coerceIn(1, 2),
@@ -2334,7 +2339,7 @@ private class SettingsStore(context: Context) {
             .putInt("modelThreads", settings.modelThreads)
             .putBoolean("useGpu", settings.useGpu)
             .putString("gpuTestMode", settings.gpuTestMode.name)
-            .putBoolean("forceGpuNoFallback", true)
+            .putBoolean("forceGpuNoFallback", false)
             .putInt("videoModelThreads", settings.videoModelThreads)
             .putBoolean("videoUseGpu", settings.videoUseGpu)
             .putInt("videoDepthWorkers", settings.videoDepthWorkers)
@@ -4797,6 +4802,30 @@ private fun GalleryScreen(
     onRegenerateImages: (List<Int>) -> Unit,
 ) {
     val lang = state.settings.language
+    val view = LocalView.current
+    DisposableEffect(Unit) {
+        val window = (view.context as? Activity)?.window
+        val oldStatusBarColor = window?.statusBarColor
+        val oldSystemUiVisibility = window?.decorView?.systemUiVisibility
+        if (Build.VERSION.SDK_INT >= 21) {
+            window?.statusBarColor = Color.TRANSPARENT
+        }
+        if (Build.VERSION.SDK_INT >= 23) {
+            window?.decorView?.systemUiVisibility =
+                (oldSystemUiVisibility ?: 0) or
+                    android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                    android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        }
+        onDispose {
+            if (Build.VERSION.SDK_INT >= 21 && oldStatusBarColor != null) {
+                window?.statusBarColor = oldStatusBarColor
+            }
+            if (Build.VERSION.SDK_INT >= 23 && oldSystemUiVisibility != null) {
+                window?.decorView?.systemUiVisibility = oldSystemUiVisibility
+            }
+        }
+    }
     var lastPinchAt by remember { mutableStateOf(0L) }
     var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     val systemItems = remember(state.photos) { state.photos.filterNot { it.generatedVirtual } }
@@ -4828,51 +4857,7 @@ private fun GalleryScreen(
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
             containerColor = androidx.compose.ui.graphics.Color.Transparent,
-            topBar = {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .background(androidx.compose.ui.graphics.Color(0xccffffff))
-                        .statusBarsPadding()
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (selectedKeys.isEmpty()) {
-                        val title = when {
-                            state.homeTab == "albums" && state.selectedAlbumId != null -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Album")
-                            state.homeTab == "albums" -> lang.t("相册", "Albums")
-                            state.homeTab == "generated" -> lang.t("生成", "Generated")
-                            else -> lang.t("全部", "All")
-                        }
-                        if (state.homeTab == "albums" && state.selectedAlbumId != null) {
-                            OutlinedButton(onClick = onCloseAlbum) { Text(lang.t("返回", "Back")) }
-                            Spacer(Modifier.width(8.dp))
-                        }
-                        Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
-                        Spacer(Modifier.width(8.dp))
-                        OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
-                    } else {
-                        Text(lang.t("已选择 ${selectedKeys.size} 项", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
-                        Spacer(Modifier.width(8.dp))
-                        Button(onClick = {
-                            onSaveGenerated(selectedIndexes)
-                            selectedKeys = emptySet()
-                        }) { Text(lang.t("保存", "Save")) }
-                        Spacer(Modifier.width(8.dp))
-                        Button(onClick = {
-                            onReplaceOriginal(selectedIndexes)
-                            selectedKeys = emptySet()
-                        }) { Text(lang.t("替换", "Replace")) }
-                    }
-                }
-                state.message?.let {
-                    Spacer(Modifier.height(6.dp))
-                    Text(lang.pickMixed(it), style = MaterialTheme.typography.bodySmall)
-                }
-            }
-            },
+            contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
         ) { padding ->
             if (state.loading) {
                 Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
@@ -4953,7 +4938,7 @@ private fun GalleryScreen(
                     },
                     onItemLongClick = { photo ->
                         if (System.currentTimeMillis() - lastPinchAt > 700L) {
-                    selectedKeys = selectedKeys + photo.cacheKey
+                            selectedKeys = selectedKeys + photo.cacheKey
                         }
                     },
                     onNearEnd = {
@@ -4983,6 +4968,50 @@ private fun GalleryScreen(
                 )
             }
         }
+        Column(
+            Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .background(androidx.compose.ui.graphics.Color(0x88ffffff))
+                .statusBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+        ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (selectedKeys.isEmpty()) {
+                        val title = when {
+                            state.homeTab == "albums" && state.selectedAlbumId != null -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Album")
+                            state.homeTab == "albums" -> lang.t("相册", "Albums")
+                            state.homeTab == "generated" -> lang.t("生成", "Generated")
+                            else -> lang.t("全部", "All")
+                        }
+                        if (state.homeTab == "albums" && state.selectedAlbumId != null) {
+                            OutlinedButton(onClick = onCloseAlbum) { Text(lang.t("返回", "Back")) }
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
+                    } else {
+                        Text(lang.t("已选择 ${selectedKeys.size} 项", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
+                        Spacer(Modifier.width(8.dp))
+                        Button(onClick = {
+                            onSaveGenerated(selectedIndexes)
+                            selectedKeys = emptySet()
+                        }) { Text(lang.t("保存", "Save")) }
+                        Spacer(Modifier.width(8.dp))
+                        Button(onClick = {
+                            onReplaceOriginal(selectedIndexes)
+                            selectedKeys = emptySet()
+                        }) { Text(lang.t("替换", "Replace")) }
+                    }
+                }
+                state.message?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(lang.pickMixed(it), style = MaterialTheme.typography.bodySmall)
+                }
+            }
         HomeBottomNav(
             current = state.homeTab,
             lang = lang,
@@ -6084,7 +6113,15 @@ private fun ViewerScreen(
                                 VideoVrState.FAILED -> lang.t("重试视频 VR", "Retry video VR")
                             }
                         } else if (state.vrMode) {
-                            lang.t("关闭 VR", "VR Off")
+                            val imageState = currentItem?.let { state.states[it.cacheKey] } ?: VrState.NORMAL
+                            when (imageState) {
+                                VrState.READY -> lang.t("关闭 VR", "VR Off")
+                                VrState.GENERATING -> lang.t("生成中", "Generating")
+                                VrState.QUEUED -> lang.t("继续生成", "Resume")
+                                VrState.PAUSED -> lang.t("继续生成", "Resume")
+                                VrState.FAILED -> lang.t("重试 VR", "Retry VR")
+                                VrState.NORMAL -> lang.t("生成 VR", "Generate VR")
+                            }
                         } else {
                             lang.t("开启 VR", "VR On")
                         },
@@ -6221,7 +6258,7 @@ private fun DebugScreen(
                     DebugLine("Threads", "${videoJob?.modelThreads ?: state.settings.videoModelThreads}")
                     DebugLine("GPU requested", "${videoJob?.useGpu ?: state.settings.videoUseGpu}")
                     DebugLine("GPU mode", state.settings.gpuTestMode.name)
-                    DebugLine("Force GPU", "${videoJob?.useGpu ?: state.settings.videoUseGpu}")
+                    DebugLine("Force GPU", "${state.settings.toVideoParams().toVrParams().forceGpuNoFallback}")
                     DebugLine("Runtime", videoJob?.runtimeInfo?.ifBlank { "-" } ?: "-")
                     DebugLine("Output", videoEntry?.outputPath ?: "-")
                     DebugLine(lang.t("深度 worker", "Depth workers"), "${videoJob?.depthWorkers?.takeIf { it > 0 } ?: state.settings.videoDepthWorkers.coerceIn(1, 2)}")
@@ -6242,7 +6279,7 @@ private fun DebugScreen(
                     DebugLine("Threads", "${state.settings.modelThreads}")
                     DebugLine("GPU requested", "${state.settings.useGpu}")
                     DebugLine("GPU mode", state.settings.gpuTestMode.name)
-                    DebugLine("Force GPU", "${state.settings.useGpu}")
+                    DebugLine("Force GPU", "${state.settings.toParams().forceGpuNoFallback}")
                     DebugLine("Error", job?.error ?: "-")
                 }
                 DebugSection(lang.t("性能诊断", "Performance")) {
