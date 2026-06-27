@@ -131,6 +131,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -405,7 +406,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.41"
+private const val CURRENT_VERSION_TAG = "v2.42"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -443,6 +444,8 @@ data class VrJob(
     val priority: Int,
     val state: VrState,
     val progress: Float,
+    val source: QueueSource? = null,
+    val albumId: String? = null,
     val startedAt: Long? = null,
     val finishedAt: Long? = null,
     val error: String? = null,
@@ -603,7 +606,7 @@ private sealed class TimelineCell {
     data class Footer(val loaded: Int, val total: Int, val text: String? = null) : TimelineCell()
 }
 
-private enum class QueueSource {
+enum class QueueSource {
     ALL,
     ALBUM,
     GENERATED,
@@ -827,7 +830,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 selectedIndex = index,
                 galleryAnchorIndex = index,
                 galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
-                vrMode = true,
                 manageOpen = false,
                 homeTab = if (origin == ViewerOrigin.GENERATED_TAB) "generated" else it.homeTab,
                 generatedTab = "images",
@@ -857,7 +859,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 selectedIndex = index,
                 galleryAnchorIndex = index,
                 galleryScrollIndex = max(0, index - it.galleryAnchorSlot),
-                vrMode = true,
                 manageOpen = false,
                 homeTab = if (origin == ViewerOrigin.GENERATED_TAB) "generated" else it.homeTab,
                 generatedTab = "videos",
@@ -1642,14 +1643,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
         synchronized(pending) {
             val keep = targets.map { photos[it.first].cacheKey }.toSet()
-            val toPause = pending.filter { it.photo.cacheKey !in keep }
+            val toPause = pending.filter { sameQueueSource(it, queueContext) && it.photo.cacheKey !in keep }
             pending.removeAll(toPause.toSet())
             toPause.forEach { job ->
                 paused[job.photo.cacheKey] = job
                 autoPausedKeys += job.photo.cacheKey
                 queueTags.upsert(job, VrState.PAUSED)
                 markState(job.photo.cacheKey, VrState.PAUSED)
-                upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
+                upsertJob(job.photo, job.priority, VrState.PAUSED, 0f, source = job.source, albumId = job.albumId)
             }
         }
         targets.forEach { (targetIndex, priority) -> enqueuePhoto(targetIndex, priority, force = false, current = false, context = queueContext) }
@@ -1679,7 +1680,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
         queueTags.upsert(job, VrState.QUEUED)
         markState(photo.cacheKey, VrState.QUEUED)
-        upsertJob(photo, priority = 0, state = VrState.QUEUED, progress = 0f)
+        upsertJob(photo, priority = 0, state = VrState.QUEUED, progress = 0f, source = job.source, albumId = job.albumId)
         addLog("current ${photo.displayName} p=0 source=${queueContext.source}${queueContext.albumId?.let { ":$it" } ?: ""}")
         startCurrentWorker()
     }
@@ -1709,6 +1710,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         synchronized(pending) { pending.add(job) }
         queueTags.upsert(job, VrState.QUEUED)
         markState(photo.cacheKey, VrState.QUEUED)
+        upsertJob(photo, priority, VrState.QUEUED, 0f, source = job.source, albumId = job.albumId)
         addLog("${if (current) "current" else "queued"} ${photo.displayName} p=$priority source=${queueContext.source}${queueContext.albumId?.let { ":$it" } ?: ""}")
     }
 
@@ -1774,7 +1776,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     autoPausedKeys += job.photo.cacheKey
                     queueTags.upsert(job, VrState.PAUSED)
                     markState(job.photo.cacheKey, VrState.PAUSED)
-                    upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
+                    upsertJob(job.photo, job.priority, VrState.PAUSED, 0f, source = job.source, albumId = job.albumId)
                 }
             }
         }
@@ -1788,14 +1790,20 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             pending.removeAll(items.toSet())
             items
         }
-        if (disallowed.isNotEmpty()) {
+        val disallowedCurrent = synchronized(currentPending) {
+            val items = currentPending.filterNot { jobAllowedInCurrentContext(it, state) }
+            currentPending.removeAll(items.toSet())
+            items
+        }
+        val allDisallowed = disallowed + disallowedCurrent
+        if (allDisallowed.isNotEmpty()) {
             synchronized(paused) {
-                disallowed.forEach { job ->
+                allDisallowed.forEach { job ->
                     paused[job.photo.cacheKey] = job
                     autoPausedKeys += job.photo.cacheKey
                     queueTags.upsert(job, VrState.PAUSED)
                     markState(job.photo.cacheKey, VrState.PAUSED)
-                    upsertJob(job.photo, job.priority, VrState.PAUSED, 0f)
+                    upsertJob(job.photo, job.priority, VrState.PAUSED, 0f, source = job.source, albumId = job.albumId)
                 }
             }
         }
@@ -1812,7 +1820,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             restored.forEach { job ->
                 queueTags.upsert(job, VrState.QUEUED)
                 markState(job.photo.cacheKey, VrState.QUEUED)
-                upsertJob(job.photo, job.priority, VrState.QUEUED, 0f)
+                upsertJob(job.photo, job.priority, VrState.QUEUED, 0f, source = job.source, albumId = job.albumId)
             }
         }
     }
@@ -2130,7 +2138,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         activeKey = next.photo.cacheKey
         queueTags.upsert(next, VrState.GENERATING)
         markState(next.photo.cacheKey, VrState.GENERATING)
-        upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f)
+        upsertJob(next.photo, next.priority, VrState.GENERATING, 0.1f, source = next.source, albumId = next.albumId)
         val started = System.currentTimeMillis()
         val result = runCatching {
             generator.generate(
@@ -2149,18 +2157,19 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     }
                 },
             ) { progress ->
-                upsertJob(next.photo, next.priority, VrState.GENERATING, progress)
+                upsertJob(next.photo, next.priority, VrState.GENERATING, progress, source = next.source, albumId = next.albumId)
             }
         }
         result.onSuccess { entry ->
             queueTags.remove(next.photo.cacheKey)
             synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
             markReady(next.photo.cacheKey, entry)
-            upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis())
+            upsertJob(next.photo, next.priority, VrState.READY, 1f, finishedAt = System.currentTimeMillis(), source = next.source, albumId = next.albumId)
             addLog("ready ${next.photo.displayName} ${entry.width}x${entry.height}")
-            val selected = _uiState.value.selectedIndex ?: _uiState.value.galleryAnchorIndex
-            val doneIndex = _uiState.value.photos.indexOfFirst { it.cacheKey == next.photo.cacheKey }
-            val generationInfo = LastGenerationInfo(doneIndex - selected, System.currentTimeMillis() - started)
+            val currentState = _uiState.value
+            val selected = currentState.selectedIndex ?: currentState.galleryAnchorIndex
+            val doneIndex = currentState.photos.indexOfFirst { it.cacheKey == next.photo.cacheKey }
+            val generationInfo = LastGenerationInfo(relativeIndexInViewerScope(currentState, doneIndex, selected), System.currentTimeMillis() - started)
             _uiState.update {
                 it.copy(
                     modelProgress = null,
@@ -2174,7 +2183,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             synchronized(paused) { autoPausedKeys.remove(next.photo.cacheKey) }
             queueTags.upsert(next, VrState.FAILED)
             markState(next.photo.cacheKey, VrState.FAILED)
-            upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message)
+            upsertJob(next.photo, next.priority, VrState.FAILED, 1f, finishedAt = System.currentTimeMillis(), error = error.message, source = next.source, albumId = next.albumId)
             addLog("failed ${next.photo.displayName}: ${error.message}")
         }
         activeKey = null
@@ -2238,14 +2247,19 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         progress: Float,
         finishedAt: Long? = null,
         error: String? = null,
+        source: QueueSource? = null,
+        albumId: String? = null,
     ) {
         _uiState.update { current ->
+            val previous = current.jobs.firstOrNull { it.photoItem.cacheKey == photo.cacheKey }
             val existing = current.jobs.filterNot { it.photoItem.cacheKey == photo.cacheKey }
             val job = VrJob(
                 photoItem = photo,
                 priority = priority,
                 state = state,
                 progress = progress,
+                source = source ?: previous?.source,
+                albumId = albumId ?: previous?.albumId,
                 startedAt = System.currentTimeMillis(),
                 finishedAt = finishedAt,
                 error = error,
@@ -2407,11 +2421,31 @@ private fun statusBadgeTextColor(text: String): androidx.compose.ui.graphics.Col
     else -> androidx.compose.ui.graphics.Color.White
 }
 
+private fun viewerScopeIndices(state: UiState): List<Int> {
+    if (state.photos.isEmpty()) return emptyList()
+    val indexByKey = state.photos.mapIndexed { index, item -> item.cacheKey to index }.toMap()
+    return when {
+        state.viewerScopeOrderedKeys.isNotEmpty() -> state.viewerScopeOrderedKeys.mapNotNull { indexByKey[it] }.distinct()
+        state.viewerScopeKeys.isNotEmpty() -> state.photos.mapIndexedNotNull { index, item -> if (item.cacheKey in state.viewerScopeKeys) index else null }
+        else -> state.photos.indices.toList()
+    }
+}
+
+private fun relativeIndexInViewerScope(state: UiState, index: Int, selectedIndex: Int): Int {
+    val scopeIndices = viewerScopeIndices(state)
+    val itemPosition = scopeIndices.indexOf(index)
+    val selectedPosition = scopeIndices.indexOf(selectedIndex)
+    return if (itemPosition >= 0 && selectedPosition >= 0) itemPosition - selectedPosition else index - selectedIndex
+}
+
 private fun imageSideCount(state: UiState, index: Int, offsetStep: Int, states: Set<VrState>): Int {
+    val scopeIndices = viewerScopeIndices(state)
+    val startPosition = scopeIndices.indexOf(index)
+    if (startPosition < 0) return 0
     var count = 0
-    var cursor = index + offsetStep
-    while (cursor in state.photos.indices) {
-        val item = state.photos[cursor]
+    var cursor = startPosition + offsetStep
+    while (cursor in scopeIndices.indices) {
+        val item = state.photos[scopeIndices[cursor]]
         if (item.kind != MediaKind.IMAGE) {
             cursor += offsetStep
             continue
@@ -2438,12 +2472,15 @@ private fun imageQueueLine(state: UiState, index: Int, lang: AppLanguage): Strin
 }
 
 private fun imageWindowCount(state: UiState, index: Int, offsetStep: Int, states: Set<VrState>): Int {
+    val scopeIndices = viewerScopeIndices(state)
+    val startPosition = scopeIndices.indexOf(index)
+    if (startPosition < 0) return 0
     var count = 0
     var seenImages = 0
-    var cursor = index + offsetStep
+    var cursor = startPosition + offsetStep
     val window = state.activePrefetchWindow.coerceAtMost(8)
-    while (cursor in state.photos.indices && seenImages < window) {
-        val item = state.photos[cursor]
+    while (cursor in scopeIndices.indices && seenImages < window) {
+        val item = state.photos[scopeIndices[cursor]]
         if (item.kind == MediaKind.IMAGE) {
             seenImages++
             val itemState = state.states[item.cacheKey] ?: VrState.NORMAL
@@ -2533,26 +2570,10 @@ private fun imageRecentGenerationLines(state: UiState, lang: AppLanguage): List<
 }
 
 private fun imagePrefetchSummary(state: UiState, index: Int, lang: AppLanguage): String {
-    fun countSide(offsetStep: Int, states: Set<VrState>): Int {
-        var count = 0
-        var cursor = index + offsetStep
-        while (cursor in state.photos.indices) {
-            val item = state.photos[cursor]
-            if (item.kind != MediaKind.IMAGE) {
-                cursor += offsetStep
-                continue
-            }
-            val itemState = state.states[item.cacheKey] ?: VrState.NORMAL
-            if (itemState !in states) break
-            count++
-            cursor += offsetStep
-        }
-        return count
-    }
-    val readyPrev = countSide(-1, setOf(VrState.READY))
-    val readyNext = countSide(1, setOf(VrState.READY))
-    val queuedPrev = countSide(-1, setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED))
-    val queuedNext = countSide(1, setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED))
+    val readyPrev = imageSideCount(state, index, -1, setOf(VrState.READY))
+    val readyNext = imageSideCount(state, index, 1, setOf(VrState.READY))
+    val queuedPrev = imageSideCount(state, index, -1, setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED))
+    val queuedNext = imageSideCount(state, index, 1, setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED))
     val last = state.lastGeneration?.let {
         val side = when {
             it.relativeIndex < 0 -> lang.t("前${abs(it.relativeIndex)}", "prev ${abs(it.relativeIndex)}")
@@ -5120,6 +5141,7 @@ private fun GalleryScreen(
     onRegenerateImages: (List<Int>) -> Unit,
 ) {
     val lang = state.settings.language
+    val density = LocalDensity.current
     val view = LocalView.current
     DisposableEffect(Unit) {
         val window = (view.context as? Activity)?.window
@@ -5171,7 +5193,8 @@ private fun GalleryScreen(
     )
     val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
     val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
-    val topContentPadding = 96.dp
+    var topBarHeightPx by remember { mutableStateOf(0) }
+    val topContentPadding = with(density) { topBarHeightPx.toDp() }
     val topBarScrollOffset = when {
         state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
         state.homeTab == "generated" && state.selectedGeneratedVersion != null -> {
@@ -5182,8 +5205,12 @@ private fun GalleryScreen(
         state.homeTab == "albums" && state.selectedAlbumId == null -> albumListGridState.firstVisibleItemIndex * 240 + albumListGridState.firstVisibleItemScrollOffset
         else -> gridState.firstVisibleItemIndex * 240 + gridState.firstVisibleItemScrollOffset
     }
-    val topBarOverlap = (topBarScrollOffset - topContentPadding.value).coerceAtLeast(0f)
-    val topBarAlpha = (0.98f - (topBarOverlap / 180f).coerceIn(0f, 0.48f)).coerceIn(0.5f, 0.98f)
+    val topBarOverlap = topBarScrollOffset.coerceAtLeast(0).toFloat()
+    val topBarAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
+        0.98f
+    } else {
+        (0.98f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.48f).coerceIn(0.5f, 0.98f)
+    }
 
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
@@ -5310,7 +5337,8 @@ private fun GalleryScreen(
                 .fillMaxWidth()
                 .background(androidx.compose.ui.graphics.Color.White.copy(alpha = topBarAlpha))
                 .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .onSizeChanged { topBarHeightPx = it.height },
         ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selectedKeys.isEmpty()) {
@@ -6441,6 +6469,7 @@ private fun ViewerScreen(
     onOpenDebug: (Int) -> Unit,
 ) {
     val lang = state.settings.language
+    val generatedViewer = state.viewerOrigin != ViewerOrigin.NORMAL
     val view = LocalView.current
     DisposableEffect(Unit) {
         val window = (view.context as? ComponentActivity)?.window
@@ -6522,7 +6551,7 @@ private fun ViewerScreen(
             } else {
                 val entry = generatedEntryByKey[photo.cacheKey] ?: state.entries[photo.cacheKey]
                 val vrState = state.states[photo.cacheKey] ?: VrState.NORMAL
-                if (state.vrMode && entry != null) {
+                if ((state.vrMode || generatedViewer) && entry != null) {
                     SyncSbsZoomImage(Uri.fromFile(File(entry.outputPath)), Modifier.fillMaxSize()) {
                         controlsVisible = !controlsVisible
                     }
@@ -6537,7 +6566,7 @@ private fun ViewerScreen(
                                 detectTapGestures(onTap = { controlsVisible = !controlsVisible })
                             },
                     )
-                    if (state.vrMode && vrState != VrState.READY) {
+                    if (state.vrMode && !generatedViewer && vrState != VrState.READY) {
                         StatusOverlay(vrState, lang, onRetry = { onRetry(sourceIndex) })
                     }
                 }
@@ -6560,9 +6589,11 @@ private fun ViewerScreen(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
-                Button(onClick = { onVr(currentIndex) }) {
+                Button(onClick = { onVr(currentIndex) }, enabled = !generatedViewer) {
                     Text(
-                        if (currentItem?.kind == MediaKind.VIDEO) {
+                        if (generatedViewer) {
+                            lang.t("已生成", "Ready")
+                        } else if (currentItem?.kind == MediaKind.VIDEO) {
                             when (state.videoStates[currentItem.cacheKey] ?: VideoVrState.NORMAL) {
                                 VideoVrState.NORMAL -> lang.t("加入 VR 队列", "Add to VR queue")
                                 VideoVrState.QUEUED -> lang.t("暂停生成", "Pause")
@@ -6582,7 +6613,7 @@ private fun ViewerScreen(
                 OutlinedButton(onClick = { onOpenDebug(currentIndex) }) { Text(lang.t("调试", "Debug")) }
             }
             val current = viewerItems.getOrNull(pagerState.currentPage)?.second
-            if (current?.kind != MediaKind.VIDEO) Column(
+            if (!generatedViewer && state.vrMode && current?.kind != MediaKind.VIDEO) Column(
                 modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
             ) {
                 if (current != null) {
@@ -6724,6 +6755,8 @@ private fun DebugScreen(
                 DebugSection(lang.t("图片运行状态", "Image runtime")) {
                     DebugLine("State", "$vrState")
                     DebugLine("Job", job?.let { "${it.state} ${(it.progress * 100f).roundToInt()}%" } ?: "-")
+                    DebugLine("Source", job?.source?.name ?: state.viewerQueueSource ?: "-")
+                    DebugLine("Album", job?.albumId ?: state.viewerQueueAlbumId ?: "-")
                     DebugLine("Cache", entry?.version ?: "-")
                     DebugLine("Output", entry?.let { "${it.width}x${it.height}" } ?: "-")
                     DebugLine("Model", state.settings.imageModelId)
@@ -6759,7 +6792,8 @@ private fun DebugScreen(
                     DebugMonoLine("${it.state.label(lang)} ${(it.progress * 100f).roundToInt()}% f=${it.currentFrame}/${it.totalFrames} ${it.item.displayName}")
                 }
                 state.jobs.take(4).forEach {
-                    DebugMonoLine("${it.state.label(lang)} ${(it.progress * 100f).roundToInt()}% ${it.photoItem.displayName}")
+                    val sourceLabel = it.source?.name?.let { source -> "$source${it.albumId?.let { album -> ":$album" } ?: ""}" } ?: "-"
+                    DebugMonoLine("${it.state.label(lang)} ${(it.progress * 100f).roundToInt()}% [$sourceLabel] ${it.photoItem.displayName}")
                 }
             }
             DebugSection(lang.t("最近日志", "Recent app logs")) {
