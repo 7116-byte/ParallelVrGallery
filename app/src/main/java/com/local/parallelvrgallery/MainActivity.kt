@@ -985,7 +985,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
                     val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
                     val url = downloadUrl ?: pageUrl
-                    val current = "v2.32"
+                    val current = "v2.33"
                     if (compareVersionTags(latest, current) <= 0) {
                         UpdateCheckResult(lang.t("已是最新版本：$current", "Already up to date: $current"), null, latest, false)
                     } else {
@@ -4827,8 +4827,15 @@ private fun GalleryScreen(
 
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
+            containerColor = androidx.compose.ui.graphics.Color.Transparent,
             topBar = {
-                Column(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp, vertical = 12.dp)) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(androidx.compose.ui.graphics.Color(0xccffffff))
+                        .statusBarsPadding()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selectedKeys.isEmpty()) {
                         val title = when {
