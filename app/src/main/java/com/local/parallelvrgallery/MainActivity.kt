@@ -406,7 +406,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.42"
+private const val CURRENT_VERSION_TAG = "v2.43"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -1606,6 +1606,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun refreshWindow(index: Int) {
+        if (_uiState.value.viewerOrigin != ViewerOrigin.NORMAL) return
         enqueueWindow(index, includeCurrent = false)
     }
 
@@ -1613,6 +1614,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val state = _uiState.value
         val photos = state.photos
         if (!state.vrMode) return
+        if (state.viewerOrigin != ViewerOrigin.NORMAL) return
         if (photos.isEmpty()) return
         val photoIndexByKey = photos.mapIndexed { photoIndex, item -> item.cacheKey to photoIndex }.toMap()
         val scopeIndices = if (state.viewerScopeOrderedKeys.isNotEmpty()) {
@@ -2190,9 +2192,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun expandAutoPrefetchIfNeeded(): Boolean {
-        if (!_uiState.value.vrMode || !_uiState.value.settings.autoPrefetch) return false
-        val selected = _uiState.value.selectedIndex ?: _uiState.value.galleryAnchorIndex
-        val next = when (_uiState.value.activePrefetchWindow) {
+        val state = _uiState.value
+        if (!state.vrMode || !state.settings.autoPrefetch || state.viewerOrigin != ViewerOrigin.NORMAL) return false
+        val selected = state.selectedIndex ?: state.galleryAnchorIndex
+        val next = when (state.activePrefetchWindow) {
             2 -> 4
             4 -> 8
             else -> return false
