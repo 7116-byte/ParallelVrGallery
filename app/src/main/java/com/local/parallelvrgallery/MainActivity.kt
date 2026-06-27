@@ -405,6 +405,9 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
+private const val CURRENT_VERSION_TAG = "v2.35"
+private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
+private const val UPDATE_APK_NAME = "app-debug.apk"
 
 private object AppWorkScopes {
     val video = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -579,6 +582,13 @@ private data class UpdateCheckResult(
     val url: String?,
     val version: String?,
     val available: Boolean,
+)
+
+private data class ReleaseInfo(
+    val tag: String,
+    val apkUrl: String?,
+    val pageUrl: String?,
+    val source: String,
 )
 
 private sealed class TimelineCell {
@@ -972,28 +982,38 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    val connection = (URL("https://api.github.com/repos/7116-byte/ParallelVrGallery/releases/latest").openConnection() as HttpURLConnection).apply {
-                        connectTimeout = 12000
-                        readTimeout = 12000
-                        requestMethod = "GET"
-                        setRequestProperty("Accept", "application/vnd.github+json")
+                runCatching { fetchLatestReleaseInfo() }
+                    .map { release ->
+                        val url = release.apkUrl ?: release.pageUrl
+                        if (compareVersionTags(release.tag, CURRENT_VERSION_TAG) <= 0) {
+                            UpdateCheckResult(
+                                lang.t("已是最新版本：$CURRENT_VERSION_TAG", "Already up to date: $CURRENT_VERSION_TAG"),
+                                null,
+                                release.tag,
+                                false,
+                            )
+                        } else {
+                            UpdateCheckResult(
+                                lang.t(
+                                    "发现新版本：${release.tag}，当前：$CURRENT_VERSION_TAG（${release.source}）",
+                                    "New version: ${release.tag}, current: $CURRENT_VERSION_TAG (${release.source})",
+                                ),
+                                url,
+                                release.tag,
+                                url != null,
+                            )
+                        }
+                    }.getOrElse { error ->
+                        UpdateCheckResult(
+                            lang.t(
+                                "检查更新失败：${error.message}。可打开 Release 页面手动下载。",
+                                "Update check failed: ${error.message}. Open Releases to download manually.",
+                            ),
+                            "https://github.com/$GITHUB_REPO/releases/latest",
+                            null,
+                            true,
+                        )
                     }
-                    connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-                }.mapCatching { body ->
-                    val latest = Regex("\"tag_name\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1) ?: "unknown"
-                    val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*app-debug\\.apk)\"").find(body)?.groupValues?.getOrNull(1)
-                    val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
-                    val url = downloadUrl ?: pageUrl
-                    val current = "v2.34"
-                    if (compareVersionTags(latest, current) <= 0) {
-                        UpdateCheckResult(lang.t("已是最新版本：$current", "Already up to date: $current"), null, latest, false)
-                    } else {
-                        UpdateCheckResult(lang.t("发现新版本：$latest，当前：$current", "New version: $latest, current: $current"), url, latest, url != null)
-                    }
-                }.getOrElse { error ->
-                    UpdateCheckResult(lang.t("检查更新失败：${error.message}", "Update check failed: ${error.message}"), null, null, false)
-                }
             }
             _uiState.update {
                 it.copy(
@@ -1006,11 +1026,179 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    private fun fetchLatestReleaseInfo(): ReleaseInfo {
+        val errors = mutableListOf<String>()
+        for (apiUrl in updateApiUrls()) {
+            runCatching {
+                val body = httpGetText(apiUrl, accept = "application/vnd.github+json")
+                val latest = Regex("\"tag_name\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.getOrNull(1)
+                    ?: error("missing tag_name")
+                val downloadUrl = Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]*$UPDATE_APK_NAME)\"")
+                    .find(body)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.replace("\\/", "/")
+                val pageUrl = Regex("\"html_url\"\\s*:\\s*\"([^\"]+)\"")
+                    .find(body)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.replace("\\/", "/")
+                return ReleaseInfo(latest, downloadUrl ?: releaseApkUrl(latest), pageUrl ?: releasePageUrl(latest), apiUrl.hostLabel())
+            }.onFailure { error ->
+                errors += "${apiUrl.hostLabel()}: ${error.shortMessage()}"
+            }
+        }
+
+        for (latestUrl in updateLatestPageUrls()) {
+            runCatching {
+                val tag = resolveLatestReleaseTag(latestUrl)
+                return ReleaseInfo(tag, releaseApkUrl(tag), releasePageUrl(tag), latestUrl.hostLabel())
+            }.onFailure { error ->
+                errors += "${latestUrl.hostLabel()}: ${error.shortMessage()}"
+            }
+        }
+
+        error(errors.joinToString(" | ").ifBlank { "no update source available" })
+    }
+
+    private fun httpGetText(url: String, accept: String? = null): String {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 12000
+            readTimeout = 12000
+            requestMethod = "GET"
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "ParallelVrGallery/$CURRENT_VERSION_TAG")
+            accept?.let { setRequestProperty("Accept", it) }
+        }
+        connection.connect()
+        if (connection.responseCode !in 200..299) {
+            val errorText = connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText().take(120) }.orEmpty()
+            error("HTTP ${connection.responseCode} $errorText")
+        }
+        return connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+    }
+
+    private fun resolveLatestReleaseTag(url: String): String {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 12000
+            readTimeout = 12000
+            requestMethod = "GET"
+            instanceFollowRedirects = false
+            setRequestProperty("User-Agent", "ParallelVrGallery/$CURRENT_VERSION_TAG")
+        }
+        connection.connect()
+        val location = connection.getHeaderField("Location").orEmpty()
+        Regex("/releases/tag/([^/?#]+)").find(location)?.groupValues?.getOrNull(1)?.let { return it }
+        val body = if (connection.responseCode in 200..299) {
+            connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } else {
+            ""
+        }
+        Regex("/$GITHUB_REPO/releases/tag/([^\"/?#]+)").find(body)?.groupValues?.getOrNull(1)?.let { return it }
+        Regex("/releases/tag/([^\"/?#]+)").find(body)?.groupValues?.getOrNull(1)?.let { return it }
+        error("missing latest tag")
+    }
+
+    private fun updateApiUrls(): List<String> {
+        val api = "https://api.github.com/repos/$GITHUB_REPO/releases/latest"
+        return listOf(
+            api,
+            "https://gh-proxy.com/$api",
+            "https://ghproxy.net/$api",
+        )
+    }
+
+    private fun updateLatestPageUrls(): List<String> {
+        val latest = "https://github.com/$GITHUB_REPO/releases/latest"
+        return listOf(
+            latest,
+            "https://gh-proxy.com/$latest",
+            "https://ghproxy.net/$latest",
+        )
+    }
+
+    private fun releasePageUrl(tag: String): String = "https://github.com/$GITHUB_REPO/releases/tag/$tag"
+
+    private fun releaseApkUrl(tag: String): String = "https://github.com/$GITHUB_REPO/releases/download/$tag/$UPDATE_APK_NAME"
+
+    private fun updateDownloadUrls(url: String): List<String> {
+        if (!url.contains("github.com/$GITHUB_REPO/releases/download/")) return listOf(url)
+        return listOf(
+            url,
+            "https://gh-proxy.com/$url",
+            "https://ghproxy.net/$url",
+        ).distinct()
+    }
+
+    private fun String.hostLabel(): String = runCatching { URL(this).host }
+        .getOrDefault(this.substringBefore('/'))
+        .removePrefix("www.")
+
+    private fun downloadFileWithProgress(urls: List<String>, output: File, lang: AppLanguage) {
+        val errors = mutableListOf<String>()
+        urls.forEachIndexed { sourceIndex, sourceUrl ->
+            if (output.exists()) output.delete()
+            runCatching {
+                val connection = (URL(sourceUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15000
+                    readTimeout = 30000
+                    requestMethod = "GET"
+                    instanceFollowRedirects = true
+                    setRequestProperty("User-Agent", "ParallelVrGallery/$CURRENT_VERSION_TAG")
+                }
+                connection.connect()
+                if (connection.responseCode !in 200..299) error("HTTP ${connection.responseCode}")
+                val total = connection.contentLengthLong.coerceAtLeast(1L)
+                var readTotal = 0L
+                connection.inputStream.use { input ->
+                    FileOutputStream(output).use { fileOut ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            fileOut.write(buffer, 0, read)
+                            readTotal += read
+                            val sourceBase = sourceIndex.toFloat() / urls.size.toFloat()
+                            val sourceSpan = 1f / urls.size.toFloat()
+                            val progress = (sourceBase + (readTotal.toFloat() / total.toFloat()) * sourceSpan).coerceIn(0f, 1f)
+                            _uiState.update {
+                                it.copy(
+                                    updateDownloadProgress = progress,
+                                    updateStatus = lang.t(
+                                        "正在下载更新 ${(progress * 100f).roundToInt()}%（${sourceUrl.hostLabel()}）",
+                                        "Downloading update ${(progress * 100f).roundToInt()}% (${sourceUrl.hostLabel()})",
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                }
+                return
+            }.onFailure { error ->
+                errors += "${sourceUrl.hostLabel()}: ${error.shortMessage()}"
+            }
+        }
+        if (output.exists()) output.delete()
+        error(errors.joinToString(" | ").ifBlank { "all update download sources failed" })
+    }
+
     fun downloadUpdateApk() {
         val state = _uiState.value
         val lang = state.settings.language
         val url = state.updateUrl ?: return
         val version = state.updateVersion?.takeIf { it.isNotBlank() } ?: "latest"
+        if (!url.endsWith(".apk", ignoreCase = true)) {
+            _uiState.update {
+                it.copy(
+                    updateStatus = lang.t(
+                        "当前网络只能打开 Release 页面，请在浏览器中下载 APK。",
+                        "Only the Release page is available on this network. Download the APK in your browser.",
+                    ),
+                )
+            }
+            app.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            return
+        }
         _uiState.update {
             it.copy(
                 updateDownloading = true,
@@ -1024,34 +1212,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 runCatching {
                     val updatesDir = File(app.getExternalFilesDir(null), "updates").also { it.mkdirs() }
                     val output = File(updatesDir, "ParallelVrGallery-$version.apk")
-                    if (output.exists()) output.delete()
-                    val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-                        connectTimeout = 15000
-                        readTimeout = 30000
-                        requestMethod = "GET"
-                    }
-                    connection.connect()
-                    if (connection.responseCode !in 200..299) error("HTTP ${connection.responseCode}")
-                    val total = connection.contentLengthLong.coerceAtLeast(1L)
-                    var readTotal = 0L
-                    connection.inputStream.use { input ->
-                        FileOutputStream(output).use { fileOut ->
-                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                            while (true) {
-                                val read = input.read(buffer)
-                                if (read <= 0) break
-                                fileOut.write(buffer, 0, read)
-                                readTotal += read
-                                val progress = (readTotal.toFloat() / total.toFloat()).coerceIn(0f, 1f)
-                                _uiState.update {
-                                    it.copy(
-                                        updateDownloadProgress = progress,
-                                        updateStatus = lang.t("正在下载更新 ${(progress * 100f).roundToInt()}%", "Downloading update ${(progress * 100f).roundToInt()}%"),
-                                    )
-                                }
-                            }
-                        }
-                    }
+                    downloadFileWithProgress(updateDownloadUrls(url), output, lang)
                     output
                 }
             }

@@ -12,8 +12,8 @@ android {
         applicationId = "com.local.parallelvrgallery"
         minSdk = 26
         targetSdk = 35
-        versionCode = 234
-        versionName = "2.34"
+        versionCode = 235
+        versionName = "2.35"
     }
 
     buildFeatures {
