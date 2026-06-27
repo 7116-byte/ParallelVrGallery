@@ -5303,6 +5303,14 @@ private fun PermissionScreen(lang: AppLanguage, onGrant: () -> Unit) {
     }
 }
 
+private data class GeneratedSelectionActionsState(
+    val count: Int,
+    val onClear: () -> Unit,
+    val onSave: () -> Unit,
+    val onRegenerate: () -> Unit,
+    val onDelete: () -> Unit,
+)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun GalleryScreen(
@@ -5365,6 +5373,7 @@ private fun GalleryScreen(
     }
     var lastPinchAt by remember { mutableStateOf(0L) }
     var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var generatedSelectionActions by remember { mutableStateOf<GeneratedSelectionActionsState?>(null) }
     val systemItems = remember(state.photos) { state.photos.filterNot { it.generatedVirtual } }
     val albumItems = remember(systemItems, state.selectedAlbumId) {
         state.selectedAlbumId?.let { bucketId -> systemItems.filter { it.bucketId == bucketId } } ?: emptyList()
@@ -5408,6 +5417,9 @@ private fun GalleryScreen(
     } else {
         (0.98f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.48f).coerceIn(0.5f, 0.98f)
     }
+    LaunchedEffect(state.homeTab) {
+        if (state.homeTab != "generated") generatedSelectionActions = null
+    }
 
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
@@ -5429,7 +5441,7 @@ private fun GalleryScreen(
                         onToggleVersion = onToggleGeneratedVersion,
                         onOpenVersion = onOpenGeneratedVersion,
                         onCloseVersion = onCloseGeneratedVersion,
-                        contentTopPadding = topContentPadding,
+                        contentTopPadding = topContentPadding + 8.dp,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
                         onGeneratedScroll = onGeneratedScroll,
                         onGeneratedVersionScroll = onGeneratedVersionScroll,
@@ -5444,6 +5456,7 @@ private fun GalleryScreen(
                         onSaveImages = onSaveImages,
                         onDeleteImages = onDeleteImages,
                         onRegenerateImages = onRegenerateImages,
+                        onGeneratedSelectionChange = { generatedSelectionActions = it },
                     )
                 }
             } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
@@ -5537,43 +5550,55 @@ private fun GalleryScreen(
                 .padding(horizontal = 16.dp, vertical = 12.dp)
                 .onSizeChanged { topBarHeightPx = it.height },
         ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (selectedKeys.isEmpty()) {
-                        val title = when {
-                            state.homeTab == "albums" && state.selectedAlbumId != null -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Album")
-                            state.homeTab == "albums" -> lang.t("相册", "Albums")
-                            else -> lang.t("全部", "All")
-                        }
-                        if (state.homeTab == "albums" && state.selectedAlbumId != null) {
-                            OutlinedButton(onClick = onCloseAlbum) { Text(lang.t("返回", "Back")) }
+                val generatedActions = generatedSelectionActions.takeIf { state.homeTab == "generated" }
+                if (selectedKeys.isEmpty() && generatedActions != null) {
+                    ManageSelectionActions(
+                        count = generatedActions.count,
+                        lang = lang,
+                        onClear = generatedActions.onClear,
+                        onSave = generatedActions.onSave,
+                        onRegenerate = generatedActions.onRegenerate,
+                        onDelete = generatedActions.onDelete,
+                    )
+                } else {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (selectedKeys.isEmpty()) {
+                            val title = when {
+                                state.homeTab == "albums" && state.selectedAlbumId != null -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Album")
+                                state.homeTab == "albums" -> lang.t("相册", "Albums")
+                                else -> lang.t("全部", "All")
+                            }
+                            if (state.homeTab == "albums" && state.selectedAlbumId != null) {
+                                OutlinedButton(onClick = onCloseAlbum) { Text(lang.t("返回", "Back")) }
+                                Spacer(Modifier.width(8.dp))
+                            }
+                            if (state.homeTab == "generated") {
+                                RoundedPillTabs(
+                                    options = listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
+                                    selected = state.generatedTab,
+                                    onSelect = onSetGeneratedTab,
+                                )
+                                Spacer(Modifier.weight(1f))
+                            } else {
+                                Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                            }
+                            OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
                             Spacer(Modifier.width(8.dp))
-                        }
-                        if (state.homeTab == "generated") {
-                            RoundedPillTabs(
-                                options = listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
-                                selected = state.generatedTab,
-                                onSelect = onSetGeneratedTab,
-                            )
-                            Spacer(Modifier.weight(1f))
+                            OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
                         } else {
-                            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                            Text(lang.t("已选择 ${selectedKeys.size} 项", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                            OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
+                            Spacer(Modifier.width(8.dp))
+                            Button(onClick = {
+                                onSaveGenerated(selectedIndexes)
+                                selectedKeys = emptySet()
+                            }) { Text(lang.t("保存", "Save")) }
+                            Spacer(Modifier.width(8.dp))
+                            Button(onClick = {
+                                onReplaceOriginal(selectedIndexes)
+                                selectedKeys = emptySet()
+                            }) { Text(lang.t("替换", "Replace")) }
                         }
-                        OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
-                        Spacer(Modifier.width(8.dp))
-                        OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
-                    } else {
-                        Text(lang.t("已选择 ${selectedKeys.size} 项", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
-                        Spacer(Modifier.width(8.dp))
-                        Button(onClick = {
-                            onSaveGenerated(selectedIndexes)
-                            selectedKeys = emptySet()
-                        }) { Text(lang.t("保存", "Save")) }
-                        Spacer(Modifier.width(8.dp))
-                        Button(onClick = {
-                            onReplaceOriginal(selectedIndexes)
-                            selectedKeys = emptySet()
-                        }) { Text(lang.t("替换", "Replace")) }
                     }
                 }
                 state.message?.let {
@@ -6008,6 +6033,7 @@ private fun ManageScreen(
     onSaveImages: (List<Int>) -> Unit,
     onDeleteImages: (List<ManagedCacheItem>) -> Unit,
     onRegenerateImages: (List<Int>) -> Unit,
+    onGeneratedSelectionChange: (GeneratedSelectionActionsState?) -> Unit = {},
 ) {
     val lang = state.settings.language
     val tab = selectedTab
@@ -6016,6 +6042,9 @@ private fun ManageScreen(
     LaunchedEffect(tab, state.selectedGeneratedVersion) {
         selectedImageKeys = emptySet()
         selectedVideoKeys = emptySet()
+    }
+    DisposableEffect(Unit) {
+        onDispose { onGeneratedSelectionChange(null) }
     }
     Column(
         modifier = Modifier
@@ -6061,8 +6090,23 @@ private fun ManageScreen(
                         state.videoEntries.containsKey(item.cacheKey) ||
                         state.videoJobs.any { it.item.cacheKey == item.cacheKey })
             }
-            if (selectedVideoKeys.isNotEmpty()) {
-                val selectedIndexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedVideoKeys } }
+            val selectedIndexes = videos.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.cacheKey }.takeIf { it >= 0 && item.cacheKey in selectedVideoKeys } }
+            LaunchedEffect(embedded, selectedVideoKeys, selectedIndexes) {
+                if (embedded && selectedVideoKeys.isNotEmpty()) {
+                    onGeneratedSelectionChange(
+                        GeneratedSelectionActionsState(
+                            count = selectedVideoKeys.size,
+                            onClear = { selectedVideoKeys = emptySet() },
+                            onSave = { onSaveVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                            onRegenerate = { onRegenerateVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                            onDelete = { onDeleteVideos(selectedIndexes); selectedVideoKeys = emptySet() },
+                        ),
+                    )
+                } else if (embedded) {
+                    onGeneratedSelectionChange(null)
+                }
+            }
+            if (selectedVideoKeys.isNotEmpty() && !embedded) {
                 ManageSelectionActions(
                     count = selectedVideoKeys.size,
                     lang = lang,
@@ -6074,7 +6118,10 @@ private fun ManageScreen(
                 Spacer(Modifier.height(8.dp))
             }
             if (videos.isEmpty()) {
-                Text(lang.t("暂无生成中或已生成的视频", "No generating or generated videos"))
+                Text(
+                    text = lang.t("暂无生成中或已生成的视频", "No generating or generated videos"),
+                    modifier = Modifier.padding(top = if (embedded) contentTopPadding else 0.dp),
+                )
             } else {
                 Box(Modifier.fillMaxSize()) {
                     LazyVerticalGrid(
@@ -6132,10 +6179,19 @@ private fun ManageScreen(
             }
         } else {
             if (state.cacheVersions.isEmpty()) {
-                Text(lang.t("暂无已生成图片", "No generated images yet"))
+                LaunchedEffect(embedded) {
+                    if (embedded) onGeneratedSelectionChange(null)
+                }
+                Text(
+                    text = lang.t("暂无已生成图片", "No generated images yet"),
+                    modifier = Modifier.padding(top = if (embedded) contentTopPadding else 0.dp),
+                )
             } else {
                 val selectedVersion = state.selectedGeneratedVersion
                 if (selectedVersion == null) {
+                    LaunchedEffect(embedded, selectedVersion) {
+                        if (embedded) onGeneratedSelectionChange(null)
+                    }
                     val versionGridState = rememberLazyGridState(
                         initialFirstVisibleItemIndex = state.generatedImageScrollIndex.coerceAtLeast(0),
                         initialFirstVisibleItemScrollOffset = state.generatedImageScrollOffset.coerceAtLeast(0),
@@ -6201,15 +6257,30 @@ private fun ManageScreen(
                             OutlinedButton(onClick = { onDeleteVersion(selectedVersion); onCloseVersion() }) { Text(lang.t("删除", "Delete")) }
                         }
                         Spacer(Modifier.height(10.dp))
-                        if (selectedImageKeys.isNotEmpty()) {
-                            val selectedItems = itemsInVersion.filter { "${it.entry.photoKey}|${it.entry.version}" in selectedImageKeys }
-                            val selectedIndexes = selectedItems.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }.takeIf { it >= 0 } }.distinct()
+                        val selectedItems = itemsInVersion.filter { "${it.entry.photoKey}|${it.entry.version}" in selectedImageKeys }
+                        val selectedImageIndexes = selectedItems.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }.takeIf { it >= 0 } }.distinct()
+                        LaunchedEffect(embedded, selectedImageKeys, selectedItems, selectedImageIndexes) {
+                            if (embedded && selectedImageKeys.isNotEmpty()) {
+                                onGeneratedSelectionChange(
+                                    GeneratedSelectionActionsState(
+                                        count = selectedImageKeys.size,
+                                        onClear = { selectedImageKeys = emptySet() },
+                                        onSave = { onSaveImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                        onRegenerate = { onRegenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                        onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
+                                    ),
+                                )
+                            } else if (embedded) {
+                                onGeneratedSelectionChange(null)
+                            }
+                        }
+                        if (selectedImageKeys.isNotEmpty() && !embedded) {
                             ManageSelectionActions(
                                 count = selectedImageKeys.size,
                                 lang = lang,
                                 onClear = { selectedImageKeys = emptySet() },
-                                onSave = { onSaveImages(selectedIndexes); selectedImageKeys = emptySet() },
-                                onRegenerate = { onRegenerateImages(selectedIndexes); selectedImageKeys = emptySet() },
+                                onSave = { onSaveImages(selectedImageIndexes); selectedImageKeys = emptySet() },
+                                onRegenerate = { onRegenerateImages(selectedImageIndexes); selectedImageKeys = emptySet() },
                                 onDelete = { onDeleteImages(selectedItems); selectedImageKeys = emptySet() },
                             )
                             Spacer(Modifier.height(8.dp))
