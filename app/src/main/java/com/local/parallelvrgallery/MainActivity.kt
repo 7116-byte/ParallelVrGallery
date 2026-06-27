@@ -406,7 +406,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.45"
+private const val CURRENT_VERSION_TAG = "v2.46"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -1409,7 +1409,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun deleteCacheVersion(version: String) {
         viewModelScope.launch(Dispatchers.IO) {
+            val affectedKeys = _uiState.value.managedCacheItems
+                .filter { it.entry.version == version }
+                .map { it.entry.photoKey }
+                .toSet()
             cache.deleteVersion(version)
+            clearImageQueueForKeys(affectedKeys)
             val photos = _uiState.value.photos
             val entries = photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey }
             _uiState.update {
@@ -1509,7 +1514,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun deleteGeneratedImageEntries(entries: List<ManagedCacheItem>) {
         viewModelScope.launch(Dispatchers.IO) {
+            val deletedKeys = entries.map { it.entry.photoKey }.toSet()
             entries.forEach { cache.deleteEntry(it.entry) }
+            clearImageQueueForKeys(deletedKeys)
             val photos = _uiState.value.photos
             val currentEntries = photos.mapNotNull { cache.findEntry(it) }.associateBy { it.photoKey }
             _uiState.update {
@@ -1522,6 +1529,24 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
         }
+    }
+
+    private fun clearImageQueueForKeys(keys: Set<String>) {
+        if (keys.isEmpty()) return
+        synchronized(pending) { pending.removeAll { it.photo.cacheKey in keys } }
+        synchronized(currentPending) { currentPending.removeAll { it.photo.cacheKey in keys } }
+        synchronized(paused) {
+            keys.forEach { paused.remove(it) }
+            autoPausedKeys.removeAll(keys)
+        }
+        keys.forEach { queueTags.remove(it) }
+        _uiState.update {
+            it.copy(
+                states = it.states - keys,
+                jobs = it.jobs.filterNot { job -> job.photoItem.cacheKey in keys },
+            )
+        }
+        addLog("cleared image queue keys=${keys.size}")
     }
 
     fun regenerateImages(indexes: List<Int>) {
