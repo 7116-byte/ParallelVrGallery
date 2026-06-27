@@ -405,7 +405,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.39"
+private const val CURRENT_VERSION_TAG = "v2.40"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -513,6 +513,7 @@ data class UiState(
     val viewerOrigin: ViewerOrigin = ViewerOrigin.NORMAL,
     val manageViewerKeys: Set<String> = emptySet(),
     val viewerScopeKeys: Set<String> = emptySet(),
+    val viewerScopeOrderedKeys: List<String> = emptyList(),
     val galleryAnchorIndex: Int = 0,
     val galleryScrollIndex: Int = 0,
     val galleryScrollOffset: Int = 0,
@@ -529,6 +530,8 @@ data class UiState(
     val expandedGeneratedVersions: Set<String> = emptySet(),
     val generatedImageScrollIndex: Int = 0,
     val generatedImageScrollOffset: Int = 0,
+    val generatedVersionScrollIndexes: Map<String, Int> = emptyMap(),
+    val generatedVersionScrollOffsets: Map<String, Int> = emptyMap(),
     val generatedVideoScrollIndex: Int = 0,
     val generatedVideoScrollOffset: Int = 0,
     val allOffset: Int = 0,
@@ -776,14 +779,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun openPhoto(index: Int, firstVisibleIndex: Int = index, firstVisibleOffset: Int = 0) {
-        openPhoto(index, firstVisibleIndex, firstVisibleOffset, emptySet())
+        openPhoto(index, firstVisibleIndex, firstVisibleOffset, emptyList())
     }
 
-    fun openScopedPhoto(index: Int, scopeKeys: Set<String>, firstVisibleIndex: Int = index, firstVisibleOffset: Int = 0) {
+    fun openScopedPhoto(index: Int, scopeKeys: List<String>, firstVisibleIndex: Int = index, firstVisibleOffset: Int = 0) {
         openPhoto(index, firstVisibleIndex, firstVisibleOffset, scopeKeys)
     }
 
-    private fun openPhoto(index: Int, firstVisibleIndex: Int, firstVisibleOffset: Int, scopeKeys: Set<String>) {
+    private fun openPhoto(index: Int, firstVisibleIndex: Int, firstVisibleOffset: Int, scopeKeys: List<String>) {
         val item = _uiState.value.photos.getOrNull(index)
         _uiState.update {
             it.copy(
@@ -795,7 +798,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 vrMode = true,
                 viewerOrigin = ViewerOrigin.NORMAL,
                 manageViewerKeys = emptySet(),
-                viewerScopeKeys = scopeKeys,
+                viewerScopeKeys = scopeKeys.toSet(),
+                viewerScopeOrderedKeys = scopeKeys,
                 message = null,
             )
         }
@@ -825,6 +829,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 viewerOrigin = origin,
                 manageViewerKeys = keys + listOfNotNull(photo?.cacheKey),
                 viewerScopeKeys = keys + listOfNotNull(photo?.cacheKey),
+                viewerScopeOrderedKeys = scopedItems.map { item -> item.photoItem.cacheKey } + listOfNotNull(photo?.cacheKey),
                 entries = if (photo != null && entry != null) it.entries + scopedEntries + (photo.cacheKey to entry) else it.entries,
                 message = null,
             )
@@ -851,6 +856,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 viewerOrigin = origin,
                 manageViewerKeys = keys,
                 viewerScopeKeys = keys,
+                viewerScopeOrderedKeys = keys.toList(),
                 message = null,
             )
         }
@@ -869,6 +875,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 viewerOrigin = ViewerOrigin.NORMAL,
                 manageViewerKeys = emptySet(),
                 viewerScopeKeys = emptySet(),
+                viewerScopeOrderedKeys = emptyList(),
                 galleryAnchorIndex = currentIndex,
             )
         }
@@ -919,6 +926,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 "videos" -> it.copy(generatedVideoScrollIndex = index.coerceAtLeast(0), generatedVideoScrollOffset = offset.coerceAtLeast(0))
                 else -> it.copy(generatedImageScrollIndex = index.coerceAtLeast(0), generatedImageScrollOffset = offset.coerceAtLeast(0))
             }
+        }
+    }
+
+    fun setGeneratedVersionScroll(version: String, index: Int, offset: Int) {
+        _uiState.update {
+            it.copy(
+                generatedVersionScrollIndexes = it.generatedVersionScrollIndexes + (version to index.coerceAtLeast(0)),
+                generatedVersionScrollOffsets = it.generatedVersionScrollOffsets + (version to offset.coerceAtLeast(0)),
+            )
         }
     }
 
@@ -1582,7 +1598,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val photos = state.photos
         if (!state.vrMode) return
         if (photos.isEmpty()) return
-        val scopeIndices = if (state.viewerScopeKeys.isNotEmpty()) {
+        val photoIndexByKey = photos.mapIndexed { photoIndex, item -> item.cacheKey to photoIndex }.toMap()
+        val scopeIndices = if (state.viewerScopeOrderedKeys.isNotEmpty()) {
+            state.viewerScopeOrderedKeys.mapNotNull { photoIndexByKey[it] }.distinct()
+        } else if (state.viewerScopeKeys.isNotEmpty()) {
             photos.mapIndexedNotNull { photoIndex, item -> if (item.cacheKey in state.viewerScopeKeys) photoIndex else null }
         } else {
             photos.indices.toList()
@@ -4901,6 +4920,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onCloseVersion = viewModel::closeGeneratedVersion,
                 onSetGeneratedColumns = { viewModel.setPageColumns("generated", it) },
                 onGeneratedScroll = viewModel::setGeneratedScroll,
+                onGeneratedVersionScroll = viewModel::setGeneratedVersionScroll,
                 onDeleteVersion = viewModel::deleteCacheVersion,
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
@@ -4952,6 +4972,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSetGeneratedTab = viewModel::setGeneratedTab,
                 onSetPageColumns = viewModel::setPageColumns,
                 onGeneratedScroll = viewModel::setGeneratedScroll,
+                onGeneratedVersionScroll = viewModel::setGeneratedVersionScroll,
                 onToggleGeneratedVersion = viewModel::toggleGeneratedVersion,
                 onOpenGeneratedVersion = viewModel::openGeneratedVersion,
                 onCloseGeneratedVersion = viewModel::closeGeneratedVersion,
@@ -5009,12 +5030,13 @@ private fun GalleryScreen(
     state: UiState,
     onRefresh: () -> Unit,
     onOpen: (Int, Int, Int) -> Unit,
-    onOpenScoped: (Int, Set<String>, Int, Int) -> Unit,
+    onOpenScoped: (Int, List<String>, Int, Int) -> Unit,
     onSettings: () -> Unit,
     onSetTab: (String) -> Unit,
     onSetGeneratedTab: (String) -> Unit,
     onSetPageColumns: (String, Int) -> Unit,
     onGeneratedScroll: (String, Int, Int) -> Unit,
+    onGeneratedVersionScroll: (String, Int, Int) -> Unit,
     onToggleGeneratedVersion: (String) -> Unit,
     onOpenGeneratedVersion: (String) -> Unit,
     onCloseGeneratedVersion: () -> Unit,
@@ -5072,7 +5094,7 @@ private fun GalleryScreen(
     }
     val photoIndexByKey = remember(state.photos) { state.photos.mapIndexed { index, item -> item.cacheKey to index }.toMap() }
     val visibleScopeKeys = remember(visibleItems, state.homeTab, state.selectedAlbumId) {
-        if (state.homeTab == "generated") emptySet() else visibleItems.map { it.cacheKey }.toSet()
+        if (state.homeTab == "generated") emptyList() else visibleItems.map { it.cacheKey }
     }
     val selectedIndexes = remember(selectedKeys, photoIndexByKey) {
         if (selectedKeys.isEmpty()) emptyList() else selectedKeys.mapNotNull { photoIndexByKey[it] }
@@ -5088,6 +5110,17 @@ private fun GalleryScreen(
     )
     val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
     val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
+    val topBarScrollOffset = when {
+        state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
+        state.homeTab == "generated" && state.selectedGeneratedVersion != null -> {
+            val version = state.selectedGeneratedVersion
+            (state.generatedVersionScrollIndexes[version] ?: 0) * 240 + (state.generatedVersionScrollOffsets[version] ?: 0)
+        }
+        state.homeTab == "generated" -> state.generatedImageScrollIndex * 240 + state.generatedImageScrollOffset
+        state.homeTab == "albums" && state.selectedAlbumId == null -> albumListGridState.firstVisibleItemIndex * 240 + albumListGridState.firstVisibleItemScrollOffset
+        else -> gridState.firstVisibleItemIndex * 240 + gridState.firstVisibleItemScrollOffset
+    }
+    val topBarAlpha = (0.96f - (topBarScrollOffset / 180f).coerceIn(0f, 0.48f)).coerceIn(0.48f, 0.96f)
 
     Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
         Scaffold(
@@ -5111,6 +5144,7 @@ private fun GalleryScreen(
                         onCloseVersion = onCloseGeneratedVersion,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
                         onGeneratedScroll = onGeneratedScroll,
+                        onGeneratedVersionScroll = onGeneratedVersionScroll,
                         onDeleteVersion = onDeleteVersion,
                         onOpenGenerated = onOpenGenerated,
                         onOpenGeneratedVideo = onOpenGeneratedVideo,
@@ -5209,7 +5243,7 @@ private fun GalleryScreen(
             Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
-                .background(androidx.compose.ui.graphics.Color(0x88ffffff))
+                .background(androidx.compose.ui.graphics.Color.White.copy(alpha = topBarAlpha))
                 .statusBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 12.dp),
         ) {
@@ -5670,6 +5704,7 @@ private fun ManageScreen(
     onCloseVersion: () -> Unit,
     onSetGeneratedColumns: (Int) -> Unit,
     onGeneratedScroll: (String, Int, Int) -> Unit,
+    onGeneratedVersionScroll: (String, Int, Int) -> Unit,
     onDeleteVersion: (String) -> Unit,
     onOpenGenerated: (Int, VrCacheEntry) -> Unit,
     onOpenGeneratedVideo: (Int) -> Unit,
@@ -5846,7 +5881,14 @@ private fun ManageScreen(
                     }
                 } else {
                     val itemsInVersion = state.managedCacheItems.filter { it.entry.version == selectedVersion }
-                    val imageGridState = rememberLazyGridState()
+                    val imageGridState = rememberLazyGridState(
+                        initialFirstVisibleItemIndex = (state.generatedVersionScrollIndexes[selectedVersion] ?: 0).coerceAtLeast(0),
+                        initialFirstVisibleItemScrollOffset = (state.generatedVersionScrollOffsets[selectedVersion] ?: 0).coerceAtLeast(0),
+                    )
+                    LaunchedEffect(selectedVersion, imageGridState) {
+                        snapshotFlow { imageGridState.firstVisibleItemIndex to imageGridState.firstVisibleItemScrollOffset }
+                            .collect { (index, offset) -> onGeneratedVersionScroll(selectedVersion, index, offset) }
+                    }
                     Column(Modifier.fillMaxSize()) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             OutlinedButton(onClick = onCloseVersion) { Text(lang.t("返回", "Back")) }
@@ -6351,14 +6393,20 @@ private fun ViewerScreen(
             emptyMap()
         }
     }
-    val viewerItems = remember(state.photos, state.managedCacheItems, state.viewerScopeKeys, state.viewerOrigin, state.selectedGeneratedVersion, startIndex) {
+    val viewerItems = remember(state.photos, state.managedCacheItems, state.viewerScopeKeys, state.viewerScopeOrderedKeys, state.viewerOrigin, state.selectedGeneratedVersion, startIndex) {
         val indexed = state.photos.mapIndexed { index, item -> index to item }
+        val indexedByKey = indexed.associateBy { (_, item) -> item.cacheKey }
         if (state.viewerOrigin != ViewerOrigin.NORMAL && state.selectedGeneratedVersion != null) {
             state.managedCacheItems
                 .filter { it.entry.version == state.selectedGeneratedVersion }
                 .mapNotNull { generated ->
-                    indexed.firstOrNull { (_, item) -> item.cacheKey == generated.photoItem.cacheKey }
+                    indexedByKey[generated.photoItem.cacheKey]
                 }
+                .distinctBy { (_, item) -> item.cacheKey }
+                .ifEmpty { indexed.filter { it.first == startIndex } }
+        } else if (state.viewerScopeOrderedKeys.isNotEmpty()) {
+            state.viewerScopeOrderedKeys
+                .mapNotNull { indexedByKey[it] }
                 .distinctBy { (_, item) -> item.cacheKey }
                 .ifEmpty { indexed.filter { it.first == startIndex } }
         } else if (state.viewerScopeKeys.isNotEmpty()) {
