@@ -405,7 +405,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.38"
+private const val CURRENT_VERSION_TAG = "v2.39"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -1291,7 +1291,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     fun onPagerIndexChanged(index: Int) {
         _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow) }
-        if (_uiState.value.vrMode && _uiState.value.photos.getOrNull(index)?.kind == MediaKind.IMAGE) {
+        val state = _uiState.value
+        if (state.viewerOrigin != ViewerOrigin.NORMAL) return
+        if (state.vrMode && state.photos.getOrNull(index)?.kind == MediaKind.IMAGE) {
             enqueueWindow(index, includeCurrent = true)
         }
     }
@@ -5695,7 +5697,7 @@ private fun ManageScreen(
             .then(if (embedded) Modifier else Modifier.statusBarsPadding())
             .padding(
                 if (embedded) {
-                    androidx.compose.foundation.layout.PaddingValues(start = 12.dp, top = 96.dp, end = 12.dp, bottom = 96.dp)
+                    androidx.compose.foundation.layout.PaddingValues(0.dp)
                 } else {
                     androidx.compose.foundation.layout.PaddingValues(16.dp)
                 },
@@ -6340,9 +6342,26 @@ private fun ViewerScreen(
         }
     }
 
-    val viewerItems = remember(state.photos, state.viewerScopeKeys, startIndex) {
+    val generatedEntryByKey = remember(state.managedCacheItems, state.viewerOrigin, state.selectedGeneratedVersion) {
+        if (state.viewerOrigin != ViewerOrigin.NORMAL && state.selectedGeneratedVersion != null) {
+            state.managedCacheItems
+                .filter { it.entry.version == state.selectedGeneratedVersion }
+                .associate { it.photoItem.cacheKey to it.entry }
+        } else {
+            emptyMap()
+        }
+    }
+    val viewerItems = remember(state.photos, state.managedCacheItems, state.viewerScopeKeys, state.viewerOrigin, state.selectedGeneratedVersion, startIndex) {
         val indexed = state.photos.mapIndexed { index, item -> index to item }
-        if (state.viewerScopeKeys.isNotEmpty()) {
+        if (state.viewerOrigin != ViewerOrigin.NORMAL && state.selectedGeneratedVersion != null) {
+            state.managedCacheItems
+                .filter { it.entry.version == state.selectedGeneratedVersion }
+                .mapNotNull { generated ->
+                    indexed.firstOrNull { (_, item) -> item.cacheKey == generated.photoItem.cacheKey }
+                }
+                .distinctBy { (_, item) -> item.cacheKey }
+                .ifEmpty { indexed.filter { it.first == startIndex } }
+        } else if (state.viewerScopeKeys.isNotEmpty()) {
             indexed.filter { (_, item) -> item.cacheKey in state.viewerScopeKeys }
                 .ifEmpty { indexed.filter { it.first == startIndex } }
         } else {
@@ -6382,7 +6401,7 @@ private fun ViewerScreen(
                     onSingleTap = { controlsVisible = !controlsVisible },
                 )
             } else {
-                val entry = state.entries[photo.cacheKey]
+                val entry = generatedEntryByKey[photo.cacheKey] ?: state.entries[photo.cacheKey]
                 val vrState = state.states[photo.cacheKey] ?: VrState.NORMAL
                 if (state.vrMode && entry != null) {
                     SyncSbsZoomImage(Uri.fromFile(File(entry.outputPath)), Modifier.fillMaxSize()) {
