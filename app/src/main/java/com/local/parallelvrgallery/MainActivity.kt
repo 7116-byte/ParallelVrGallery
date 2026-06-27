@@ -406,7 +406,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.47"
+private const val CURRENT_VERSION_TAG = "v2.48"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -507,6 +507,13 @@ data class LastGenerationInfo(
     val elapsedMs: Long,
 )
 
+data class PrefetchSlotState(
+    val centerKey: String? = null,
+    val tier: Int = 2,
+    val prevDone: Int = 0,
+    val nextDone: Int = 0,
+)
+
 data class UiState(
     val hasPermission: Boolean = false,
     val hasVideoPermission: Boolean = false,
@@ -549,6 +556,7 @@ data class UiState(
     val vrMode: Boolean = false,
     val settings: AppSettings = AppSettings(),
     val activePrefetchWindow: Int = 2,
+    val prefetchSlotState: PrefetchSlotState = PrefetchSlotState(),
     val states: Map<String, VrState> = emptyMap(),
     val entries: Map<String, VrCacheEntry> = emptyMap(),
     val jobs: List<VrJob> = emptyList(),
@@ -1311,6 +1319,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             it.copy(
                 settings = settings,
                 activePrefetchWindow = if (settings.autoPrefetch) 2 else settings.prefetchWindow,
+                prefetchSlotState = PrefetchSlotState(),
                 modelStatus = modelStatusText(settings),
             )
         }
@@ -1319,7 +1328,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun onPagerIndexChanged(index: Int) {
-        _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow) }
+        _uiState.update { it.copy(selectedIndex = index, galleryAnchorIndex = index, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow, prefetchSlotState = PrefetchSlotState()) }
         val state = _uiState.value
         if (state.viewerOrigin != ViewerOrigin.NORMAL) return
         if (state.vrMode && state.photos.getOrNull(index)?.kind == MediaKind.IMAGE) {
@@ -1342,7 +1351,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (_uiState.value.vrMode) {
             stopVr()
         } else {
-            _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow) }
+            _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow, prefetchSlotState = PrefetchSlotState()) }
             enqueueWindow(index, includeCurrent = true)
         }
     }
@@ -1355,7 +1364,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             autoPausedKeys.clear()
         }
         queueTags.clearActive()
-        _uiState.update { it.copy(vrMode = false, modelProgress = null) }
+        _uiState.update { it.copy(vrMode = false, modelProgress = null, prefetchSlotState = PrefetchSlotState()) }
         addLog("vr stopped; generated caches kept")
     }
 
@@ -1678,17 +1687,19 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (includeCurrent) {
             promoteCurrentImageForVr(index, queueContext)
         }
+        val occupiedStates = setOf(VrState.QUEUED, VrState.GENERATING, VrState.PAUSED)
         fun eligibleAt(position: Int): Int? {
             val photoIndex = scopeIndices.getOrNull(position) ?: return null
             val photo = photos[photoIndex]
             if (photo.kind != MediaKind.IMAGE) return null
             if (photo.cacheKey in targetKeys) return null
+            if ((state.states[photo.cacheKey] ?: VrState.NORMAL) in occupiedStates) return null
             if (cache.findEntry(photo, currentVersion) != null) return null
             return photoIndex
         }
-        fun stealFrom(offsetStep: Int): Int? {
-            var distance = 1
-            while (distance <= window) {
+        fun stealFrom(offsetStep: Int, fromDistance: Int, toDistance: Int): Int? {
+            var distance = fromDistance
+            while (distance <= toDistance) {
                 val candidate = eligibleAt(scopePosition + offsetStep * distance)
                 if (candidate != null) return candidate
                 distance++
@@ -1702,19 +1713,50 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             targets += photoIndex to targets.size + 1
             return true
         }
-        fun fillSlot(preferredOffsetStep: Int, distance: Int) {
+        fun fillAutoSlot(preferredOffsetStep: Int, distance: Int, fromDistance: Int, toDistance: Int) {
             val preferred = eligibleAt(scopePosition + preferredOffsetStep * distance)
             if (preferred != null) {
                 addTarget(preferred)
             } else {
-                stealFrom(-preferredOffsetStep)?.let { addTarget(it) }
+                stealFrom(-preferredOffsetStep, fromDistance, toDistance)?.let { addTarget(it) }
             }
         }
-        for (distance in 1..window) {
-            if (targets.size >= desiredCount) break
-            fillSlot(preferredOffsetStep = -1, distance = distance)
-            if (targets.size >= desiredCount) break
-            fillSlot(preferredOffsetStep = 1, distance = distance)
+        if (state.settings.autoPrefetch) {
+            val centerKey = photos[index].cacheKey
+            val previousSlotState = state.prefetchSlotState.takeIf { it.centerKey == centerKey } ?: PrefetchSlotState(centerKey = centerKey)
+            var slotState = previousSlotState
+            val fromDistance = when (slotState.tier) {
+                2 -> 1
+                4 -> 3
+                else -> 5
+            }
+            val toDistance = slotState.tier
+            val tierSlots = toDistance - fromDistance + 1
+            while ((slotState.prevDone < tierSlots || slotState.nextDone < tierSlots) && targets.size < desiredCount) {
+                if (slotState.prevDone < tierSlots) {
+                    val distance = fromDistance + slotState.prevDone
+                    fillAutoSlot(preferredOffsetStep = -1, distance = distance, fromDistance = fromDistance, toDistance = toDistance)
+                    slotState = slotState.copy(prevDone = slotState.prevDone + 1)
+                }
+                if (slotState.nextDone < tierSlots && targets.size < desiredCount) {
+                    val distance = fromDistance + slotState.nextDone
+                    fillAutoSlot(preferredOffsetStep = 1, distance = distance, fromDistance = fromDistance, toDistance = toDistance)
+                    slotState = slotState.copy(nextDone = slotState.nextDone + 1)
+                }
+            }
+            if (slotState.prevDone >= tierSlots && slotState.nextDone >= tierSlots) {
+                slotState = when (slotState.tier) {
+                    2 -> PrefetchSlotState(centerKey = centerKey, tier = 4)
+                    4 -> PrefetchSlotState(centerKey = centerKey, tier = 8)
+                    else -> slotState
+                }
+            }
+            _uiState.update { it.copy(prefetchSlotState = slotState, activePrefetchWindow = slotState.tier) }
+        } else {
+            for (distance in 1..window) {
+                eligibleAt(scopePosition - distance)?.let { addTarget(it) }
+                eligibleAt(scopePosition + distance)?.let { addTarget(it) }
+            }
         }
 
         synchronized(pending) {
@@ -2275,18 +2317,18 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun expandAutoPrefetchIfNeeded(): Boolean {
-        val state = _uiState.value
-        if (!state.vrMode || !state.settings.autoPrefetch || state.viewerOrigin != ViewerOrigin.NORMAL) return false
-        val selected = state.selectedIndex ?: state.galleryAnchorIndex
-        val next = when (state.activePrefetchWindow) {
-            2 -> 4
-            4 -> 8
-            else -> return false
+        var attempts = 0
+        while (attempts++ < 3) {
+            val state = _uiState.value
+            if (!state.vrMode || !state.settings.autoPrefetch || state.viewerOrigin != ViewerOrigin.NORMAL) return false
+            val selected = state.selectedIndex ?: state.galleryAnchorIndex
+            val before = state.prefetchSlotState
+            if (before.tier >= 8 && before.prevDone >= 4 && before.nextDone >= 4) return false
+            enqueueWindow(selected, includeCurrent = false)
+            if (synchronized(pending) { pending.any { jobAllowedInCurrentContext(it, _uiState.value) } }) return true
+            if (_uiState.value.prefetchSlotState == before) return false
         }
-        _uiState.update { it.copy(activePrefetchWindow = next) }
-        addLog("auto prefetch expanded to $next")
-        enqueueWindow(selected, includeCurrent = false)
-        return synchronized(pending) { pending.any { jobAllowedInCurrentContext(it, _uiState.value) } }
+        return false
     }
 
     private fun markReady(key: String, entry: VrCacheEntry) {
