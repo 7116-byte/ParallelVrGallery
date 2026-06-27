@@ -2,6 +2,12 @@
 
 一个本地 Android 图库应用：按“全部 / 相册 / 生成”浏览系统图片和视频，并在手机本地生成平行眼 SBS VR 缓存。
 
+## v2.36 更新
+
+- 恢复图片 VR 当前图最高优先级生成机制：当前 Viewer 图片进入 `currentPending`，前后图片只做普通预加载。
+- 修复调试页可能出现 `State=QUEUED` 但 `Job=-` 的问题，当前图入队时同步写入可见 job。
+- 恢复图片 VR 按钮语义：VR 模式下显示 `关闭 VR`，`QUEUED` 只表示排队等待生成。
+
 ## v2.35 更新
 
 - 检查更新改为多源 fallback：GitHub API 失败时会继续尝试代理 API 和 Release 页面解析。

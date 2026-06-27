@@ -405,7 +405,7 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.35"
+private const val CURRENT_VERSION_TAG = "v2.36"
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -1291,13 +1291,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
             return
         }
-        val currentState = _uiState.value.states[item.cacheKey] ?: VrState.NORMAL
-        if (_uiState.value.vrMode && currentState == VrState.READY) {
+        if (_uiState.value.vrMode) {
             stopVr()
-        } else if (_uiState.value.vrMode) {
-            enqueuePhoto(index, priority = 0, force = currentState == VrState.FAILED, current = true)
-            startCurrentWorker()
-            startWorker()
         } else {
             _uiState.update { it.copy(vrMode = true, selectedIndex = index, message = null, activePrefetchWindow = if (it.settings.autoPrefetch) 2 else it.settings.prefetchWindow) }
             enqueueWindow(index, includeCurrent = true)
@@ -1581,7 +1576,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         val desiredCount = window * 2
         val targets = mutableListOf<Pair<Int, Int>>()
         if (includeCurrent) {
-            if (photos.getOrNull(index)?.kind == MediaKind.IMAGE) enqueuePhoto(index, priority = 0, force = false, current = true, context = queueContext)
+            promoteCurrentImageForVr(index, queueContext)
         }
         var distance = 1
         while (targets.size < desiredCount && distance <= window && distance < scopeIndices.size) {
@@ -1608,6 +1603,30 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         startWorker()
     }
 
+    private fun promoteCurrentImageForVr(index: Int, context: QueueContext? = null) {
+        val photo = _uiState.value.photos.getOrNull(index) ?: return
+        if (photo.kind != MediaKind.IMAGE) return
+        val currentVersion = _uiState.value.settings.toParams().cacheVersion()
+        cache.findEntry(photo, currentVersion)?.let { entry ->
+            markReady(photo.cacheKey, entry)
+            queueTags.remove(photo.cacheKey)
+            return
+        }
+        val queueContext = context ?: activeQueueContext(_uiState.value)
+        val job = QueuedJob(photo, priority = 0, sequence = sequence++, source = queueContext.source, albumId = queueContext.albumId)
+        synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
+        synchronized(paused) { paused.remove(photo.cacheKey) }
+        synchronized(currentPending) {
+            currentPending.removeAll { it.photo.cacheKey == photo.cacheKey }
+            currentPending.add(job)
+        }
+        queueTags.upsert(job, VrState.QUEUED)
+        markState(photo.cacheKey, VrState.QUEUED)
+        upsertJob(photo, priority = 0, state = VrState.QUEUED, progress = 0f)
+        addLog("current ${photo.displayName} p=0 source=${queueContext.source}${queueContext.albumId?.let { ":$it" } ?: ""}")
+        startCurrentWorker()
+    }
+
     private fun enqueuePhoto(index: Int, priority: Int, force: Boolean, current: Boolean = false, context: QueueContext? = null) {
         val photo = _uiState.value.photos.getOrNull(index) ?: return
         if (photo.kind != MediaKind.IMAGE) return
@@ -1620,18 +1639,14 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (!force && existingState == VrState.GENERATING) return
         if (!force && !current && existingState == VrState.QUEUED) return
         val queueContext = context ?: activeQueueContext(_uiState.value)
+        if (current) {
+            promoteCurrentImageForVr(index, queueContext)
+            return
+        }
         val job = QueuedJob(photo, priority, sequence++, queueContext.source, queueContext.albumId)
         synchronized(pending) { pending.removeAll { it.photo.cacheKey == photo.cacheKey } }
         synchronized(paused) { paused.remove(photo.cacheKey) }
-        if (current) {
-            synchronized(currentPending) {
-                currentPending.removeAll { it.photo.cacheKey == photo.cacheKey }
-                currentPending.add(job)
-            }
-            startCurrentWorker()
-        } else {
-            synchronized(pending) { pending.add(job) }
-        }
+        synchronized(pending) { pending.add(job) }
         queueTags.upsert(job, VrState.QUEUED)
         markState(photo.cacheKey, VrState.QUEUED)
         addLog("${if (current) "current" else "queued"} ${photo.displayName} p=$priority source=${queueContext.source}${queueContext.albumId?.let { ":$it" } ?: ""}")
@@ -1810,12 +1825,21 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private fun startCurrentWorker() {
         if (currentWorker?.isActive == true) return
         currentWorker = viewModelScope.launch(Dispatchers.IO) {
+            var idleChecks = 0
             while (true) {
                 if (!_uiState.value.vrMode) {
                     synchronized(currentPending) { currentPending.clear() }
                     break
                 }
-                val next = synchronized(currentPending) { currentPending.poll() } ?: break
+                val next = synchronized(currentPending) { currentPending.poll() }
+                if (next == null) {
+                    if (idleChecks++ < 3) {
+                        delay(50)
+                        continue
+                    }
+                    break
+                }
+                idleChecks = 0
                 processJob(next)
                 delay(25)
             }
@@ -6274,15 +6298,7 @@ private fun ViewerScreen(
                                 VideoVrState.FAILED -> lang.t("重试视频 VR", "Retry video VR")
                             }
                         } else if (state.vrMode) {
-                            val imageState = currentItem?.let { state.states[it.cacheKey] } ?: VrState.NORMAL
-                            when (imageState) {
-                                VrState.READY -> lang.t("关闭 VR", "VR Off")
-                                VrState.GENERATING -> lang.t("生成中", "Generating")
-                                VrState.QUEUED -> lang.t("继续生成", "Resume")
-                                VrState.PAUSED -> lang.t("继续生成", "Resume")
-                                VrState.FAILED -> lang.t("重试 VR", "Retry VR")
-                                VrState.NORMAL -> lang.t("生成 VR", "Generate VR")
-                            }
+                            lang.t("关闭 VR", "VR Off")
                         } else {
                             lang.t("开启 VR", "VR On")
                         },
