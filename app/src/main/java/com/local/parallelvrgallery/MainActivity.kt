@@ -5431,7 +5431,12 @@ private fun GalleryScreen(
                     CircularProgressIndicator()
                 }
             } else if (state.homeTab == "generated") {
-                Box(Modifier.fillMaxSize().padding(padding)) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .padding(padding)
+                        .padding(top = topContentPadding),
+                ) {
                     ManageScreen(
                         state = state,
                         embedded = true,
@@ -5441,7 +5446,7 @@ private fun GalleryScreen(
                         onToggleVersion = onToggleGeneratedVersion,
                         onOpenVersion = onOpenGeneratedVersion,
                         onCloseVersion = onCloseGeneratedVersion,
-                        contentTopPadding = topContentPadding + 8.dp,
+                        contentTopPadding = 8.dp,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
                         onGeneratedScroll = onGeneratedScroll,
                         onGeneratedVersionScroll = onGeneratedVersionScroll,
@@ -5460,7 +5465,12 @@ private fun GalleryScreen(
                     )
                 }
             } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
-                Box(Modifier.fillMaxSize().padding(padding)) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .padding(padding)
+                        .padding(top = topContentPadding),
+                ) {
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(state.albumListColumns),
                         state = albumListGridState,
@@ -5471,7 +5481,7 @@ private fun GalleryScreen(
                                 onColumns = { onSetPageColumns("albumList", it) },
                                 onPinchActivity = { lastPinchAt = System.currentTimeMillis() },
                             ),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = topContentPadding, end = 14.dp, bottom = 14.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = 14.dp, end = 14.dp, bottom = 14.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
@@ -5536,8 +5546,8 @@ private fun GalleryScreen(
                     } else {
                         null
                     },
-                    contentTopPadding = topContentPadding,
-                    modifier = Modifier.fillMaxSize().padding(padding),
+                    contentTopPadding = 8.dp,
+                    modifier = Modifier.fillMaxSize().padding(padding).padding(top = topContentPadding),
                 )
             }
         }
