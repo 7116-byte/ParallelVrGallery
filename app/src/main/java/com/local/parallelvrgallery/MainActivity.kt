@@ -5442,8 +5442,6 @@ private fun GalleryScreen(
     val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
     var topBarHeightPx by remember { mutableStateOf(0) }
     val topContentPadding = with(density) { topBarHeightPx.toDp() }
-    val minTopContentPadding = if (state.message != null) 190.dp else 150.dp
-    val pageTopPadding = if (topContentPadding < minTopContentPadding) minTopContentPadding else topContentPadding
     val topBarScrollOffset = when {
         state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
         state.homeTab == "generated" && state.selectedGeneratedVersion != null -> {
@@ -5456,9 +5454,9 @@ private fun GalleryScreen(
     }
     val topBarOverlap = topBarScrollOffset.coerceAtLeast(0).toFloat()
     val topBarAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
-        0.98f
+        1f
     } else {
-        (0.98f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.48f).coerceIn(0.5f, 0.98f)
+        (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.45f).coerceIn(0.55f, 1f)
     }
     LaunchedEffect(state.homeTab) {
         if (state.homeTab != "generated") generatedSelectionActions = null
@@ -5477,8 +5475,7 @@ private fun GalleryScreen(
                 Box(
                     Modifier
                         .fillMaxSize()
-                        .padding(padding)
-                        .padding(top = pageTopPadding),
+                        .padding(padding),
                 ) {
                     ManageScreen(
                         state = state,
@@ -5489,7 +5486,7 @@ private fun GalleryScreen(
                         onToggleVersion = onToggleGeneratedVersion,
                         onOpenVersion = onOpenGeneratedVersion,
                         onCloseVersion = onCloseGeneratedVersion,
-                        contentTopPadding = 8.dp,
+                        contentTopPadding = topContentPadding + 8.dp,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
                         onGeneratedScroll = onGeneratedScroll,
                         onGeneratedVersionScroll = onGeneratedVersionScroll,
@@ -5511,8 +5508,7 @@ private fun GalleryScreen(
                 Box(
                     Modifier
                         .fillMaxSize()
-                        .padding(padding)
-                        .padding(top = pageTopPadding),
+                        .padding(padding),
                 ) {
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(state.albumListColumns),
@@ -5524,7 +5520,7 @@ private fun GalleryScreen(
                                 onColumns = { onSetPageColumns("albumList", it) },
                                 onPinchActivity = { lastPinchAt = System.currentTimeMillis() },
                             ),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = 14.dp, end = 14.dp, bottom = 14.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = topContentPadding + 14.dp, end = 14.dp, bottom = 14.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
@@ -5589,8 +5585,8 @@ private fun GalleryScreen(
                     } else {
                         null
                     },
-                    contentTopPadding = 8.dp,
-                    modifier = Modifier.fillMaxSize().padding(padding).padding(top = pageTopPadding),
+                    contentTopPadding = topContentPadding + 8.dp,
+                    modifier = Modifier.fillMaxSize().padding(padding),
                 )
             }
         }
