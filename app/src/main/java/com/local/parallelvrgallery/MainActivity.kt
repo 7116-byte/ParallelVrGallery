@@ -5442,6 +5442,8 @@ private fun GalleryScreen(
     val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
     var topBarHeightPx by remember { mutableStateOf(0) }
     val topContentPadding = with(density) { topBarHeightPx.toDp() }
+    val minTopListPadding = if (state.message != null) 128.dp else 104.dp
+    val topListPadding = if (topContentPadding < minTopListPadding) minTopListPadding else topContentPadding
     val topBarScrollOffset = when {
         state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
         state.homeTab == "generated" && state.selectedGeneratedVersion != null -> {
@@ -5486,7 +5488,7 @@ private fun GalleryScreen(
                         onToggleVersion = onToggleGeneratedVersion,
                         onOpenVersion = onOpenGeneratedVersion,
                         onCloseVersion = onCloseGeneratedVersion,
-                        contentTopPadding = topContentPadding + 8.dp,
+                        contentTopPadding = topListPadding + 8.dp,
                         onSetGeneratedColumns = { onSetPageColumns("generated", it) },
                         onGeneratedScroll = onGeneratedScroll,
                         onGeneratedVersionScroll = onGeneratedVersionScroll,
@@ -5520,7 +5522,7 @@ private fun GalleryScreen(
                                 onColumns = { onSetPageColumns("albumList", it) },
                                 onPinchActivity = { lastPinchAt = System.currentTimeMillis() },
                             ),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = topContentPadding + 14.dp, end = 14.dp, bottom = 14.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = topListPadding + 14.dp, end = 14.dp, bottom = 14.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
                         horizontalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
@@ -5585,7 +5587,7 @@ private fun GalleryScreen(
                     } else {
                         null
                     },
-                    contentTopPadding = topContentPadding + 8.dp,
+                    contentTopPadding = topListPadding + 8.dp,
                     modifier = Modifier.fillMaxSize().padding(padding),
                 )
             }
