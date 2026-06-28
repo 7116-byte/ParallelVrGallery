@@ -5442,6 +5442,8 @@ private fun GalleryScreen(
     val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
     var topBarHeightPx by remember { mutableStateOf(0) }
     val topContentPadding = with(density) { topBarHeightPx.toDp() }
+    val minTopContentPadding = if (state.message != null) 190.dp else 150.dp
+    val pageTopPadding = if (topContentPadding < minTopContentPadding) minTopContentPadding else topContentPadding
     val topBarScrollOffset = when {
         state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
         state.homeTab == "generated" && state.selectedGeneratedVersion != null -> {
@@ -5476,7 +5478,7 @@ private fun GalleryScreen(
                     Modifier
                         .fillMaxSize()
                         .padding(padding)
-                        .padding(top = topContentPadding),
+                        .padding(top = pageTopPadding),
                 ) {
                     ManageScreen(
                         state = state,
@@ -5510,7 +5512,7 @@ private fun GalleryScreen(
                     Modifier
                         .fillMaxSize()
                         .padding(padding)
-                        .padding(top = topContentPadding),
+                        .padding(top = pageTopPadding),
                 ) {
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(state.albumListColumns),
@@ -5588,7 +5590,7 @@ private fun GalleryScreen(
                         null
                     },
                     contentTopPadding = 8.dp,
-                    modifier = Modifier.fillMaxSize().padding(padding).padding(top = topContentPadding),
+                    modifier = Modifier.fillMaxSize().padding(padding).padding(top = pageTopPadding),
                 )
             }
         }
