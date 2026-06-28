@@ -5442,7 +5442,12 @@ private fun GalleryScreen(
     val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
     var topBarHeightPx by remember { mutableStateOf(0) }
     val topContentPadding = with(density) { topBarHeightPx.toDp() }
-    val minTopListPadding = if (state.message != null) 128.dp else 104.dp
+    val topBarStatusText = if (state.homeTab == "generated" && state.selectedGeneratedVersion != null) {
+        state.selectedGeneratedVersion
+    } else {
+        state.message?.let { lang.pickMixed(it) }
+    }
+    val minTopListPadding = if (topBarStatusText != null) 128.dp else 104.dp
     val topListPadding = if (topContentPadding < minTopListPadding) minTopListPadding else topContentPadding
     val topBarScrollOffset = when {
         state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
@@ -5652,9 +5657,14 @@ private fun GalleryScreen(
                         }
                     }
                 }
-                state.message?.let {
+                topBarStatusText?.let {
                     Spacer(Modifier.height(6.dp))
-                    Text(lang.pickMixed(it), style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
             }
         HomeBottomNav(
@@ -6293,21 +6303,23 @@ private fun ManageScreen(
                             .fillMaxSize()
                             .padding(top = if (embedded) contentTopPadding else 0.dp),
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            OutlinedButton(onClick = onCloseVersion) { Text(lang.t("返回", "Back")) }
-                            Spacer(Modifier.width(10.dp))
-                            Text(
-                                text = selectedVersion,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f),
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            OutlinedButton(onClick = { onDeleteVersion(selectedVersion); onCloseVersion() }) { Text(lang.t("删除", "Delete")) }
+                        if (!embedded) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                OutlinedButton(onClick = onCloseVersion) { Text(lang.t("返回", "Back")) }
+                                Spacer(Modifier.width(10.dp))
+                                Text(
+                                    text = selectedVersion,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                OutlinedButton(onClick = { onDeleteVersion(selectedVersion); onCloseVersion() }) { Text(lang.t("删除", "Delete")) }
+                            }
+                            Spacer(Modifier.height(10.dp))
                         }
-                        Spacer(Modifier.height(10.dp))
                         val selectedItems = itemsInVersion.filter { "${it.entry.photoKey}|${it.entry.version}" in selectedImageKeys }
                         val selectedImageIndexes = selectedItems.mapNotNull { item -> state.photos.indexOfFirst { it.cacheKey == item.photoItem.cacheKey }.takeIf { it >= 0 } }.distinct()
                         LaunchedEffect(embedded, selectedImageKeys, selectedItems, selectedImageIndexes) {
