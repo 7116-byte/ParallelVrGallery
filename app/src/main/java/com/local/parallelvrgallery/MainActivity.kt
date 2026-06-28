@@ -5465,6 +5465,11 @@ private fun GalleryScreen(
     } else {
         (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.45f).coerceIn(0.55f, 1f)
     }
+    val topBarStatusAlpha = if (state.homeTab == "generated" && state.selectedGeneratedVersion != null && topBarHeightPx > 0) {
+        (1f - (topBarOverlap / (topBarHeightPx.toFloat() * 0.45f)).coerceIn(0f, 1f)).coerceIn(0f, 1f)
+    } else {
+        1f
+    }
     LaunchedEffect(state.homeTab) {
         if (state.homeTab != "generated") generatedSelectionActions = null
     }
@@ -5664,6 +5669,7 @@ private fun GalleryScreen(
                         style = MaterialTheme.typography.bodySmall,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.graphicsLayer(alpha = topBarStatusAlpha),
                     )
                 }
             }
