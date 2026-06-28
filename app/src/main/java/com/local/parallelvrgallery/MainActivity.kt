@@ -5463,7 +5463,12 @@ private fun GalleryScreen(
     val topBarAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
         1f
     } else {
-        (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.45f).coerceIn(0.55f, 1f)
+        (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.58f).coerceIn(0.42f, 1f)
+    }
+    val topBarControlsAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
+        1f
+    } else {
+        (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.42f).coerceIn(0.58f, 1f)
     }
     val topBarStatusAlpha = if (state.homeTab == "generated" && state.selectedGeneratedVersion != null && topBarHeightPx > 0) {
         (1f - (topBarOverlap / (topBarHeightPx.toFloat() * 0.45f)).coerceIn(0f, 1f)).coerceIn(0f, 1f)
@@ -5613,16 +5618,21 @@ private fun GalleryScreen(
         ) {
                 val generatedActions = generatedSelectionActions.takeIf { state.homeTab == "generated" }
                 if (selectedKeys.isEmpty() && generatedActions != null) {
-                    ManageSelectionActions(
-                        count = generatedActions.count,
-                        lang = lang,
-                        onClear = generatedActions.onClear,
-                        onSave = generatedActions.onSave,
-                        onRegenerate = generatedActions.onRegenerate,
-                        onDelete = generatedActions.onDelete,
-                    )
+                    Box(Modifier.graphicsLayer(alpha = topBarControlsAlpha)) {
+                        ManageSelectionActions(
+                            count = generatedActions.count,
+                            lang = lang,
+                            onClear = generatedActions.onClear,
+                            onSave = generatedActions.onSave,
+                            onRegenerate = generatedActions.onRegenerate,
+                            onDelete = generatedActions.onDelete,
+                        )
+                    }
                 } else {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.graphicsLayer(alpha = topBarControlsAlpha),
+                    ) {
                         if (selectedKeys.isEmpty()) {
                             val title = when {
                                 state.homeTab == "albums" && state.selectedAlbumId != null -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Album")
