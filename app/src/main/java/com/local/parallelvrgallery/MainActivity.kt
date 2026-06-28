@@ -406,7 +406,8 @@ private const val ALBUM_PAGE_SIZE = 1200
 private const val ALL_PAGE_SIZE = 1200
 private const val IMAGE_GENERATOR_VERSION = "depthV6"
 private const val VIDEO_ENCODER_VERSION = "encoderV12"
-private const val CURRENT_VERSION_TAG = "v2.51"
+private val CURRENT_VERSION_TAG: String get() = "v${BuildConfig.VERSION_NAME}"
+private val CURRENT_VERSION_CODE: Long get() = BuildConfig.VERSION_CODE.toLong()
 private const val GITHUB_REPO = "7116-byte/ParallelVrGallery"
 private const val UPDATE_APK_NAME = "app-debug.apk"
 
@@ -1208,6 +1209,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     requestMethod = "GET"
                     instanceFollowRedirects = true
                     setRequestProperty("User-Agent", "ParallelVrGallery/$CURRENT_VERSION_TAG")
+                    setRequestProperty("Cache-Control", "no-cache")
+                    setRequestProperty("Pragma", "no-cache")
                 }
                 connection.connect()
                 if (connection.responseCode !in 200..299) error("HTTP ${connection.responseCode}")
@@ -1245,6 +1248,43 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         error(errors.joinToString(" | ").ifBlank { "all update download sources failed" })
     }
 
+    private fun downloadedApkVersion(file: File): Pair<String, Long> {
+        val info = app.packageManager.getPackageArchiveInfo(file.absolutePath, 0)
+            ?: error("无法读取安装包版本 / Cannot read APK version")
+        if (info.packageName != app.packageName) {
+            error("安装包应用 ID 不匹配：${info.packageName} / APK package mismatch")
+        }
+        val versionName = info.versionName?.takeIf { it.isNotBlank() }
+            ?: error("安装包缺少版本号 / APK versionName missing")
+        val versionCode = if (Build.VERSION.SDK_INT >= 28) {
+            info.longVersionCode
+        } else {
+            @Suppress("DEPRECATION")
+            info.versionCode.toLong()
+        }
+        return "v$versionName" to versionCode
+    }
+
+    private fun validateDownloadedUpdate(file: File, expectedTag: String?, lang: AppLanguage) {
+        val (downloadedTag, downloadedCode) = downloadedApkVersion(file)
+        if (compareVersionTags(downloadedTag, CURRENT_VERSION_TAG) <= 0 || downloadedCode <= CURRENT_VERSION_CODE) {
+            error(
+                lang.t(
+                    "下载到旧版安装包：$downloadedTag($downloadedCode)，当前：$CURRENT_VERSION_TAG($CURRENT_VERSION_CODE)，请重新检查更新。",
+                    "Downloaded APK is not newer: $downloadedTag($downloadedCode), current: $CURRENT_VERSION_TAG($CURRENT_VERSION_CODE). Check again.",
+                ),
+            )
+        }
+        if (expectedTag != null && compareVersionTags(downloadedTag, expectedTag) < 0) {
+            error(
+                lang.t(
+                    "下载版本不对：期望 $expectedTag，实际 $downloadedTag，请重新下载。",
+                    "Downloaded wrong version: expected $expectedTag, got $downloadedTag. Download again.",
+                ),
+            )
+        }
+    }
+
     fun downloadUpdateApk() {
         val state = _uiState.value
         val lang = state.settings.language
@@ -1276,6 +1316,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     val updatesDir = File(app.getExternalFilesDir(null), "updates").also { it.mkdirs() }
                     val output = File(updatesDir, "ParallelVrGallery-$version.apk")
                     downloadFileWithProgress(updateDownloadUrls(url), output, lang)
+                    validateDownloadedUpdate(output, state.updateVersion, lang)
                     output
                 }
             }
@@ -6502,6 +6543,14 @@ private fun SettingsScreen(
         OutlinedButton(onClick = onCheckUpdate) {
             Text(lang.t("检查更新", "Check for updates"))
         }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = lang.t(
+                "当前版本：$CURRENT_VERSION_TAG ($CURRENT_VERSION_CODE)",
+                "Current version: $CURRENT_VERSION_TAG ($CURRENT_VERSION_CODE)",
+            ),
+            style = MaterialTheme.typography.bodySmall,
+        )
         updateStatus?.let {
             Spacer(Modifier.height(6.dp))
             Text(it, style = MaterialTheme.typography.bodySmall)

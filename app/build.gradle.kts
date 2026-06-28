@@ -12,12 +12,13 @@ android {
         applicationId = "com.local.parallelvrgallery"
         minSdk = 26
         targetSdk = 35
-        versionCode = 253
-        versionName = "2.53"
+        versionCode = 254
+        versionName = "2.54"
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     packaging {
