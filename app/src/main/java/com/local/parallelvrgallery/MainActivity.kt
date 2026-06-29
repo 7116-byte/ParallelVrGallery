@@ -5447,6 +5447,7 @@ private fun GalleryScreen(
     } else {
         state.message?.let { lang.pickMixed(it) }
     }
+    val generatedVersionDetail = state.homeTab == "generated" && state.selectedGeneratedVersion != null
     val minTopListPadding = if (topBarStatusText != null) 128.dp else 104.dp
     val topListPadding = if (topContentPadding < minTopListPadding) minTopListPadding else topContentPadding
     val topBarScrollOffset = when {
@@ -5467,11 +5468,13 @@ private fun GalleryScreen(
     }
     val topBarControlsAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
         1f
+    } else if (generatedVersionDetail) {
+        (1f - (topBarOverlap / (topBarHeightPx.toFloat() * 0.45f)).coerceIn(0f, 1f)).coerceIn(0f, 1f)
     } else {
         (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.42f).coerceIn(0.58f, 1f)
     }
-    val topBarStatusAlpha = if (state.homeTab == "generated" && state.selectedGeneratedVersion != null && topBarHeightPx > 0) {
-        (1f - (topBarOverlap / (topBarHeightPx.toFloat() * 0.45f)).coerceIn(0f, 1f)).coerceIn(0f, 1f)
+    val topBarStatusAlpha = if (generatedVersionDetail && topBarHeightPx > 0) {
+        topBarControlsAlpha
     } else {
         1f
     }
@@ -5618,16 +5621,14 @@ private fun GalleryScreen(
         ) {
                 val generatedActions = generatedSelectionActions.takeIf { state.homeTab == "generated" }
                 if (selectedKeys.isEmpty() && generatedActions != null) {
-                    Box(Modifier.graphicsLayer(alpha = topBarControlsAlpha)) {
-                        ManageSelectionActions(
-                            count = generatedActions.count,
-                            lang = lang,
-                            onClear = generatedActions.onClear,
-                            onSave = generatedActions.onSave,
-                            onRegenerate = generatedActions.onRegenerate,
-                            onDelete = generatedActions.onDelete,
-                        )
-                    }
+                    ManageSelectionActions(
+                        count = generatedActions.count,
+                        lang = lang,
+                        onClear = generatedActions.onClear,
+                        onSave = generatedActions.onSave,
+                        onRegenerate = generatedActions.onRegenerate,
+                        onDelete = generatedActions.onDelete,
+                    )
                 } else {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
