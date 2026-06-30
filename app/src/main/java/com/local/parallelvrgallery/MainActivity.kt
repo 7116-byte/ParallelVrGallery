@@ -129,12 +129,14 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -5447,7 +5449,6 @@ private fun GalleryScreen(
     } else {
         state.message?.let { lang.pickMixed(it) }
     }
-    val generatedVersionDetail = state.homeTab == "generated" && state.selectedGeneratedVersion != null
     val minTopListPadding = if (topBarStatusText != null) 128.dp else 104.dp
     val topListPadding = if (topContentPadding < minTopListPadding) minTopListPadding else topContentPadding
     val topBarScrollOffset = when {
@@ -5468,15 +5469,8 @@ private fun GalleryScreen(
     }
     val topBarControlsAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
         1f
-    } else if (generatedVersionDetail) {
-        (1f - (topBarOverlap / (topBarHeightPx.toFloat() * 0.45f)).coerceIn(0f, 1f)).coerceIn(0f, 1f)
     } else {
         (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.42f).coerceIn(0.58f, 1f)
-    }
-    val topBarStatusAlpha = if (generatedVersionDetail && topBarHeightPx > 0) {
-        topBarControlsAlpha
-    } else {
-        1f
     }
     LaunchedEffect(state.homeTab) {
         if (state.homeTab != "generated") generatedSelectionActions = null
@@ -5680,7 +5674,7 @@ private fun GalleryScreen(
                         style = MaterialTheme.typography.bodySmall,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.graphicsLayer(alpha = topBarStatusAlpha),
+                        modifier = Modifier.graphicsLayer(alpha = topBarControlsAlpha),
                     )
                 }
             }
@@ -6900,6 +6894,7 @@ private fun ViewerScreen(
                     uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
                     modifier = Modifier.fillMaxSize(),
                     active = page == pagerState.currentPage,
+                    sbsMode = generated != null,
                     controlsVisible = controlsVisible,
                     statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  当前帧${job?.currentFrameMs ?: 0}ms  平均帧${job?.avgFrameMs ?: 0}ms",
                     onSingleTap = { controlsVisible = !controlsVisible },
@@ -7345,6 +7340,16 @@ private fun List<PointerInputChange>.previousSpan(center: Offset): Float {
     return map { (it.previousPosition - center).getDistance() }.average().toFloat()
 }
 
+private fun Modifier.sbsVideoHalfLayout(alignEnd: Boolean): Modifier = layout { measurable, constraints ->
+    val fullWidth = (constraints.maxWidth * 2).coerceAtLeast(1)
+    val fullHeight = constraints.maxHeight.coerceAtLeast(1)
+    val placeable = measurable.measure(Constraints.fixed(fullWidth, fullHeight))
+    layout(constraints.maxWidth, constraints.maxHeight) {
+        val x = if (alignEnd) constraints.maxWidth - fullWidth else 0
+        placeable.place(x, 0)
+    }
+}
+
 @Composable
 private fun WindowSelector(value: Int, onChange: (Int) -> Unit) {
     val options = listOf(2, 4, 8)
@@ -7419,13 +7424,16 @@ private fun VideoPlayer(
     uri: Uri,
     modifier: Modifier = Modifier,
     active: Boolean,
+    sbsMode: Boolean = false,
     controlsVisible: Boolean,
     statusText: String,
     onSingleTap: () -> Unit,
 ) {
     val context = LocalContext.current
     var videoView by remember { mutableStateOf<VideoView?>(null) }
+    var secondaryVideoView by remember { mutableStateOf<VideoView?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+    var secondaryMediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var lastTapAt by remember { mutableStateOf(0L) }
     var longPressRunnable by remember { mutableStateOf<Runnable?>(null) }
     var longPressActive by remember { mutableStateOf(false) }
@@ -7433,26 +7441,51 @@ private fun VideoPlayer(
     var positionText by remember(uri) { mutableStateOf("00:00 / 00:00") }
     var hint by remember(uri) { mutableStateOf<String?>(null) }
     var isPlaying by remember(uri) { mutableStateOf(false) }
+    var scale by remember(uri) { mutableStateOf(1f) }
+    var offset by remember(uri) { mutableStateOf(Offset.Zero) }
+    val animatedScale by animateFloatAsState(targetValue = scale, label = "videoScale")
+    val animatedOffsetX by animateFloatAsState(targetValue = offset.x, label = "videoOffsetX")
+    val animatedOffsetY by animateFloatAsState(targetValue = offset.y, label = "videoOffsetY")
+    val zoomLayer = Modifier.graphicsLayer {
+        scaleX = animatedScale
+        scaleY = animatedScale
+        translationX = animatedOffsetX
+        translationY = animatedOffsetY
+    }
 
-    LaunchedEffect(uri, videoView, active) {
+    LaunchedEffect(uri, videoView, secondaryVideoView, sbsMode, active) {
         while (true) {
             val view = videoView
+            val secondary = secondaryVideoView
             val duration = view?.duration?.takeIf { it > 0 } ?: 0
             val position = view?.currentPosition ?: 0
             isPlaying = view?.isPlaying == true
             progress = if (duration > 0) (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else 0f
             positionText = "${formatDuration(position)} / ${formatDuration(duration)}"
+            if (sbsMode && secondary != null && active && duration > 0) {
+                val delta = abs(secondary.currentPosition - position)
+                if (delta > 160) secondary.seekTo(position)
+                if (view?.isPlaying == true && !secondary.isPlaying) secondary.start()
+                if (view?.isPlaying != true && secondary.isPlaying) secondary.pause()
+            }
             delay(350)
         }
     }
 
-    LaunchedEffect(uri, videoView, active) {
+    LaunchedEffect(uri, videoView, secondaryVideoView, active) {
         val view = videoView ?: return@LaunchedEffect
         if (active) {
             if (!view.isPlaying) view.start()
+            secondaryVideoView?.let { if (!it.isPlaying) it.start() }
         } else {
             if (view.isPlaying) view.pause()
+            secondaryVideoView?.let { if (it.isPlaying) it.pause() }
         }
+    }
+
+    LaunchedEffect(uri, sbsMode) {
+        scale = 1f
+        offset = Offset.Zero
     }
 
     LaunchedEffect(hint) {
@@ -7463,40 +7496,108 @@ private fun VideoPlayer(
     }
 
     Box(modifier.background(androidx.compose.ui.graphics.Color.Black)) {
-        AndroidView(
-            factory = {
-                VideoView(context).apply {
-                    setVideoURI(uri)
-                    setOnPreparedListener { player ->
-                        mediaPlayer = player
-                        player.isLooping = true
-                        if (active) {
-                            start()
-                            isPlaying = true
-                        } else {
-                            pause()
-                            isPlaying = false
+        if (sbsMode) {
+            Row(Modifier.fillMaxSize()) {
+                Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.CenterStart) {
+                    AndroidView(
+                        factory = {
+                            VideoView(context).apply {
+                                setVideoURI(uri)
+                                setOnPreparedListener { player ->
+                                    mediaPlayer = player
+                                    player.isLooping = true
+                                    if (active) {
+                                        start()
+                                        isPlaying = true
+                                    } else {
+                                        pause()
+                                        isPlaying = false
+                                    }
+                                }
+                                videoView = this
+                            }
+                        },
+                        update = { view ->
+                            if (view.tag != uri) {
+                                view.tag = uri
+                                view.setVideoURI(uri)
+                            } else if (!active && view.isPlaying) {
+                                view.pause()
+                            }
+                            videoView = view
+                        },
+                        modifier = Modifier.sbsVideoHalfLayout(alignEnd = false).then(zoomLayer),
+                    )
+                }
+                Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.CenterEnd) {
+                    AndroidView(
+                        factory = {
+                            VideoView(context).apply {
+                                setVideoURI(uri)
+                                setOnPreparedListener { player ->
+                                    secondaryMediaPlayer = player
+                                    player.isLooping = true
+                                    player.setVolume(0f, 0f)
+                                    val primaryPosition = videoView?.currentPosition ?: 0
+                                    if (primaryPosition > 0) seekTo(primaryPosition)
+                                    if (active) start() else pause()
+                                }
+                                secondaryVideoView = this
+                            }
+                        },
+                        update = { view ->
+                            if (view.tag != uri) {
+                                view.tag = uri
+                                view.setVideoURI(uri)
+                            } else if (!active && view.isPlaying) {
+                                view.pause()
+                            }
+                            secondaryVideoView = view
+                        },
+                        modifier = Modifier.sbsVideoHalfLayout(alignEnd = true).then(zoomLayer),
+                    )
+                }
+            }
+            Box(Modifier.align(Alignment.Center).width(1.dp).fillMaxSize().background(androidx.compose.ui.graphics.Color(0x66ffffff)))
+        } else {
+            AndroidView(
+                factory = {
+                    VideoView(context).apply {
+                        setVideoURI(uri)
+                        setOnPreparedListener { player ->
+                            mediaPlayer = player
+                            player.isLooping = true
+                            if (active) {
+                                start()
+                                isPlaying = true
+                            } else {
+                                pause()
+                                isPlaying = false
+                            }
                         }
+                        videoView = this
                     }
-                    videoView = this
-                }
-            },
-            update = { view ->
-                if (view.tag != uri) {
-                    view.tag = uri
-                    view.setVideoURI(uri)
-                } else if (!active) {
-                    if (view.isPlaying) view.pause()
-                }
-                videoView = view
-            },
-            modifier = Modifier.fillMaxSize(),
-        )
+                },
+                update = { view ->
+                    if (view.tag != uri) {
+                        view.tag = uri
+                        view.setVideoURI(uri)
+                    } else if (!active) {
+                        if (view.isPlaying) view.pause()
+                    }
+                    videoView = view
+                },
+                modifier = Modifier.fillMaxSize().then(zoomLayer),
+            )
+        }
         DisposableEffect(uri) {
             onDispose {
                 runCatching { videoView?.stopPlayback() }
+                runCatching { secondaryVideoView?.stopPlayback() }
                 mediaPlayer = null
+                secondaryMediaPlayer = null
                 videoView = null
+                secondaryVideoView = null
             }
         }
         Box(
@@ -7513,23 +7614,46 @@ private fun VideoPlayer(
                                 hint = "2 倍速"
                                 runCatching {
                                     if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(2f) }
+                                    if (Build.VERSION.SDK_INT >= 23) secondaryMediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(2f) }
                                 }
                             }
                             longPressRunnable = runnable
                             view?.postDelayed(runnable, 450L)
                             var moved = false
+                            var multiTouch = false
                             val start = down.position
+                            var lastCentroid: Offset? = null
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val pressed = event.changes.filter { it.pressed }
-                                if (pressed.isNotEmpty() && (pressed.first().position - start).getDistance() > 18f) moved = true
                                 if (pressed.isEmpty()) break
+                                if (pressed.size >= 2) {
+                                    multiTouch = true
+                                    moved = true
+                                    longPressRunnable?.let { view?.removeCallbacks(it) }
+                                    longPressRunnable = null
+                                    val centroid = pressed.centroid()
+                                    val previousCentroid = lastCentroid ?: pressed.previousCentroid()
+                                    val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
+                                    val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
+                                    val pan = lastCentroid?.let { centroid - it } ?: Offset.Zero
+                                    val nextScale = (scale * zoom).coerceIn(1f, 8f)
+                                    scale = nextScale
+                                    offset = if (nextScale == 1f) Offset.Zero else offset + pan
+                                    lastCentroid = centroid
+                                    event.changes.forEach { it.consume() }
+                                } else {
+                                    lastCentroid = null
+                                    if ((pressed.first().position - start).getDistance() > 18f) moved = true
+                                }
                             }
                             longPressRunnable?.let { view?.removeCallbacks(it) }
                             longPressRunnable = null
+                            if (multiTouch) continue
                             if (longPressActive) {
                                 runCatching {
                                     if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(1f) }
+                                    if (Build.VERSION.SDK_INT >= 23) secondaryMediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(1f) }
                                 }
                                 hint = "恢复正常速度"
                                 longPressActive = false
@@ -7548,6 +7672,7 @@ private fun VideoPlayer(
                                         } else {
                                             view?.seekTo(target)
                                         }
+                                        secondaryVideoView?.seekTo(target)
                                     }
                                     progress = if (duration > 0) (target.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else progress
                                     positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
@@ -7587,9 +7712,11 @@ private fun VideoPlayer(
                             val view = videoView
                             if (view?.isPlaying == true) {
                                 view.pause()
+                                secondaryVideoView?.pause()
                                 isPlaying = false
                             } else {
                                 view?.start()
+                                secondaryVideoView?.start()
                                 isPlaying = true
                             }
                         },
@@ -7621,6 +7748,7 @@ private fun VideoPlayer(
                                 } else {
                                     view?.seekTo(target)
                                 }
+                                secondaryVideoView?.seekTo(target)
                             }
                             positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
                         }
