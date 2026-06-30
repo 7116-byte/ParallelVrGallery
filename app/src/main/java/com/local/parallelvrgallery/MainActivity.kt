@@ -16,6 +16,7 @@ import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
 import android.graphics.Color
 import android.graphics.ImageDecoder
+import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.media.MediaCodec
@@ -47,6 +48,7 @@ import android.view.Surface
 import android.view.TextureView
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.widget.VideoView
 import androidx.activity.result.IntentSenderRequest
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
@@ -130,14 +132,12 @@ import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -6953,12 +6953,16 @@ private fun ViewerScreen(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
-                Button(onClick = { onVr(currentIndex) }, enabled = !generatedViewer) {
+                val currentVideoState = currentItem?.takeIf { it.kind == MediaKind.VIDEO }?.let { state.videoStates[it.cacheKey] ?: VideoVrState.NORMAL }
+                val vrButtonEnabled = if (currentVideoState != null) {
+                    !generatedViewer || currentVideoState != VideoVrState.READY
+                } else {
+                    !generatedViewer
+                }
+                Button(onClick = { onVr(currentIndex) }, enabled = vrButtonEnabled) {
                     Text(
-                        if (generatedViewer) {
-                            lang.t("已生成", "Ready")
-                        } else if (currentItem?.kind == MediaKind.VIDEO) {
-                            when (state.videoStates[currentItem.cacheKey] ?: VideoVrState.NORMAL) {
+                        if (currentItem?.kind == MediaKind.VIDEO) {
+                            when (currentVideoState ?: VideoVrState.NORMAL) {
                                 VideoVrState.NORMAL -> lang.t("加入 VR 队列", "Add to VR queue")
                                 VideoVrState.QUEUED -> lang.t("暂停生成", "Pause")
                                 VideoVrState.GENERATING -> lang.t("暂停生成", "Pause")
@@ -6966,6 +6970,8 @@ private fun ViewerScreen(
                                 VideoVrState.READY -> lang.t("已生成", "Ready")
                                 VideoVrState.FAILED -> lang.t("重试视频 VR", "Retry video VR")
                             }
+                        } else if (generatedViewer) {
+                            lang.t("已生成", "Ready")
                         } else if (state.vrMode) {
                             lang.t("关闭 VR", "VR Off")
                         } else {
@@ -7353,14 +7359,43 @@ private fun List<PointerInputChange>.previousSpan(center: Offset): Float {
     return map { (it.previousPosition - center).getDistance() }.average().toFloat()
 }
 
-private fun Modifier.sbsVideoHalfLayout(alignEnd: Boolean): Modifier = layout { measurable, constraints ->
-    val fullWidth = (constraints.maxWidth * 2).coerceAtLeast(1)
-    val fullHeight = constraints.maxHeight.coerceAtLeast(1)
-    val placeable = measurable.measure(Constraints.fixed(fullWidth, fullHeight))
-    layout(constraints.maxWidth, constraints.maxHeight) {
-        val x = if (alignEnd) constraints.maxWidth - fullWidth else 0
-        placeable.place(x, 0)
+private enum class VideoCropMode {
+    FULL,
+    SBS_LEFT,
+    SBS_RIGHT,
+}
+
+private fun fittedRect(viewWidth: Float, viewHeight: Float, sourceAspect: Float): android.graphics.RectF {
+    val viewAspect = if (viewHeight > 0f) viewWidth / viewHeight else sourceAspect
+    return if (viewAspect > sourceAspect) {
+        val contentWidth = viewHeight * sourceAspect
+        val left = (viewWidth - contentWidth) / 2f
+        android.graphics.RectF(left, 0f, left + contentWidth, viewHeight)
+    } else {
+        val contentHeight = viewWidth / sourceAspect
+        val top = (viewHeight - contentHeight) / 2f
+        android.graphics.RectF(0f, top, viewWidth, top + contentHeight)
     }
+}
+
+private fun applyVideoTextureTransform(view: TextureView, videoSize: IntSize, cropMode: VideoCropMode) {
+    val viewWidth = view.width.toFloat()
+    val viewHeight = view.height.toFloat()
+    if (viewWidth <= 0f || viewHeight <= 0f || videoSize.width <= 0 || videoSize.height <= 0) return
+
+    val sourceRect = when (cropMode) {
+        VideoCropMode.FULL -> android.graphics.RectF(0f, 0f, viewWidth, viewHeight)
+        VideoCropMode.SBS_LEFT -> android.graphics.RectF(0f, 0f, viewWidth / 2f, viewHeight)
+        VideoCropMode.SBS_RIGHT -> android.graphics.RectF(viewWidth / 2f, 0f, viewWidth, viewHeight)
+    }
+    val sourceAspect = when (cropMode) {
+        VideoCropMode.FULL -> videoSize.width.toFloat() / videoSize.height.toFloat()
+        VideoCropMode.SBS_LEFT,
+        VideoCropMode.SBS_RIGHT -> (videoSize.width.toFloat() / 2f) / videoSize.height.toFloat()
+    }
+    val matrix = Matrix()
+    matrix.setRectToRect(sourceRect, fittedRect(viewWidth, viewHeight, sourceAspect), Matrix.ScaleToFit.FILL)
+    view.setTransform(matrix)
 }
 
 @Composable
@@ -7368,6 +7403,7 @@ private fun TextureVideoView(
     uri: Uri,
     active: Boolean,
     muted: Boolean,
+    cropMode: VideoCropMode,
     modifier: Modifier = Modifier,
     onPlayer: (MediaPlayer?) -> Unit,
 ) {
@@ -7375,6 +7411,7 @@ private fun TextureVideoView(
     var textureView by remember(uri) { mutableStateOf<TextureView?>(null) }
     var player by remember(uri) { mutableStateOf<MediaPlayer?>(null) }
     var boundSurface by remember(uri) { mutableStateOf<Surface?>(null) }
+    var naturalSize by remember(uri) { mutableStateOf(IntSize.Zero) }
     var prepared by remember(uri) { mutableStateOf(false) }
 
     fun releaseCurrent() {
@@ -7399,7 +7436,13 @@ private fun TextureVideoView(
             nextPlayer.setSurface(surface)
             nextPlayer.isLooping = true
             if (muted) nextPlayer.setVolume(0f, 0f)
+            nextPlayer.setOnVideoSizeChangedListener { _, width, height ->
+                naturalSize = IntSize(width, height)
+                textureView?.let { applyVideoTextureTransform(it, IntSize(width, height), cropMode) }
+            }
             nextPlayer.setOnPreparedListener {
+                naturalSize = IntSize(it.videoWidth, it.videoHeight)
+                textureView?.let { view -> applyVideoTextureTransform(view, naturalSize, cropMode) }
                 prepared = true
                 if (active) runCatching { it.start() } else runCatching { it.pause() }
             }
@@ -7422,7 +7465,9 @@ private fun TextureVideoView(
                         prepare(surface)
                     }
 
-                    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
+                    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+                        textureView?.let { applyVideoTextureTransform(it, naturalSize, cropMode) }
+                    }
 
                     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                         releaseCurrent()
@@ -7438,6 +7483,8 @@ private fun TextureVideoView(
             textureView = view
             if (view.isAvailable && player == null) {
                 view.surfaceTexture?.let { prepare(it) }
+            } else {
+                applyVideoTextureTransform(view, naturalSize, cropMode)
             }
         },
         modifier = modifier,
@@ -7535,6 +7582,7 @@ private fun VideoPlayer(
     onSingleTap: () -> Unit,
 ) {
     val delayHost = LocalView.current
+    var normalVideoView by remember { mutableStateOf<VideoView?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var secondaryMediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var videoSize by remember { mutableStateOf(IntSize.Zero) }
@@ -7602,8 +7650,9 @@ private fun VideoPlayer(
                         uri = uri,
                         active = active,
                         muted = false,
+                        cropMode = VideoCropMode.SBS_LEFT,
                         onPlayer = { mediaPlayer = it },
-                        modifier = Modifier.sbsVideoHalfLayout(alignEnd = false).then(zoomLayer),
+                        modifier = Modifier.fillMaxSize().then(zoomLayer),
                     )
                 }
                 Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.CenterEnd) {
@@ -7611,24 +7660,54 @@ private fun VideoPlayer(
                         uri = uri,
                         active = active,
                         muted = true,
+                        cropMode = VideoCropMode.SBS_RIGHT,
                         onPlayer = { player ->
                             secondaryMediaPlayer = player
                             val primaryPosition = runCatching { mediaPlayer?.currentPosition ?: 0 }.getOrDefault(0)
                             if (player != null && primaryPosition > 0) runCatching { player.seekTo(primaryPosition) }
                         },
-                        modifier = Modifier.sbsVideoHalfLayout(alignEnd = true).then(zoomLayer),
+                        modifier = Modifier.fillMaxSize().then(zoomLayer),
                     )
                 }
             }
             Box(Modifier.align(Alignment.Center).width(1.dp).fillMaxSize().background(androidx.compose.ui.graphics.Color(0x66ffffff)))
         } else {
-            TextureVideoView(
-                uri = uri,
-                active = active,
-                muted = false,
-                onPlayer = { mediaPlayer = it },
-                modifier = Modifier.fillMaxSize().then(zoomLayer),
+            AndroidView(
+                factory = {
+                    VideoView(it).apply {
+                        tag = uri
+                        setVideoURI(uri)
+                        setOnPreparedListener { player ->
+                            mediaPlayer = player
+                            player.isLooping = true
+                            if (active) start() else pause()
+                        }
+                        normalVideoView = this
+                    }
+                },
+                update = { view ->
+                    if (view.tag != uri) {
+                        view.tag = uri
+                        view.setVideoURI(uri)
+                    }
+                    if (active) {
+                        if (!view.isPlaying) view.start()
+                    } else if (view.isPlaying) {
+                        view.pause()
+                    }
+                    normalVideoView = view
+                },
+                modifier = Modifier.fillMaxSize(),
             )
+        }
+        DisposableEffect(uri, sbsMode) {
+            onDispose {
+                if (!sbsMode) {
+                    runCatching { normalVideoView?.stopPlayback() }
+                    normalVideoView = null
+                    mediaPlayer = null
+                }
+            }
         }
         Box(
             Modifier
@@ -7669,12 +7748,21 @@ private fun VideoPlayer(
                                     val nextScale = (scale * zoom).coerceIn(1f, 8f)
                                     val effectiveZoom = if (scale <= 0f) 1f else nextScale / scale
                                     scale = nextScale
-                                    val containerCenter = Offset(videoSize.width / 2f, videoSize.height / 2f)
+                                    val halfWidth = videoSize.width / 2f
+                                    fun localEyePosition(position: Offset): Offset {
+                                        return if (sbsMode && halfWidth > 0f) {
+                                            Offset(if (position.x >= halfWidth) position.x - halfWidth else position.x, position.y)
+                                        } else {
+                                            position
+                                        }
+                                    }
+                                    val localWidth = if (sbsMode && halfWidth > 0f) halfWidth else videoSize.width.toFloat()
+                                    val containerCenter = Offset(localWidth / 2f, videoSize.height / 2f)
                                     offset = if (nextScale == 1f || videoSize == IntSize.Zero) {
                                         Offset.Zero
                                     } else {
-                                        val previousFromCenter = previousCentroid - containerCenter
-                                        val currentFromCenter = centroid - containerCenter
+                                        val previousFromCenter = localEyePosition(previousCentroid) - containerCenter
+                                        val currentFromCenter = localEyePosition(centroid) - containerCenter
                                         currentFromCenter - (previousFromCenter - offset) * effectiveZoom
                                     }
                                     lastCentroid = centroid
