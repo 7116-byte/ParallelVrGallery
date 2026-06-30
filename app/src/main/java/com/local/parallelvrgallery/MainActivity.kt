@@ -7359,6 +7359,38 @@ private fun List<PointerInputChange>.previousSpan(center: Offset): Float {
     return map { (it.previousPosition - center).getDistance() }.average().toFloat()
 }
 
+private fun PointerInputChange.sbsLocalPosition(halfWidth: Float): Offset {
+    return Offset(if (position.x >= halfWidth) position.x - halfWidth else position.x, position.y)
+}
+
+private fun PointerInputChange.previousSbsLocalPosition(halfWidth: Float): Offset {
+    return Offset(if (previousPosition.x >= halfWidth) previousPosition.x - halfWidth else previousPosition.x, previousPosition.y)
+}
+
+private fun List<PointerInputChange>.sbsLocalCentroid(halfWidth: Float): Offset {
+    if (isEmpty()) return Offset.Zero
+    val x = sumOf { it.sbsLocalPosition(halfWidth).x.toDouble() }.toFloat() / size
+    val y = sumOf { it.sbsLocalPosition(halfWidth).y.toDouble() }.toFloat() / size
+    return Offset(x, y)
+}
+
+private fun List<PointerInputChange>.previousSbsLocalCentroid(halfWidth: Float): Offset {
+    if (isEmpty()) return Offset.Zero
+    val x = sumOf { it.previousSbsLocalPosition(halfWidth).x.toDouble() }.toFloat() / size
+    val y = sumOf { it.previousSbsLocalPosition(halfWidth).y.toDouble() }.toFloat() / size
+    return Offset(x, y)
+}
+
+private fun List<PointerInputChange>.sbsLocalSpan(center: Offset, halfWidth: Float): Float {
+    if (isEmpty()) return 1f
+    return map { (it.sbsLocalPosition(halfWidth) - center).getDistance() }.average().toFloat()
+}
+
+private fun List<PointerInputChange>.previousSbsLocalSpan(center: Offset, halfWidth: Float): Float {
+    if (isEmpty()) return 1f
+    return map { (it.previousSbsLocalPosition(halfWidth) - center).getDistance() }.average().toFloat()
+}
+
 private enum class VideoCropMode {
     FULL,
     SBS_LEFT,
@@ -7741,28 +7773,31 @@ private fun VideoPlayer(
                                     moved = true
                                     longPressRunnable?.let { delayHost.removeCallbacks(it) }
                                     longPressRunnable = null
-                                    val centroid = pressed.centroid()
-                                    val previousCentroid = lastCentroid ?: pressed.previousCentroid()
-                                    val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
-                                    val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
+                                    val halfWidth = videoSize.width / 2f
+                                    val useSbsLocalGesture = sbsMode && halfWidth > 0f
+                                    val centroid = if (useSbsLocalGesture) pressed.sbsLocalCentroid(halfWidth) else pressed.centroid()
+                                    val previousCentroid = lastCentroid ?: if (useSbsLocalGesture) pressed.previousSbsLocalCentroid(halfWidth) else pressed.previousCentroid()
+                                    val previousSpan = if (useSbsLocalGesture) {
+                                        pressed.previousSbsLocalSpan(previousCentroid, halfWidth)
+                                    } else {
+                                        pressed.previousSpan(previousCentroid)
+                                    }.coerceAtLeast(1f)
+                                    val currentSpan = if (useSbsLocalGesture) {
+                                        pressed.sbsLocalSpan(centroid, halfWidth)
+                                    } else {
+                                        pressed.span(centroid)
+                                    }
+                                    val zoom = (currentSpan / previousSpan).coerceIn(0.85f, 1.18f)
                                     val nextScale = (scale * zoom).coerceIn(1f, 8f)
                                     val effectiveZoom = if (scale <= 0f) 1f else nextScale / scale
                                     scale = nextScale
-                                    val halfWidth = videoSize.width / 2f
-                                    fun localEyePosition(position: Offset): Offset {
-                                        return if (sbsMode && halfWidth > 0f) {
-                                            Offset(if (position.x >= halfWidth) position.x - halfWidth else position.x, position.y)
-                                        } else {
-                                            position
-                                        }
-                                    }
-                                    val localWidth = if (sbsMode && halfWidth > 0f) halfWidth else videoSize.width.toFloat()
+                                    val localWidth = if (useSbsLocalGesture) halfWidth else videoSize.width.toFloat()
                                     val containerCenter = Offset(localWidth / 2f, videoSize.height / 2f)
                                     offset = if (nextScale == 1f || videoSize == IntSize.Zero) {
                                         Offset.Zero
                                     } else {
-                                        val previousFromCenter = localEyePosition(previousCentroid) - containerCenter
-                                        val currentFromCenter = localEyePosition(centroid) - containerCenter
+                                        val previousFromCenter = previousCentroid - containerCenter
+                                        val currentFromCenter = centroid - containerCenter
                                         currentFromCenter - (previousFromCenter - offset) * effectiveZoom
                                     }
                                     lastCentroid = centroid
