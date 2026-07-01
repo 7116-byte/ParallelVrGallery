@@ -16,7 +16,6 @@ import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
 import android.graphics.Color
 import android.graphics.ImageDecoder
-import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.media.MediaCodec
@@ -32,6 +31,7 @@ import android.opengl.EGLConfig
 import android.opengl.EGLContext
 import android.opengl.EGLDisplay
 import android.opengl.EGLExt
+import android.opengl.GLES11Ext
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.opengl.GLUtils
@@ -45,10 +45,10 @@ import android.provider.MediaStore
 import android.util.Size
 import android.view.MotionEvent
 import android.view.Surface
-import android.view.TextureView
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.VideoView
+import android.opengl.GLSurfaceView
 import androidx.activity.result.IntentSenderRequest
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
@@ -7359,178 +7359,294 @@ private fun List<PointerInputChange>.previousSpan(center: Offset): Float {
     return map { (it.previousPosition - center).getDistance() }.average().toFloat()
 }
 
-private fun PointerInputChange.sbsLocalPosition(halfWidth: Float): Offset {
-    return Offset(if (position.x >= halfWidth) position.x - halfWidth else position.x, position.y)
+private fun PointerInputChange.stableSbsLocalPosition(halfWidth: Float, sideByPointer: MutableMap<Long, Boolean>): Offset {
+    val rightEye = sideByPointer.getOrPut(id.value) { position.x >= halfWidth }
+    return Offset(if (rightEye) position.x - halfWidth else position.x, position.y)
 }
 
-private fun PointerInputChange.previousSbsLocalPosition(halfWidth: Float): Offset {
-    return Offset(if (previousPosition.x >= halfWidth) previousPosition.x - halfWidth else previousPosition.x, previousPosition.y)
+private fun PointerInputChange.previousStableSbsLocalPosition(halfWidth: Float, sideByPointer: MutableMap<Long, Boolean>): Offset {
+    val rightEye = sideByPointer.getOrPut(id.value) { previousPosition.x >= halfWidth }
+    return Offset(if (rightEye) previousPosition.x - halfWidth else previousPosition.x, previousPosition.y)
 }
 
-private fun List<PointerInputChange>.sbsLocalCentroid(halfWidth: Float): Offset {
+private fun List<PointerInputChange>.stableSbsLocalCentroid(halfWidth: Float, sideByPointer: MutableMap<Long, Boolean>): Offset {
     if (isEmpty()) return Offset.Zero
-    val x = sumOf { it.sbsLocalPosition(halfWidth).x.toDouble() }.toFloat() / size
-    val y = sumOf { it.sbsLocalPosition(halfWidth).y.toDouble() }.toFloat() / size
+    val x = sumOf { it.stableSbsLocalPosition(halfWidth, sideByPointer).x.toDouble() }.toFloat() / size
+    val y = sumOf { it.stableSbsLocalPosition(halfWidth, sideByPointer).y.toDouble() }.toFloat() / size
     return Offset(x, y)
 }
 
-private fun List<PointerInputChange>.previousSbsLocalCentroid(halfWidth: Float): Offset {
+private fun List<PointerInputChange>.previousStableSbsLocalCentroid(halfWidth: Float, sideByPointer: MutableMap<Long, Boolean>): Offset {
     if (isEmpty()) return Offset.Zero
-    val x = sumOf { it.previousSbsLocalPosition(halfWidth).x.toDouble() }.toFloat() / size
-    val y = sumOf { it.previousSbsLocalPosition(halfWidth).y.toDouble() }.toFloat() / size
+    val x = sumOf { it.previousStableSbsLocalPosition(halfWidth, sideByPointer).x.toDouble() }.toFloat() / size
+    val y = sumOf { it.previousStableSbsLocalPosition(halfWidth, sideByPointer).y.toDouble() }.toFloat() / size
     return Offset(x, y)
 }
 
-private fun List<PointerInputChange>.sbsLocalSpan(center: Offset, halfWidth: Float): Float {
+private fun List<PointerInputChange>.stableSbsLocalSpan(center: Offset, halfWidth: Float, sideByPointer: MutableMap<Long, Boolean>): Float {
     if (isEmpty()) return 1f
-    return map { (it.sbsLocalPosition(halfWidth) - center).getDistance() }.average().toFloat()
+    return map { (it.stableSbsLocalPosition(halfWidth, sideByPointer) - center).getDistance() }.average().toFloat()
 }
 
-private fun List<PointerInputChange>.previousSbsLocalSpan(center: Offset, halfWidth: Float): Float {
+private fun List<PointerInputChange>.previousStableSbsLocalSpan(center: Offset, halfWidth: Float, sideByPointer: MutableMap<Long, Boolean>): Float {
     if (isEmpty()) return 1f
-    return map { (it.previousSbsLocalPosition(halfWidth) - center).getDistance() }.average().toFloat()
+    return map { (it.previousStableSbsLocalPosition(halfWidth, sideByPointer) - center).getDistance() }.average().toFloat()
 }
 
-private enum class VideoCropMode {
-    FULL,
-    SBS_LEFT,
-    SBS_RIGHT,
-}
+private class SbsVideoGlPlayerView(context: Context) :
+    GLSurfaceView(context),
+    GLSurfaceView.Renderer,
+    SurfaceTexture.OnFrameAvailableListener {
 
-private fun fittedRect(viewWidth: Float, viewHeight: Float, sourceAspect: Float): android.graphics.RectF {
-    val viewAspect = if (viewHeight > 0f) viewWidth / viewHeight else sourceAspect
-    return if (viewAspect > sourceAspect) {
-        val contentWidth = viewHeight * sourceAspect
-        val left = (viewWidth - contentWidth) / 2f
-        android.graphics.RectF(left, 0f, left + contentWidth, viewHeight)
-    } else {
-        val contentHeight = viewWidth / sourceAspect
-        val top = (viewHeight - contentHeight) / 2f
-        android.graphics.RectF(0f, top, viewWidth, top + contentHeight)
-    }
-}
+    private var textureId = 0
+    private var surfaceTexture: SurfaceTexture? = null
+    private var surface: Surface? = null
+    private var program = 0
+    private var positionHandle = 0
+    private var texCoordHandle = 0
+    private var textureHandle = 0
+    private var texMatrixHandle = 0
+    private val textureMatrix = FloatArray(16)
+    private var frameAvailable = false
+    private var sourceUri: Uri? = null
+    private var sourceContext: Context? = null
+    private var active = false
+    private var playerCallback: ((MediaPlayer?) -> Unit)? = null
+    private var player: MediaPlayer? = null
+    private var videoWidth = 0
+    private var videoHeight = 0
+    private var zoomScale = 1f
+    private var zoomOffset = Offset.Zero
 
-private fun applyVideoTextureTransform(view: TextureView, videoSize: IntSize, cropMode: VideoCropMode) {
-    val viewWidth = view.width.toFloat()
-    val viewHeight = view.height.toFloat()
-    if (viewWidth <= 0f || viewHeight <= 0f || videoSize.width <= 0 || videoSize.height <= 0) return
-
-    val sourceRect = when (cropMode) {
-        VideoCropMode.FULL -> android.graphics.RectF(0f, 0f, viewWidth, viewHeight)
-        VideoCropMode.SBS_LEFT -> android.graphics.RectF(0f, 0f, viewWidth / 2f, viewHeight)
-        VideoCropMode.SBS_RIGHT -> android.graphics.RectF(viewWidth / 2f, 0f, viewWidth, viewHeight)
-    }
-    val sourceAspect = when (cropMode) {
-        VideoCropMode.FULL -> videoSize.width.toFloat() / videoSize.height.toFloat()
-        VideoCropMode.SBS_LEFT,
-        VideoCropMode.SBS_RIGHT -> (videoSize.width.toFloat() / 2f) / videoSize.height.toFloat()
-    }
-    val matrix = Matrix()
-    matrix.setRectToRect(sourceRect, fittedRect(viewWidth, viewHeight, sourceAspect), Matrix.ScaleToFit.FILL)
-    view.setTransform(matrix)
-}
-
-@Composable
-private fun TextureVideoView(
-    uri: Uri,
-    active: Boolean,
-    muted: Boolean,
-    cropMode: VideoCropMode,
-    modifier: Modifier = Modifier,
-    onPlayer: (MediaPlayer?) -> Unit,
-) {
-    val context = LocalContext.current
-    var textureView by remember(uri) { mutableStateOf<TextureView?>(null) }
-    var player by remember(uri) { mutableStateOf<MediaPlayer?>(null) }
-    var boundSurface by remember(uri) { mutableStateOf<Surface?>(null) }
-    var naturalSize by remember(uri) { mutableStateOf(IntSize.Zero) }
-    var prepared by remember(uri) { mutableStateOf(false) }
-
-    fun releaseCurrent() {
-        runCatching { player?.stop() }
-        runCatching { player?.release() }
-        runCatching { boundSurface?.release() }
-        player = null
-        boundSurface = null
-        prepared = false
-        onPlayer(null)
+    init {
+        setEGLContextClientVersion(2)
+        setRenderer(this)
+        renderMode = RENDERMODE_WHEN_DIRTY
     }
 
-    fun prepare(surfaceTexture: SurfaceTexture) {
-        releaseCurrent()
-        val surface = Surface(surfaceTexture)
-        boundSurface = surface
-        val nextPlayer = MediaPlayer()
-        player = nextPlayer
-        onPlayer(nextPlayer)
+    fun setSource(context: Context, uri: Uri, isActive: Boolean, onPlayer: (MediaPlayer?) -> Unit) {
+        sourceContext = context.applicationContext
+        playerCallback = onPlayer
+        active = isActive
+        if (sourceUri != uri) {
+            sourceUri = uri
+            queueEvent { preparePlayer() }
+        } else {
+            setActive(isActive)
+        }
+    }
+
+    fun setActive(isActive: Boolean) {
+        active = isActive
+        val current = player
+        if (current != null) {
+            if (isActive) runCatching { if (!current.isPlaying) current.start() } else runCatching { if (current.isPlaying) current.pause() }
+        }
+    }
+
+    fun setZoom(scale: Float, offset: Offset) {
+        zoomScale = scale
+        zoomOffset = offset
+        requestRender()
+    }
+
+    fun release() {
+        queueEvent { releasePlayer() }
+    }
+
+    override fun onSurfaceCreated(gl: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
+        program = createExternalTextureProgram()
+        positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
+        texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
+        textureHandle = GLES20.glGetUniformLocation(program, "uTexture")
+        texMatrixHandle = GLES20.glGetUniformLocation(program, "uTexMatrix")
+        textureId = createOesTexture()
+        surfaceTexture = SurfaceTexture(textureId).also {
+            it.setOnFrameAvailableListener(this)
+            surface = Surface(it)
+        }
+        preparePlayer()
+    }
+
+    override fun onSurfaceChanged(gl: javax.microedition.khronos.opengles.GL10?, width: Int, height: Int) {
+        requestRender()
+    }
+
+    override fun onDrawFrame(gl: javax.microedition.khronos.opengles.GL10?) {
+        val texture = surfaceTexture ?: return
+        synchronized(this) {
+            if (frameAvailable) {
+                texture.updateTexImage()
+                frameAvailable = false
+            }
+        }
+        texture.getTransformMatrix(textureMatrix)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        if (width <= 0 || height <= 0) return
+        GLES20.glUseProgram(program)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+        GLES20.glUniform1i(textureHandle, 0)
+        GLES20.glUniformMatrix4fv(texMatrixHandle, 1, false, textureMatrix, 0)
+        drawEye(left = true)
+        drawEye(left = false)
+    }
+
+    override fun onFrameAvailable(surfaceTexture: SurfaceTexture?) {
+        synchronized(this) { frameAvailable = true }
+        requestRender()
+    }
+
+    private fun preparePlayer() {
+        val uri = sourceUri ?: return
+        val ctx = sourceContext ?: return
+        val targetSurface = surface ?: return
+        releasePlayer(keepSurface = true)
+        val next = MediaPlayer()
+        player = next
+        playerCallback?.invoke(next)
         runCatching {
-            nextPlayer.setDataSource(context, uri)
-            nextPlayer.setSurface(surface)
-            nextPlayer.isLooping = true
-            if (muted) nextPlayer.setVolume(0f, 0f)
-            nextPlayer.setOnVideoSizeChangedListener { _, width, height ->
-                naturalSize = IntSize(width, height)
-                textureView?.let { applyVideoTextureTransform(it, IntSize(width, height), cropMode) }
+            next.setDataSource(ctx, uri)
+            next.setSurface(targetSurface)
+            next.isLooping = true
+            next.setOnVideoSizeChangedListener { _, w, h ->
+                videoWidth = w
+                videoHeight = h
+                requestRender()
             }
-            nextPlayer.setOnPreparedListener {
-                naturalSize = IntSize(it.videoWidth, it.videoHeight)
-                textureView?.let { view -> applyVideoTextureTransform(view, naturalSize, cropMode) }
-                prepared = true
+            next.setOnPreparedListener {
+                videoWidth = it.videoWidth
+                videoHeight = it.videoHeight
                 if (active) runCatching { it.start() } else runCatching { it.pause() }
+                requestRender()
             }
-            nextPlayer.setOnErrorListener { _, _, _ ->
-                releaseCurrent()
+            next.setOnErrorListener { _, _, _ ->
+                releasePlayer(keepSurface = true)
                 true
             }
-            nextPlayer.prepareAsync()
+            next.prepareAsync()
         }.onFailure {
-            surface.release()
-            releaseCurrent()
+            releasePlayer(keepSurface = true)
         }
     }
 
-    AndroidView(
-        factory = {
-            TextureView(context).apply {
-                surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                    override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-                        prepare(surface)
-                    }
+    private fun releasePlayer(keepSurface: Boolean = false) {
+        runCatching { player?.stop() }
+        runCatching { player?.release() }
+        player = null
+        playerCallback?.invoke(null)
+        if (!keepSurface) {
+            runCatching { surface?.release() }
+            runCatching { surfaceTexture?.release() }
+            surface = null
+            surfaceTexture = null
+        }
+    }
 
-                    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
-                        textureView?.let { applyVideoTextureTransform(it, naturalSize, cropMode) }
-                    }
+    private fun drawEye(left: Boolean) {
+        val halfWidth = (width / 2).coerceAtLeast(1)
+        val viewportX = if (left) 0 else halfWidth
+        GLES20.glViewport(viewportX, 0, halfWidth, height)
 
-                    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-                        releaseCurrent()
-                        return true
-                    }
+        val eyeAspect = if (videoWidth > 0 && videoHeight > 0) (videoWidth.toFloat() / 2f) / videoHeight.toFloat() else halfWidth.toFloat() / height.toFloat()
+        val viewportAspect = halfWidth.toFloat() / height.toFloat()
+        val fitX: Float
+        val fitY: Float
+        if (viewportAspect > eyeAspect) {
+            fitX = (eyeAspect / viewportAspect).coerceIn(0f, 1f)
+            fitY = 1f
+        } else {
+            fitX = 1f
+            fitY = (viewportAspect / eyeAspect).coerceIn(0f, 1f)
+        }
+        val dx = (zoomOffset.x / halfWidth.toFloat()) * 2f
+        val dy = -(zoomOffset.y / height.toFloat()) * 2f
+        val l = -fitX * zoomScale + dx
+        val r = fitX * zoomScale + dx
+        val b = -fitY * zoomScale + dy
+        val t = fitY * zoomScale + dy
+        val s0 = if (left) 0f else 0.5f
+        val s1 = if (left) 0.5f else 1f
+        drawTexturedQuad(
+            floatArrayOf(l, b, r, b, l, t, r, t),
+            floatArrayOf(s0, 1f, s1, 1f, s0, 0f, s1, 0f),
+        )
+    }
 
-                    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
-                }
-                textureView = this
-            }
-        },
-        update = { view ->
-            textureView = view
-            if (view.isAvailable && player == null) {
-                view.surfaceTexture?.let { prepare(it) }
-            } else {
-                applyVideoTextureTransform(view, naturalSize, cropMode)
-            }
-        },
-        modifier = modifier,
+    private fun drawTexturedQuad(vertices: FloatArray, texCoords: FloatArray) {
+        val vertexBuffer = floatBuffer(vertices)
+        val texBuffer = floatBuffer(texCoords)
+        GLES20.glEnableVertexAttribArray(positionHandle)
+        GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer)
+        GLES20.glEnableVertexAttribArray(texCoordHandle)
+        GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 0, texBuffer)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(positionHandle)
+        GLES20.glDisableVertexAttribArray(texCoordHandle)
+    }
+}
+
+private fun floatBuffer(values: FloatArray): FloatBuffer {
+    return ByteBuffer.allocateDirect(values.size * 4)
+        .order(ByteOrder.nativeOrder())
+        .asFloatBuffer()
+        .apply {
+            put(values)
+            position(0)
+        }
+}
+
+private fun createOesTexture(): Int {
+    val ids = IntArray(1)
+    GLES20.glGenTextures(1, ids, 0)
+    GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, ids[0])
+    GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+    GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+    GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+    GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+    return ids[0]
+}
+
+private fun createExternalTextureProgram(): Int {
+    val vertexShader = compileShader(
+        GLES20.GL_VERTEX_SHADER,
+        """
+        attribute vec4 aPosition;
+        attribute vec4 aTexCoord;
+        uniform mat4 uTexMatrix;
+        varying vec2 vTexCoord;
+        void main() {
+            gl_Position = aPosition;
+            vTexCoord = (uTexMatrix * aTexCoord).xy;
+        }
+        """.trimIndent(),
     )
-
-    LaunchedEffect(active, prepared, player) {
-        val current = player ?: return@LaunchedEffect
-        if (prepared) {
-            if (active) runCatching { if (!current.isPlaying) current.start() } else runCatching { if (current.isPlaying) current.pause() }
+    val fragmentShader = compileShader(
+        GLES20.GL_FRAGMENT_SHADER,
+        """
+        #extension GL_OES_EGL_image_external : require
+        precision mediump float;
+        uniform samplerExternalOES uTexture;
+        varying vec2 vTexCoord;
+        void main() {
+            gl_FragColor = texture2D(uTexture, vTexCoord);
         }
+        """.trimIndent(),
+    )
+    return GLES20.glCreateProgram().also { program ->
+        GLES20.glAttachShader(program, vertexShader)
+        GLES20.glAttachShader(program, fragmentShader)
+        GLES20.glLinkProgram(program)
+        GLES20.glDeleteShader(vertexShader)
+        GLES20.glDeleteShader(fragmentShader)
     }
+}
 
-    DisposableEffect(uri) {
-        onDispose { releaseCurrent() }
+private fun compileShader(type: Int, source: String): Int {
+    return GLES20.glCreateShader(type).also { shader ->
+        GLES20.glShaderSource(shader, source)
+        GLES20.glCompileShader(shader)
     }
 }
 
@@ -7616,7 +7732,6 @@ private fun VideoPlayer(
     val delayHost = LocalView.current
     var normalVideoView by remember { mutableStateOf<VideoView?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
-    var secondaryMediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var videoSize by remember { mutableStateOf(IntSize.Zero) }
     var lastTapAt by remember { mutableStateOf(0L) }
     var longPressRunnable by remember { mutableStateOf<Runnable?>(null) }
@@ -7627,33 +7742,14 @@ private fun VideoPlayer(
     var isPlaying by remember(uri) { mutableStateOf(false) }
     var scale by remember(uri) { mutableStateOf(1f) }
     var offset by remember(uri) { mutableStateOf(Offset.Zero) }
-    val animatedScale by animateFloatAsState(targetValue = scale, label = "videoScale")
-    val animatedOffsetX by animateFloatAsState(targetValue = offset.x, label = "videoOffsetX")
-    val animatedOffsetY by animateFloatAsState(targetValue = offset.y, label = "videoOffsetY")
-    val zoomLayer = Modifier.graphicsLayer {
-        scaleX = animatedScale
-        scaleY = animatedScale
-        translationX = animatedOffsetX
-        translationY = animatedOffsetY
-    }
-
-    LaunchedEffect(uri, mediaPlayer, secondaryMediaPlayer, sbsMode, active) {
+    LaunchedEffect(uri, mediaPlayer, sbsMode, active) {
         while (true) {
             val player = mediaPlayer
-            val secondary = secondaryMediaPlayer
             val duration = runCatching { player?.duration?.takeIf { it > 0 } ?: 0 }.getOrDefault(0)
             val position = runCatching { player?.currentPosition ?: 0 }.getOrDefault(0)
             isPlaying = runCatching { player?.isPlaying == true }.getOrDefault(false)
             progress = if (duration > 0) (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else 0f
             positionText = "${formatDuration(position)} / ${formatDuration(duration)}"
-            if (sbsMode && secondary != null && active && duration > 0) {
-                val delta = runCatching { abs(secondary.currentPosition - position) }.getOrDefault(0)
-                if (delta > 160) runCatching { secondary.seekTo(position) }
-                val primaryPlaying = runCatching { player?.isPlaying == true }.getOrDefault(false)
-                val secondaryPlaying = runCatching { secondary.isPlaying }.getOrDefault(false)
-                if (primaryPlaying && !secondaryPlaying) runCatching { secondary.start() }
-                if (!primaryPlaying && secondaryPlaying) runCatching { secondary.pause() }
-            }
             delay(350)
         }
     }
@@ -7676,32 +7772,20 @@ private fun VideoPlayer(
             .onSizeChanged { videoSize = it },
     ) {
         if (sbsMode) {
-            Row(Modifier.fillMaxSize()) {
-                Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.CenterStart) {
-                    TextureVideoView(
-                        uri = uri,
-                        active = active,
-                        muted = false,
-                        cropMode = VideoCropMode.SBS_LEFT,
-                        onPlayer = { mediaPlayer = it },
-                        modifier = Modifier.fillMaxSize().then(zoomLayer),
-                    )
-                }
-                Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.CenterEnd) {
-                    TextureVideoView(
-                        uri = uri,
-                        active = active,
-                        muted = true,
-                        cropMode = VideoCropMode.SBS_RIGHT,
-                        onPlayer = { player ->
-                            secondaryMediaPlayer = player
-                            val primaryPosition = runCatching { mediaPlayer?.currentPosition ?: 0 }.getOrDefault(0)
-                            if (player != null && primaryPosition > 0) runCatching { player.seekTo(primaryPosition) }
-                        },
-                        modifier = Modifier.fillMaxSize().then(zoomLayer),
-                    )
-                }
-            }
+            AndroidView(
+                factory = { context ->
+                    SbsVideoGlPlayerView(context).apply {
+                        setSource(context, uri, active) { mediaPlayer = it }
+                        setZoom(scale, offset)
+                    }
+                },
+                update = { view ->
+                    view.setSource(view.context, uri, active) { mediaPlayer = it }
+                    view.setActive(active)
+                    view.setZoom(scale, offset)
+                },
+                modifier = Modifier.fillMaxSize(),
+            )
             Box(Modifier.align(Alignment.Center).width(1.dp).fillMaxSize().background(androidx.compose.ui.graphics.Color(0x66ffffff)))
         } else {
             AndroidView(
@@ -7755,7 +7839,6 @@ private fun VideoPlayer(
                                 hint = "2 倍速"
                                 runCatching {
                                     if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(2f) }
-                                    if (Build.VERSION.SDK_INT >= 23) secondaryMediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(2f) }
                                 }
                             }
                             longPressRunnable = runnable
@@ -7764,6 +7847,7 @@ private fun VideoPlayer(
                             var multiTouch = false
                             val start = down.position
                             var lastCentroid: Offset? = null
+                            val sbsPointerSides = mutableMapOf<Long, Boolean>()
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val pressed = event.changes.filter { it.pressed }
@@ -7775,15 +7859,15 @@ private fun VideoPlayer(
                                     longPressRunnable = null
                                     val halfWidth = videoSize.width / 2f
                                     val useSbsLocalGesture = sbsMode && halfWidth > 0f
-                                    val centroid = if (useSbsLocalGesture) pressed.sbsLocalCentroid(halfWidth) else pressed.centroid()
-                                    val previousCentroid = lastCentroid ?: if (useSbsLocalGesture) pressed.previousSbsLocalCentroid(halfWidth) else pressed.previousCentroid()
+                                    val centroid = if (useSbsLocalGesture) pressed.stableSbsLocalCentroid(halfWidth, sbsPointerSides) else pressed.centroid()
+                                    val previousCentroid = lastCentroid ?: if (useSbsLocalGesture) pressed.previousStableSbsLocalCentroid(halfWidth, sbsPointerSides) else pressed.previousCentroid()
                                     val previousSpan = if (useSbsLocalGesture) {
-                                        pressed.previousSbsLocalSpan(previousCentroid, halfWidth)
+                                        pressed.previousStableSbsLocalSpan(previousCentroid, halfWidth, sbsPointerSides)
                                     } else {
                                         pressed.previousSpan(previousCentroid)
                                     }.coerceAtLeast(1f)
                                     val currentSpan = if (useSbsLocalGesture) {
-                                        pressed.sbsLocalSpan(centroid, halfWidth)
+                                        pressed.stableSbsLocalSpan(centroid, halfWidth, sbsPointerSides)
                                     } else {
                                         pressed.span(centroid)
                                     }
@@ -7813,7 +7897,6 @@ private fun VideoPlayer(
                             if (longPressActive) {
                                 runCatching {
                                     if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(1f) }
-                                    if (Build.VERSION.SDK_INT >= 23) secondaryMediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(1f) }
                                 }
                                 hint = "恢复正常速度"
                                 longPressActive = false
@@ -7831,7 +7914,6 @@ private fun VideoPlayer(
                                         } else {
                                             player?.seekTo(target)
                                         }
-                                        secondaryMediaPlayer?.seekTo(target)
                                     }
                                     progress = if (duration > 0) (target.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else progress
                                     positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
@@ -7872,11 +7954,9 @@ private fun VideoPlayer(
                             val playing = runCatching { player?.isPlaying == true }.getOrDefault(false)
                             if (playing) {
                                 runCatching { player?.pause() }
-                                runCatching { secondaryMediaPlayer?.pause() }
                                 isPlaying = false
                             } else {
                                 runCatching { player?.start() }
-                                runCatching { secondaryMediaPlayer?.start() }
                                 isPlaying = true
                             }
                         },
@@ -7908,7 +7988,6 @@ private fun VideoPlayer(
                                 } else {
                                     player?.seekTo(target)
                                 }
-                                secondaryMediaPlayer?.seekTo(target)
                             }
                             positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
                         }
