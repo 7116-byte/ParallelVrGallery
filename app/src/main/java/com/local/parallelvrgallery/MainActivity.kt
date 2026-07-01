@@ -6891,25 +6891,21 @@ private fun ViewerScreen(
     }
     val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
-    val viewerFlingBehavior = if (generatedViewer) {
-        PagerDefaults.flingBehavior(state = pagerState)
-    } else {
-        PagerDefaults.flingBehavior(state = pagerState, snapPositionalThreshold = 0.24f)
-    }
+    val viewerFlingBehavior = PagerDefaults.flingBehavior(state = pagerState)
     val viewerBitmapCache = remember { mutableStateMapOf<String, Bitmap>() }
     val viewerCacheSignature = remember(viewerItems) { viewerItems.joinToString("|") { it.second.cacheKey } }
     LaunchedEffect(viewerCacheSignature) {
         viewerBitmapCache.clear()
     }
-    LaunchedEffect(viewerCacheSignature, pagerState.currentPage, state.vrMode, generatedViewer, state.entries, generatedEntryByKey) {
+    LaunchedEffect(viewerCacheSignature, pagerState.settledPage, state.vrMode, generatedViewer, state.entries, generatedEntryByKey) {
         val preloadPages = listOf(
-            pagerState.currentPage,
-            pagerState.currentPage + 1,
-            pagerState.currentPage - 1,
-            pagerState.currentPage + 2,
-            pagerState.currentPage - 2,
-            pagerState.currentPage + 3,
-            pagerState.currentPage - 3,
+            pagerState.settledPage,
+            pagerState.settledPage + 1,
+            pagerState.settledPage - 1,
+            pagerState.settledPage + 2,
+            pagerState.settledPage - 2,
+            pagerState.settledPage + 3,
+            pagerState.settledPage - 3,
         )
         val nearbyTargets = preloadPages
             .mapNotNull { page -> viewerItems.getOrNull(page)?.second }
@@ -6938,8 +6934,8 @@ private fun ViewerScreen(
             }
         }
     }
-    LaunchedEffect(pagerState.currentPage) {
-        viewerItems.getOrNull(pagerState.currentPage)?.first?.let(onIndexChanged)
+    LaunchedEffect(pagerState.settledPage) {
+        viewerItems.getOrNull(pagerState.settledPage)?.first?.let(onIndexChanged)
     }
     var controlsVisible by remember { mutableStateOf(true) }
     LaunchedEffect(controlsVisible, state.vrMode, pagerState.currentPage) {
