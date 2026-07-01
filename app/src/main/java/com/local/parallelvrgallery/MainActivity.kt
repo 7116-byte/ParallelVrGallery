@@ -101,6 +101,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -117,6 +118,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -6836,6 +6838,7 @@ private fun ViewerScreen(
     val lang = state.settings.language
     val generatedViewer = state.viewerOrigin != ViewerOrigin.NORMAL
     val view = LocalView.current
+    val context = view.context
     DisposableEffect(Unit) {
         val window = (view.context as? ComponentActivity)?.window
         if (Build.VERSION.SDK_INT >= 30) {
@@ -6883,6 +6886,35 @@ private fun ViewerScreen(
     }
     val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
+    val viewerBitmapCache = remember { mutableStateMapOf<String, Bitmap>() }
+    val viewerCacheSignature = remember(viewerItems) { viewerItems.joinToString("|") { it.second.cacheKey } }
+    LaunchedEffect(viewerCacheSignature) {
+        viewerBitmapCache.clear()
+    }
+    LaunchedEffect(viewerCacheSignature, pagerState.currentPage, state.vrMode, generatedViewer, state.entries, generatedEntryByKey) {
+        val nearbyUris = ((pagerState.currentPage - 2)..(pagerState.currentPage + 2))
+            .mapNotNull { page -> viewerItems.getOrNull(page)?.second }
+            .filter { item -> item.kind == MediaKind.IMAGE }
+            .map { item ->
+                val entry = generatedEntryByKey[item.cacheKey] ?: state.entries[item.cacheKey]
+                if ((state.vrMode || generatedViewer) && entry != null) Uri.fromFile(File(entry.outputPath)) else item.uri
+            }
+            .distinct()
+        nearbyUris.forEach { uri ->
+            val key = bitmapCacheKey(uri, 4096)
+            if (viewerBitmapCache[key] == null) {
+                val bitmap = withContext(Dispatchers.IO) {
+                    runCatching { decodeScaledBitmap(context, uri, 4096) }.getOrNull()
+                }
+                if (bitmap != null) {
+                    viewerBitmapCache[key] = bitmap
+                    while (viewerBitmapCache.size > 10) {
+                        viewerBitmapCache.keys.firstOrNull()?.let { viewerBitmapCache.remove(it) } ?: break
+                    }
+                }
+            }
+        }
+    }
     LaunchedEffect(pagerState.currentPage) {
         viewerItems.getOrNull(pagerState.currentPage)?.first?.let(onIndexChanged)
     }
@@ -6917,7 +6949,8 @@ private fun ViewerScreen(
                         active = activePage,
                         sbsMode = generated != null,
                         controlsVisible = controlsVisible,
-                        statusText = "状态：${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}  当前帧${job?.currentFrameMs ?: 0}ms  平均帧${job?.avgFrameMs ?: 0}ms",
+                        stateLine = "${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}",
+                        metricsLine = "当前帧${job?.currentFrameMs ?: 0}ms · 平均帧${job?.avgFrameMs ?: 0}ms",
                         onSingleTap = { controlsVisible = !controlsVisible },
                     )
                 }
@@ -6930,7 +6963,7 @@ private fun ViewerScreen(
                 val entry = generatedEntryByKey[photo.cacheKey] ?: state.entries[photo.cacheKey]
                 val vrState = state.states[photo.cacheKey] ?: VrState.NORMAL
                 if ((state.vrMode || generatedViewer) && entry != null) {
-                    SyncSbsZoomImage(Uri.fromFile(File(entry.outputPath)), Modifier.fillMaxSize()) {
+                    SyncSbsZoomImage(Uri.fromFile(File(entry.outputPath)), viewerBitmapCache, Modifier.fillMaxSize()) {
                         controlsVisible = !controlsVisible
                     }
                 } else {
@@ -6938,6 +6971,7 @@ private fun ViewerScreen(
                         photo.uri,
                         4096,
                         ContentScale.Fit,
+                        viewerBitmapCache,
                         Modifier
                             .fillMaxSize()
                             .pointerInput(photo.uri) {
@@ -7256,19 +7290,34 @@ private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modif
                 Text(lang.t("暂无", "None"), color = androidx.compose.ui.graphics.Color.White)
             }
         } else {
-            AsyncBitmapImage(uri, 2048, ContentScale.Fit, Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black))
+            AsyncBitmapImage(
+                uri,
+                2048,
+                ContentScale.Fit,
+                modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black),
+            )
         }
     }
 }
 
 @Composable
-private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onTap: () -> Unit) {
+private fun SyncSbsZoomImage(
+    uri: Uri,
+    bitmapCache: MutableMap<String, Bitmap>,
+    modifier: Modifier = Modifier,
+    onTap: () -> Unit,
+) {
     val context = LocalContext.current
-    var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
+    val cacheKey = bitmapCacheKey(uri, 4096)
+    var bitmap by remember(uri) { mutableStateOf(bitmapCache[cacheKey]) }
     var scale by remember(uri) { mutableStateOf(1f) }
     var offset by remember(uri) { mutableStateOf(Offset.Zero) }
+    var viewportSize by remember(uri) { mutableStateOf(IntSize.Zero) }
+    var lastTapAt by remember(uri) { mutableStateOf(0L) }
     LaunchedEffect(uri) {
-        bitmap = withContext(Dispatchers.IO) { runCatching { decodeScaledBitmap(context, uri, 4096) }.getOrNull() }
+        bitmap = bitmapCache[cacheKey] ?: withContext(Dispatchers.IO) {
+            runCatching { decodeScaledBitmap(context, uri, 4096) }.getOrNull()
+        }?.also { bitmapCache[cacheKey] = it }
         scale = 1f
         offset = Offset.Zero
     }
@@ -7283,54 +7332,93 @@ private fun SyncSbsZoomImage(uri: Uri, modifier: Modifier = Modifier, onTap: () 
     val halfWidth = (source.width / 2).coerceAtLeast(1)
     val left = remember(source) { Bitmap.createBitmap(source, 0, 0, halfWidth, source.height).asImageBitmap() }
     val right = remember(source) { Bitmap.createBitmap(source, halfWidth, 0, source.width - halfWidth, source.height).asImageBitmap() }
-    val animatedScale by animateFloatAsState(targetValue = scale, label = "sbsScale")
-    val animatedOffsetX by animateFloatAsState(targetValue = offset.x, label = "sbsOffsetX")
-    val animatedOffsetY by animateFloatAsState(targetValue = offset.y, label = "sbsOffsetY")
     val imageModifier = Modifier
         .fillMaxSize()
         .graphicsLayer {
-            scaleX = animatedScale
-            scaleY = animatedScale
-            translationX = animatedOffsetX
-            translationY = animatedOffsetY
+            scaleX = scale
+            scaleY = scale
+            translationX = offset.x
+            translationY = offset.y
         }
 
     Box(
         modifier = modifier
             .background(androidx.compose.ui.graphics.Color.Black)
+            .onSizeChanged { viewportSize = it }
             .pointerInput(uri) {
                 awaitPointerEventScope {
                     while (true) {
-                        val firstEvent = awaitPointerEvent()
+                        val firstEvent = awaitPointerEvent(PointerEventPass.Initial)
                         if (firstEvent.changes.none { it.pressed }) continue
                         var multiTouch = false
                         var moved = false
                         var firstPosition: Offset? = null
-                        var lastCentroid: Offset? = null
+                        var zoomAnchor: Offset? = null
+                        val sbsPointerSides = mutableMapOf<Long, Boolean>()
                         while (true) {
-                            val event = awaitPointerEvent()
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
                             val pressed = event.changes.filter { it.pressed }
                             if (firstPosition == null) firstPosition = pressed.firstOrNull()?.position
                             if (pressed.isEmpty()) {
-                                if (!multiTouch && !moved) onTap()
+                                if (!multiTouch && !moved) {
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastTapAt < 280L) {
+                                        scale = 1f
+                                        offset = Offset.Zero
+                                        lastTapAt = 0L
+                                    } else {
+                                        lastTapAt = now
+                                        onTap()
+                                    }
+                                }
                                 break
                             }
                             if (pressed.size >= 2) {
                                 multiTouch = true
-                                val centroid = pressed.centroid()
-                                val previousCentroid = lastCentroid ?: pressed.previousCentroid()
-                                val previousSpan = pressed.previousSpan(previousCentroid).coerceAtLeast(1f)
-                                val zoom = (pressed.span(centroid) / previousSpan).coerceIn(0.85f, 1.18f)
-                                val pan = lastCentroid?.let { centroid - it } ?: Offset.Zero
+                                val halfViewportWidth = viewportSize.width / 2f
+                                val useSbsLocalGesture = halfViewportWidth > 0f
+                                val centroid = if (useSbsLocalGesture) pressed.stableSbsLocalCentroid(halfViewportWidth, sbsPointerSides) else pressed.centroid()
+                                val previousCentroid = if (useSbsLocalGesture) {
+                                    pressed.previousStableSbsLocalCentroid(halfViewportWidth, sbsPointerSides)
+                                } else {
+                                    pressed.previousCentroid()
+                                }
+                                val anchor = zoomAnchor ?: centroid.also { zoomAnchor = it }
+                                val previousSpan = if (useSbsLocalGesture) {
+                                    pressed.previousStableSbsLocalSpan(previousCentroid, halfViewportWidth, sbsPointerSides)
+                                } else {
+                                    pressed.previousSpan(previousCentroid)
+                                }.coerceAtLeast(1f)
+                                val currentSpan = if (useSbsLocalGesture) {
+                                    pressed.stableSbsLocalSpan(centroid, halfViewportWidth, sbsPointerSides)
+                                } else {
+                                    pressed.span(centroid)
+                                }
+                                val zoom = (currentSpan / previousSpan).coerceIn(0.85f, 1.18f)
                                 val nextScale = (scale * zoom).coerceIn(1f, 8f)
+                                val effectiveZoom = if (scale <= 0f) 1f else nextScale / scale
+                                val localWidth = if (useSbsLocalGesture) halfViewportWidth else viewportSize.width.toFloat()
+                                val containerCenter = Offset(localWidth / 2f, viewportSize.height / 2f)
                                 scale = nextScale
-                                offset = if (nextScale == 1f) Offset.Zero else offset + pan
-                                lastCentroid = centroid
+                                offset = if (nextScale == 1f || viewportSize == IntSize.Zero) {
+                                    Offset.Zero
+                                } else {
+                                    val anchorFromCenter = anchor - containerCenter
+                                    anchorFromCenter - (anchorFromCenter - offset) * effectiveZoom
+                                }
                                 event.changes.forEach { it.consume() }
                             } else {
-                                val start = firstPosition
-                                val current = pressed.first().position
-                                if (start != null && (current - start).getDistance() > 18f) moved = true
+                                zoomAnchor = null
+                                val change = pressed.first()
+                                if (scale > 1f) {
+                                    offset += change.position - change.previousPosition
+                                    moved = true
+                                    change.consume()
+                                } else {
+                                    val start = firstPosition
+                                    val current = change.position
+                                    if (start != null && (current - start).getDistance() > 18f) moved = true
+                                }
                             }
                         }
                     }
@@ -7651,12 +7739,23 @@ private fun WindowSelector(value: Int, onChange: (Int) -> Unit) {
     }
 }
 
+private fun bitmapCacheKey(uri: Uri, maxSide: Int): String = "${uri}@$maxSide"
+
 @Composable
-private fun AsyncBitmapImage(uri: Uri, maxSide: Int, contentScale: ContentScale, modifier: Modifier = Modifier) {
+private fun AsyncBitmapImage(
+    uri: Uri,
+    maxSide: Int,
+    contentScale: ContentScale,
+    bitmapCache: MutableMap<String, Bitmap>? = null,
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current
-    var bitmap by remember(uri, maxSide) { mutableStateOf<Bitmap?>(null) }
+    val cacheKey = bitmapCacheKey(uri, maxSide)
+    var bitmap by remember(uri, maxSide) { mutableStateOf(bitmapCache?.get(cacheKey)) }
     LaunchedEffect(uri, maxSide) {
-        bitmap = withContext(Dispatchers.IO) { runCatching { decodeScaledBitmap(context, uri, maxSide) }.getOrNull() }
+        bitmap = bitmapCache?.get(cacheKey) ?: withContext(Dispatchers.IO) {
+            runCatching { decodeScaledBitmap(context, uri, maxSide) }.getOrNull()
+        }?.also { decoded -> bitmapCache?.put(cacheKey, decoded) }
     }
     if (bitmap == null) {
         Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
@@ -7711,11 +7810,11 @@ private fun VideoPlayer(
     active: Boolean,
     sbsMode: Boolean = false,
     controlsVisible: Boolean,
-    statusText: String,
+    stateLine: String,
+    metricsLine: String,
     onSingleTap: () -> Unit,
 ) {
     val activeState = rememberUpdatedState(active)
-    val delayHost = LocalView.current
     val context = LocalContext.current
     var normalVideoView by remember { mutableStateOf<VideoView?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
@@ -7723,12 +7822,11 @@ private fun VideoPlayer(
     var sbsGlView by remember(uri) { mutableStateOf<SbsVideoGlPlayerView?>(null) }
     var videoSize by remember { mutableStateOf(IntSize.Zero) }
     var lastTapAt by remember { mutableStateOf(0L) }
-    var longPressRunnable by remember { mutableStateOf<Runnable?>(null) }
-    var longPressActive by remember { mutableStateOf(false) }
     var progress by remember(uri) { mutableStateOf(0f) }
     var positionText by remember(uri) { mutableStateOf("00:00 / 00:00") }
     var hint by remember(uri) { mutableStateOf<String?>(null) }
     var isPlaying by remember(uri) { mutableStateOf(false) }
+    var playbackSpeed by remember(uri) { mutableStateOf(1f) }
     var sbsPrepared by remember(uri) { mutableStateOf(false) }
     var sbsRetryToken by remember(uri) { mutableStateOf(0) }
     var sbsActiveRetries by remember(uri) { mutableStateOf(0) }
@@ -7749,6 +7847,7 @@ private fun VideoPlayer(
     LaunchedEffect(uri, sbsMode) {
         scale = 1f
         offset = Offset.Zero
+        playbackSpeed = 1f
     }
 
     DisposableEffect(uri, sbsMode, sbsSurface, sbsRetryToken) {
@@ -7774,6 +7873,7 @@ private fun VideoPlayer(
                     sbsPrepared = true
                     sbsActiveRetries = 0
                     sbsGlView?.setVideoSize(it.videoWidth, it.videoHeight)
+                    if (Build.VERSION.SDK_INT >= 23) runCatching { it.playbackParams = it.playbackParams.setSpeed(playbackSpeed) }
                     if (activeState.value) runCatching { it.start() } else runCatching { it.pause() }
                 }
                 player.setOnErrorListener { _, _, _ ->
@@ -7875,6 +7975,7 @@ private fun VideoPlayer(
                         setOnPreparedListener { player ->
                             mediaPlayer = player
                             player.isLooping = true
+                            if (Build.VERSION.SDK_INT >= 23) runCatching { player.playbackParams = player.playbackParams.setSpeed(playbackSpeed) }
                             if (activeState.value) start() else pause()
                         }
                         normalVideoView = this
@@ -7914,36 +8015,28 @@ private fun VideoPlayer(
                 .pointerInput(uri) {
                     awaitPointerEventScope {
                         while (true) {
-                            val down = awaitPointerEvent().changes.firstOrNull { it.pressed } ?: continue
-                            val player = mediaPlayer
-                            longPressActive = false
-                            val runnable = Runnable {
-                                longPressActive = true
-                                hint = "2 倍速"
-                                runCatching {
-                                    if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(2f) }
-                                }
-                            }
-                            longPressRunnable = runnable
-                            delayHost.postDelayed(runnable, 450L)
+                            val down = awaitPointerEvent(PointerEventPass.Initial).changes.firstOrNull { it.pressed } ?: continue
                             var moved = false
                             var multiTouch = false
                             val start = down.position
-                            var lastCentroid: Offset? = null
+                            var zoomAnchor: Offset? = null
                             val sbsPointerSides = mutableMapOf<Long, Boolean>()
                             while (true) {
-                                val event = awaitPointerEvent()
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
                                 val pressed = event.changes.filter { it.pressed }
                                 if (pressed.isEmpty()) break
                                 if (pressed.size >= 2) {
                                     multiTouch = true
                                     moved = true
-                                    longPressRunnable?.let { delayHost.removeCallbacks(it) }
-                                    longPressRunnable = null
                                     val halfWidth = videoSize.width / 2f
                                     val useSbsLocalGesture = sbsMode && halfWidth > 0f
                                     val centroid = if (useSbsLocalGesture) pressed.stableSbsLocalCentroid(halfWidth, sbsPointerSides) else pressed.centroid()
-                                    val previousCentroid = lastCentroid ?: if (useSbsLocalGesture) pressed.previousStableSbsLocalCentroid(halfWidth, sbsPointerSides) else pressed.previousCentroid()
+                                    val previousCentroid = if (useSbsLocalGesture) {
+                                        pressed.previousStableSbsLocalCentroid(halfWidth, sbsPointerSides)
+                                    } else {
+                                        pressed.previousCentroid()
+                                    }
+                                    val anchor = zoomAnchor ?: centroid.also { zoomAnchor = it }
                                     val previousSpan = if (useSbsLocalGesture) {
                                         pressed.previousStableSbsLocalSpan(previousCentroid, halfWidth, sbsPointerSides)
                                     } else {
@@ -7963,44 +8056,28 @@ private fun VideoPlayer(
                                     offset = if (nextScale == 1f || videoSize == IntSize.Zero) {
                                         Offset.Zero
                                     } else {
-                                        val previousFromCenter = previousCentroid - containerCenter
-                                        val currentFromCenter = centroid - containerCenter
-                                        currentFromCenter - (previousFromCenter - offset) * effectiveZoom
+                                        val anchorFromCenter = anchor - containerCenter
+                                        anchorFromCenter - (anchorFromCenter - offset) * effectiveZoom
                                     }
-                                    lastCentroid = centroid
                                     event.changes.forEach { it.consume() }
                                 } else {
-                                    lastCentroid = null
-                                    if ((pressed.first().position - start).getDistance() > 18f) moved = true
+                                    zoomAnchor = null
+                                    val change = pressed.first()
+                                    if (scale > 1f) {
+                                        offset += change.position - change.previousPosition
+                                        moved = true
+                                        change.consume()
+                                    } else if ((change.position - start).getDistance() > 18f) {
+                                        moved = true
+                                    }
                                 }
                             }
-                            longPressRunnable?.let { delayHost.removeCallbacks(it) }
-                            longPressRunnable = null
                             if (multiTouch) continue
-                            if (longPressActive) {
-                                runCatching {
-                                    if (Build.VERSION.SDK_INT >= 23) mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(1f) }
-                                }
-                                hint = "恢复正常速度"
-                                longPressActive = false
-                                continue
-                            }
                             if (!moved) {
                                 val now = System.currentTimeMillis()
                                 if (now - lastTapAt < 280L) {
-                                    val duration = runCatching { player?.duration ?: 0 }.getOrDefault(0).coerceAtLeast(0)
-                                    val current = runCatching { player?.currentPosition ?: 0 }.getOrDefault(0).coerceAtLeast(0)
-                                    val target = (current + 5_000).let { if (duration > 0) it.coerceAtMost(duration) else it }
-                                    runCatching {
-                                        if (Build.VERSION.SDK_INT >= 26 && player != null) {
-                                            player.seekTo(target.toLong(), MediaPlayer.SEEK_CLOSEST)
-                                        } else {
-                                            player?.seekTo(target)
-                                        }
-                                    }
-                                    progress = if (duration > 0) (target.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else progress
-                                    positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
-                                    hint = "快进 5 秒"
+                                    scale = 1f
+                                    offset = Offset.Zero
                                     lastTapAt = 0L
                                 } else {
                                     lastTapAt = now
@@ -8028,10 +8105,10 @@ private fun VideoPlayer(
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .background(androidx.compose.ui.graphics.Color(0x99000000))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    IconButton(
                         onClick = {
                             val player = mediaPlayer
                             val playing = runCatching { player?.isPlaying == true }.getOrDefault(false)
@@ -8043,20 +8120,61 @@ private fun VideoPlayer(
                                 isPlaying = true
                             }
                         },
+                        modifier = Modifier.size(40.dp),
                     ) {
-                        Text(if (isPlaying) "暂停" else "播放")
+                        Text(if (isPlaying) "⏸" else "▶", color = androidx.compose.ui.graphics.Color.White, fontSize = 18.sp)
                     }
-                    Text(
-                        text = statusText,
-                        color = androidx.compose.ui.graphics.Color.White,
-                        style = MaterialTheme.typography.labelSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                    IconButton(
+                        onClick = {
+                            val player = mediaPlayer
+                            val duration = runCatching { player?.duration ?: 0 }.getOrDefault(0).coerceAtLeast(0)
+                            val current = runCatching { player?.currentPosition ?: 0 }.getOrDefault(0).coerceAtLeast(0)
+                            val target = (current + 5_000).let { if (duration > 0) it.coerceAtMost(duration) else it }
+                            runCatching {
+                                if (Build.VERSION.SDK_INT >= 26 && player != null) {
+                                    player.seekTo(target.toLong(), MediaPlayer.SEEK_CLOSEST)
+                                } else {
+                                    player?.seekTo(target)
+                                }
+                            }
+                            progress = if (duration > 0) (target.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else progress
+                            positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
+                        },
+                        modifier = Modifier.size(40.dp),
+                    ) {
+                        Text("⏩", color = androidx.compose.ui.graphics.Color.White, fontSize = 16.sp)
+                    }
+                    IconButton(
+                        onClick = {
+                            playbackSpeed = if (playbackSpeed >= 2f) 1f else 2f
+                            if (Build.VERSION.SDK_INT >= 23) {
+                                runCatching { mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(playbackSpeed) } }
+                            }
+                        },
+                        modifier = Modifier.size(40.dp),
+                    ) {
+                        Text(if (playbackSpeed >= 2f) "2x" else "1x", color = androidx.compose.ui.graphics.Color.White, fontSize = 13.sp)
+                    }
+                    Column(
                         modifier = Modifier.weight(1f),
-                    )
+                    ) {
+                        Text(
+                            text = stateLine,
+                            color = androidx.compose.ui.graphics.Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = metricsLine,
+                            color = androidx.compose.ui.graphics.Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                     Text(positionText, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelSmall)
                 }
-                Spacer(Modifier.height(6.dp))
                 Slider(
                     value = progress,
                     onValueChange = { value ->
