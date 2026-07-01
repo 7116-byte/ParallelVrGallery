@@ -92,6 +92,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerDefaults
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -120,6 +121,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -6882,6 +6884,10 @@ private fun ViewerScreen(
     }
     val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
+    val viewerFlingBehavior = PagerDefaults.flingBehavior(
+        state = pagerState,
+        snapPositionalThreshold = 0.18f,
+    )
     LaunchedEffect(pagerState.currentPage) {
         viewerItems.getOrNull(pagerState.currentPage)?.first?.let(onIndexChanged)
     }
@@ -6902,13 +6908,15 @@ private fun ViewerScreen(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
             beyondViewportPageCount = 2,
+            flingBehavior = viewerFlingBehavior,
         ) { page ->
             val (sourceIndex, photo) = viewerItems.getOrNull(page) ?: return@HorizontalPager
             if (photo.kind == MediaKind.VIDEO) {
                 val generated = state.videoEntries[photo.cacheKey]
                 val job = state.videoJobs.firstOrNull { it.item.cacheKey == photo.cacheKey }
                 val videoState = state.videoStates[photo.cacheKey] ?: VideoVrState.NORMAL
-                val activePage = page == pagerState.currentPage
+                val playbackPage = if (pagerState.isScrollInProgress) pagerState.targetPage else pagerState.currentPage
+                val activePage = page == playbackPage
                 val playerContent: @Composable () -> Unit = {
                     VideoPlayer(
                         uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
@@ -7713,6 +7721,7 @@ private fun VideoPlayer(
     statusText: String,
     onSingleTap: () -> Unit,
 ) {
+    val activeState = rememberUpdatedState(active)
     val delayHost = LocalView.current
     val context = LocalContext.current
     var normalVideoView by remember { mutableStateOf<VideoView?>(null) }
@@ -7727,6 +7736,7 @@ private fun VideoPlayer(
     var positionText by remember(uri) { mutableStateOf("00:00 / 00:00") }
     var hint by remember(uri) { mutableStateOf<String?>(null) }
     var isPlaying by remember(uri) { mutableStateOf(false) }
+    var sbsPrepared by remember(uri) { mutableStateOf(false) }
     var scale by remember(uri) { mutableStateOf(1f) }
     var offset by remember(uri) { mutableStateOf(Offset.Zero) }
     LaunchedEffect(uri, mediaPlayer, sbsMode, active) {
@@ -7752,6 +7762,7 @@ private fun VideoPlayer(
         } else {
             val player = MediaPlayer()
             mediaPlayer = player
+            sbsPrepared = false
             var released = false
             runCatching {
                 if (uri.scheme == "file") {
@@ -7765,14 +7776,16 @@ private fun VideoPlayer(
                     sbsGlView?.setVideoSize(width, height)
                 }
                 player.setOnPreparedListener {
+                    sbsPrepared = true
                     sbsGlView?.setVideoSize(it.videoWidth, it.videoHeight)
-                    if (active) runCatching { it.start() } else runCatching { it.pause() }
+                    if (activeState.value) runCatching { it.start() } else runCatching { it.pause() }
                 }
                 player.setOnErrorListener { _, _, _ ->
                     if (!released) {
                         released = true
                         runCatching { player.release() }
                         if (mediaPlayer === player) mediaPlayer = null
+                        sbsPrepared = false
                     }
                     true
                 }
@@ -7781,21 +7794,23 @@ private fun VideoPlayer(
                 released = true
                 runCatching { player.release() }
                 if (mediaPlayer === player) mediaPlayer = null
+                sbsPrepared = false
             }
             onDispose {
                 released = true
                 runCatching { player.stop() }
                 runCatching { player.release() }
                 if (mediaPlayer === player) mediaPlayer = null
+                sbsPrepared = false
             }
         }
     }
 
-    LaunchedEffect(active, mediaPlayer, sbsMode) {
+    LaunchedEffect(active, mediaPlayer, sbsMode, sbsPrepared) {
         if (sbsMode) {
             val player = mediaPlayer ?: return@LaunchedEffect
             sbsGlView?.setActive(active)
-            if (active) {
+            if (active && sbsPrepared) {
                 runCatching {
                     val position = player.currentPosition
                     player.seekTo(position)
@@ -7846,7 +7861,7 @@ private fun VideoPlayer(
                         setOnPreparedListener { player ->
                             mediaPlayer = player
                             player.isLooping = true
-                            if (active) start() else pause()
+                            if (activeState.value) start() else pause()
                         }
                         normalVideoView = this
                     }
