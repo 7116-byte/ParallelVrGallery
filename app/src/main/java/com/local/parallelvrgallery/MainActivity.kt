@@ -53,6 +53,7 @@ import androidx.activity.result.IntentSenderRequest
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -6886,7 +6887,8 @@ private fun ViewerScreen(
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
     val viewerFlingBehavior = PagerDefaults.flingBehavior(
         state = pagerState,
-        snapPositionalThreshold = 0.18f,
+        snapPositionalThreshold = 0.32f,
+        snapAnimationSpec = tween(durationMillis = 140),
     )
     LaunchedEffect(pagerState.currentPage) {
         viewerItems.getOrNull(pagerState.currentPage)?.first?.let(onIndexChanged)
@@ -6915,8 +6917,7 @@ private fun ViewerScreen(
                 val generated = state.videoEntries[photo.cacheKey]
                 val job = state.videoJobs.firstOrNull { it.item.cacheKey == photo.cacheKey }
                 val videoState = state.videoStates[photo.cacheKey] ?: VideoVrState.NORMAL
-                val playbackPage = if (pagerState.isScrollInProgress) pagerState.targetPage else pagerState.currentPage
-                val activePage = page == playbackPage
+                val activePage = page == pagerState.currentPage
                 val playerContent: @Composable () -> Unit = {
                     VideoPlayer(
                         uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
@@ -6929,7 +6930,7 @@ private fun ViewerScreen(
                     )
                 }
                 if (generated != null) {
-                    key(generated.outputPath) { playerContent() }
+                    key(generated.outputPath, activePage) { playerContent() }
                 } else {
                     playerContent()
                 }
