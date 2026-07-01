@@ -91,6 +91,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerDefaults
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -6890,6 +6891,11 @@ private fun ViewerScreen(
     }
     val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
+    val viewerFlingBehavior = if (generatedViewer) {
+        PagerDefaults.flingBehavior(state = pagerState)
+    } else {
+        PagerDefaults.flingBehavior(state = pagerState, snapPositionalThreshold = 0.24f)
+    }
     val viewerBitmapCache = remember { mutableStateMapOf<String, Bitmap>() }
     val viewerCacheSignature = remember(viewerItems) { viewerItems.joinToString("|") { it.second.cacheKey } }
     LaunchedEffect(viewerCacheSignature) {
@@ -6952,6 +6958,7 @@ private fun ViewerScreen(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
             beyondViewportPageCount = 2,
+            flingBehavior = viewerFlingBehavior,
         ) { page ->
             val (sourceIndex, photo) = viewerItems.getOrNull(page) ?: return@HorizontalPager
             if (photo.kind == MediaKind.VIDEO) {
