@@ -7408,11 +7408,7 @@ private class SbsVideoGlPlayerView(context: Context) :
     private var texMatrixHandle = 0
     private val textureMatrix = FloatArray(16)
     private var frameAvailable = false
-    private var sourceUri: Uri? = null
-    private var sourceContext: Context? = null
-    private var active = false
-    private var playerCallback: ((MediaPlayer?) -> Unit)? = null
-    private var player: MediaPlayer? = null
+    private var surfaceCallback: ((Surface?) -> Unit)? = null
     private var videoWidth = 0
     private var videoHeight = 0
     private var zoomScale = 1f
@@ -7424,24 +7420,17 @@ private class SbsVideoGlPlayerView(context: Context) :
         renderMode = RENDERMODE_WHEN_DIRTY
     }
 
-    fun setSource(context: Context, uri: Uri, isActive: Boolean, onPlayer: (MediaPlayer?) -> Unit) {
-        sourceContext = context.applicationContext
-        playerCallback = onPlayer
-        active = isActive
-        if (sourceUri != uri) {
-            sourceUri = uri
-            queueEvent { preparePlayer() }
-        } else {
-            setActive(isActive)
+    fun setSurfaceCallback(callback: (Surface?) -> Unit) {
+        surfaceCallback = callback
+        surface?.let { currentSurface ->
+            post { surfaceCallback?.invoke(currentSurface) }
         }
     }
 
-    fun setActive(isActive: Boolean) {
-        active = isActive
-        val current = player
-        if (current != null) {
-            if (isActive) runCatching { if (!current.isPlaying) current.start() } else runCatching { if (current.isPlaying) current.pause() }
-        }
+    fun setVideoSize(width: Int, height: Int) {
+        videoWidth = width
+        videoHeight = height
+        requestRender()
     }
 
     fun setZoom(scale: Float, offset: Offset) {
@@ -7451,7 +7440,7 @@ private class SbsVideoGlPlayerView(context: Context) :
     }
 
     fun release() {
-        queueEvent { releasePlayer() }
+        queueEvent { releaseSurfaceTexture() }
     }
 
     override fun onSurfaceCreated(gl: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
@@ -7465,7 +7454,9 @@ private class SbsVideoGlPlayerView(context: Context) :
             it.setOnFrameAvailableListener(this)
             surface = Surface(it)
         }
-        preparePlayer()
+        surface?.let { currentSurface ->
+            post { surfaceCallback?.invoke(currentSurface) }
+        }
     }
 
     override fun onSurfaceChanged(gl: javax.microedition.khronos.opengles.GL10?, width: Int, height: Int) {
@@ -7498,50 +7489,12 @@ private class SbsVideoGlPlayerView(context: Context) :
         requestRender()
     }
 
-    private fun preparePlayer() {
-        val uri = sourceUri ?: return
-        val ctx = sourceContext ?: return
-        val targetSurface = surface ?: return
-        releasePlayer(keepSurface = true)
-        val next = MediaPlayer()
-        player = next
-        playerCallback?.invoke(next)
-        runCatching {
-            next.setDataSource(ctx, uri)
-            next.setSurface(targetSurface)
-            next.isLooping = true
-            next.setOnVideoSizeChangedListener { _, w, h ->
-                videoWidth = w
-                videoHeight = h
-                requestRender()
-            }
-            next.setOnPreparedListener {
-                videoWidth = it.videoWidth
-                videoHeight = it.videoHeight
-                if (active) runCatching { it.start() } else runCatching { it.pause() }
-                requestRender()
-            }
-            next.setOnErrorListener { _, _, _ ->
-                releasePlayer(keepSurface = true)
-                true
-            }
-            next.prepareAsync()
-        }.onFailure {
-            releasePlayer(keepSurface = true)
-        }
-    }
-
-    private fun releasePlayer(keepSurface: Boolean = false) {
-        runCatching { player?.stop() }
-        runCatching { player?.release() }
-        player = null
-        playerCallback?.invoke(null)
-        if (!keepSurface) {
-            runCatching { surface?.release() }
-            runCatching { surfaceTexture?.release() }
-            surface = null
-            surfaceTexture = null
-        }
+    private fun releaseSurfaceTexture() {
+        post { surfaceCallback?.invoke(null) }
+        runCatching { surface?.release() }
+        runCatching { surfaceTexture?.release() }
+        surface = null
+        surfaceTexture = null
     }
 
     private fun drawEye(left: Boolean) {
@@ -7730,8 +7683,11 @@ private fun VideoPlayer(
     onSingleTap: () -> Unit,
 ) {
     val delayHost = LocalView.current
+    val context = LocalContext.current
     var normalVideoView by remember { mutableStateOf<VideoView?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+    var sbsSurface by remember(uri) { mutableStateOf<Surface?>(null) }
+    var sbsGlView by remember(uri) { mutableStateOf<SbsVideoGlPlayerView?>(null) }
     var videoSize by remember { mutableStateOf(IntSize.Zero) }
     var lastTapAt by remember { mutableStateOf(0L) }
     var longPressRunnable by remember { mutableStateOf<Runnable?>(null) }
@@ -7759,6 +7715,58 @@ private fun VideoPlayer(
         offset = Offset.Zero
     }
 
+    DisposableEffect(uri, sbsMode, sbsSurface) {
+        if (!sbsMode || sbsSurface == null) {
+            onDispose { }
+        } else {
+            val player = MediaPlayer()
+            mediaPlayer = player
+            var released = false
+            runCatching {
+                if (uri.scheme == "file") {
+                    player.setDataSource(requireNotNull(uri.path) { "Missing video file path" })
+                } else {
+                    player.setDataSource(context, uri)
+                }
+                player.setSurface(sbsSurface)
+                player.isLooping = true
+                player.setOnVideoSizeChangedListener { _, width, height ->
+                    sbsGlView?.setVideoSize(width, height)
+                }
+                player.setOnPreparedListener {
+                    sbsGlView?.setVideoSize(it.videoWidth, it.videoHeight)
+                    if (active) runCatching { it.start() } else runCatching { it.pause() }
+                }
+                player.setOnErrorListener { _, _, _ ->
+                    if (!released) {
+                        released = true
+                        runCatching { player.release() }
+                        if (mediaPlayer === player) mediaPlayer = null
+                    }
+                    true
+                }
+                player.prepareAsync()
+            }.onFailure {
+                released = true
+                runCatching { player.release() }
+                if (mediaPlayer === player) mediaPlayer = null
+            }
+            onDispose {
+                released = true
+                runCatching { player.stop() }
+                runCatching { player.release() }
+                if (mediaPlayer === player) mediaPlayer = null
+            }
+        }
+    }
+
+    LaunchedEffect(active, mediaPlayer, sbsMode) {
+        if (sbsMode) {
+            val player = mediaPlayer ?: return@LaunchedEffect
+            if (active) runCatching { if (!player.isPlaying) player.start() } else runCatching { if (player.isPlaying) player.pause() }
+        }
+    }
+
     LaunchedEffect(hint) {
         if (hint != null) {
             delay(900)
@@ -7775,14 +7783,15 @@ private fun VideoPlayer(
             AndroidView(
                 factory = { context ->
                     SbsVideoGlPlayerView(context).apply {
-                        setSource(context, uri, active) { mediaPlayer = it }
+                        setSurfaceCallback { surface -> sbsSurface = surface }
                         setZoom(scale, offset)
+                        sbsGlView = this
                     }
                 },
                 update = { view ->
-                    view.setSource(view.context, uri, active) { mediaPlayer = it }
-                    view.setActive(active)
+                    view.setSurfaceCallback { surface -> sbsSurface = surface }
                     view.setZoom(scale, offset)
+                    sbsGlView = view
                 },
                 modifier = Modifier.fillMaxSize(),
             )
@@ -7822,6 +7831,10 @@ private fun VideoPlayer(
                     runCatching { normalVideoView?.stopPlayback() }
                     normalVideoView = null
                     mediaPlayer = null
+                } else {
+                    sbsGlView?.release()
+                    sbsGlView = null
+                    sbsSurface = null
                 }
             }
         }
