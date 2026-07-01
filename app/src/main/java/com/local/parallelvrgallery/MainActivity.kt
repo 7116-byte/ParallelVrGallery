@@ -52,7 +52,6 @@ import android.opengl.GLSurfaceView
 import androidx.activity.result.IntentSenderRequest
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -96,11 +95,16 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.FastForward
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -6892,23 +6896,36 @@ private fun ViewerScreen(
         viewerBitmapCache.clear()
     }
     LaunchedEffect(viewerCacheSignature, pagerState.currentPage, state.vrMode, generatedViewer, state.entries, generatedEntryByKey) {
-        val nearbyUris = ((pagerState.currentPage - 2)..(pagerState.currentPage + 2))
+        val preloadPages = listOf(
+            pagerState.currentPage,
+            pagerState.currentPage + 1,
+            pagerState.currentPage - 1,
+            pagerState.currentPage + 2,
+            pagerState.currentPage - 2,
+            pagerState.currentPage + 3,
+            pagerState.currentPage - 3,
+        )
+        val nearbyTargets = preloadPages
             .mapNotNull { page -> viewerItems.getOrNull(page)?.second }
             .filter { item -> item.kind == MediaKind.IMAGE }
             .map { item ->
                 val entry = generatedEntryByKey[item.cacheKey] ?: state.entries[item.cacheKey]
-                if ((state.vrMode || generatedViewer) && entry != null) Uri.fromFile(File(entry.outputPath)) else item.uri
+                if ((state.vrMode || generatedViewer) && entry != null) {
+                    Uri.fromFile(File(entry.outputPath)) to 4096
+                } else {
+                    item.uri to 2560
+                }
             }
             .distinct()
-        nearbyUris.forEach { uri ->
-            val key = bitmapCacheKey(uri, 4096)
+        nearbyTargets.forEach { (uri, maxSide) ->
+            val key = bitmapCacheKey(uri, maxSide)
             if (viewerBitmapCache[key] == null) {
                 val bitmap = withContext(Dispatchers.IO) {
-                    runCatching { decodeScaledBitmap(context, uri, 4096) }.getOrNull()
+                    runCatching { decodeScaledBitmap(context, uri, maxSide) }.getOrNull()
                 }
                 if (bitmap != null) {
                     viewerBitmapCache[key] = bitmap
-                    while (viewerBitmapCache.size > 10) {
+                    while (viewerBitmapCache.size > 12) {
                         viewerBitmapCache.keys.firstOrNull()?.let { viewerBitmapCache.remove(it) } ?: break
                     }
                 }
@@ -6950,7 +6967,7 @@ private fun ViewerScreen(
                         sbsMode = generated != null,
                         controlsVisible = controlsVisible,
                         stateLine = "${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}",
-                        metricsLine = "当前帧${job?.currentFrameMs ?: 0}ms · 平均帧${job?.avgFrameMs ?: 0}ms",
+                        metricsLine = "frame ${job?.currentFrameMs ?: 0}ms · avg ${job?.avgFrameMs ?: 0}ms",
                         onSingleTap = { controlsVisible = !controlsVisible },
                     )
                 }
@@ -6969,7 +6986,7 @@ private fun ViewerScreen(
                 } else {
                     AsyncBitmapImage(
                         photo.uri,
-                        4096,
+                        2560,
                         ContentScale.Fit,
                         viewerBitmapCache,
                         Modifier
@@ -8107,7 +8124,7 @@ private fun VideoPlayer(
                     .background(androidx.compose.ui.graphics.Color(0x99000000))
                     .padding(horizontal = 8.dp, vertical = 4.dp),
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(0.dp)) {
                     IconButton(
                         onClick = {
                             val player = mediaPlayer
@@ -8120,9 +8137,14 @@ private fun VideoPlayer(
                                 isPlaying = true
                             }
                         },
-                        modifier = Modifier.size(40.dp),
+                        modifier = Modifier.size(34.dp),
                     ) {
-                        Text(if (isPlaying) "⏸" else "▶", color = androidx.compose.ui.graphics.Color.White, fontSize = 18.sp)
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            contentDescription = if (isPlaying) "Pause" else "Play",
+                            tint = androidx.compose.ui.graphics.Color.White,
+                            modifier = Modifier.size(24.dp),
+                        )
                     }
                     IconButton(
                         onClick = {
@@ -8140,9 +8162,14 @@ private fun VideoPlayer(
                             progress = if (duration > 0) (target.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else progress
                             positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
                         },
-                        modifier = Modifier.size(40.dp),
+                        modifier = Modifier.size(34.dp),
                     ) {
-                        Text("⏩", color = androidx.compose.ui.graphics.Color.White, fontSize = 16.sp)
+                        Icon(
+                            imageVector = Icons.Filled.FastForward,
+                            contentDescription = "Forward 5 seconds",
+                            tint = androidx.compose.ui.graphics.Color.White,
+                            modifier = Modifier.size(23.dp),
+                        )
                     }
                     IconButton(
                         onClick = {
@@ -8151,9 +8178,9 @@ private fun VideoPlayer(
                                 runCatching { mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(playbackSpeed) } }
                             }
                         },
-                        modifier = Modifier.size(40.dp),
+                        modifier = Modifier.size(34.dp),
                     ) {
-                        Text(if (playbackSpeed >= 2f) "2x" else "1x", color = androidx.compose.ui.graphics.Color.White, fontSize = 13.sp)
+                        Text(if (playbackSpeed >= 2f) "2x" else "1x", color = androidx.compose.ui.graphics.Color.White, fontSize = 12.sp)
                     }
                     Column(
                         modifier = Modifier.weight(1f),
