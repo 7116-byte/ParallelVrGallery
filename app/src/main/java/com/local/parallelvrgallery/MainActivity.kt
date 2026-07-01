@@ -53,7 +53,6 @@ import androidx.activity.result.IntentSenderRequest
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -93,7 +92,6 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.pager.HorizontalPager
-import androidx.compose.foundation.pager.PagerDefaults
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -6885,11 +6883,6 @@ private fun ViewerScreen(
     }
     val initialPage = viewerItems.indexOfFirst { it.first == startIndex }.takeIf { it >= 0 } ?: 0
     val pagerState = rememberPagerState(initialPage = initialPage) { viewerItems.size }
-    val viewerFlingBehavior = PagerDefaults.flingBehavior(
-        state = pagerState,
-        snapPositionalThreshold = 0.32f,
-        snapAnimationSpec = tween(durationMillis = 140),
-    )
     LaunchedEffect(pagerState.currentPage) {
         viewerItems.getOrNull(pagerState.currentPage)?.first?.let(onIndexChanged)
     }
@@ -6910,7 +6903,6 @@ private fun ViewerScreen(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
             beyondViewportPageCount = 2,
-            flingBehavior = viewerFlingBehavior,
         ) { page ->
             val (sourceIndex, photo) = viewerItems.getOrNull(page) ?: return@HorizontalPager
             if (photo.kind == MediaKind.VIDEO) {
@@ -6930,7 +6922,7 @@ private fun ViewerScreen(
                     )
                 }
                 if (generated != null) {
-                    key(generated.outputPath, activePage) { playerContent() }
+                    key(generated.outputPath) { playerContent() }
                 } else {
                     playerContent()
                 }
@@ -7738,6 +7730,8 @@ private fun VideoPlayer(
     var hint by remember(uri) { mutableStateOf<String?>(null) }
     var isPlaying by remember(uri) { mutableStateOf(false) }
     var sbsPrepared by remember(uri) { mutableStateOf(false) }
+    var sbsRetryToken by remember(uri) { mutableStateOf(0) }
+    var sbsActiveRetries by remember(uri) { mutableStateOf(0) }
     var scale by remember(uri) { mutableStateOf(1f) }
     var offset by remember(uri) { mutableStateOf(Offset.Zero) }
     LaunchedEffect(uri, mediaPlayer, sbsMode, active) {
@@ -7757,7 +7751,7 @@ private fun VideoPlayer(
         offset = Offset.Zero
     }
 
-    DisposableEffect(uri, sbsMode, sbsSurface) {
+    DisposableEffect(uri, sbsMode, sbsSurface, sbsRetryToken) {
         if (!sbsMode || sbsSurface == null) {
             onDispose { }
         } else {
@@ -7778,6 +7772,7 @@ private fun VideoPlayer(
                 }
                 player.setOnPreparedListener {
                     sbsPrepared = true
+                    sbsActiveRetries = 0
                     sbsGlView?.setVideoSize(it.videoWidth, it.videoHeight)
                     if (activeState.value) runCatching { it.start() } else runCatching { it.pause() }
                 }
@@ -7787,6 +7782,10 @@ private fun VideoPlayer(
                         runCatching { player.release() }
                         if (mediaPlayer === player) mediaPlayer = null
                         sbsPrepared = false
+                        if (activeState.value && sbsActiveRetries < 3) {
+                            sbsActiveRetries += 1
+                            sbsRetryToken += 1
+                        }
                     }
                     true
                 }
@@ -7796,6 +7795,10 @@ private fun VideoPlayer(
                 runCatching { player.release() }
                 if (mediaPlayer === player) mediaPlayer = null
                 sbsPrepared = false
+                if (activeState.value && sbsActiveRetries < 3) {
+                    sbsActiveRetries += 1
+                    sbsRetryToken += 1
+                }
             }
             onDispose {
                 released = true
@@ -7803,6 +7806,16 @@ private fun VideoPlayer(
                 runCatching { player.release() }
                 if (mediaPlayer === player) mediaPlayer = null
                 sbsPrepared = false
+            }
+        }
+    }
+
+    LaunchedEffect(active, sbsMode, sbsPrepared, mediaPlayer) {
+        if (sbsMode && active && !sbsPrepared && sbsActiveRetries < 3) {
+            delay(900)
+            if (activeState.value && !sbsPrepared) {
+                sbsActiveRetries += 1
+                sbsRetryToken += 1
             }
         }
     }
