@@ -6991,9 +6991,7 @@ private fun ViewerScreen(
                         viewerBitmapCache,
                         Modifier
                             .fillMaxSize()
-                            .pointerInput(photo.uri) {
-                                detectTapGestures(onTap = { controlsVisible = !controlsVisible })
-                            },
+                            .tapWithoutConsumingDrag(photo.uri) { controlsVisible = !controlsVisible },
                     )
                     if (state.vrMode && !generatedViewer && vrState != VrState.READY) {
                         StatusOverlay(vrState, lang, onRetry = { onRetry(sourceIndex) })
@@ -7510,6 +7508,25 @@ private fun List<PointerInputChange>.stableSbsLocalSpan(center: Offset, halfWidt
 private fun List<PointerInputChange>.previousStableSbsLocalSpan(center: Offset, halfWidth: Float, sideByPointer: MutableMap<Long, Boolean>): Float {
     if (isEmpty()) return 1f
     return map { (it.previousStableSbsLocalPosition(halfWidth, sideByPointer) - center).getDistance() }.average().toFloat()
+}
+
+private fun Modifier.tapWithoutConsumingDrag(key: Any?, onTap: () -> Unit): Modifier = pointerInput(key) {
+    awaitPointerEventScope {
+        while (true) {
+            val down = awaitPointerEvent(PointerEventPass.Initial).changes.firstOrNull { it.pressed } ?: continue
+            val start = down.position
+            var moved = false
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                val pressed = event.changes.filter { it.pressed }
+                if (pressed.isEmpty()) {
+                    if (!moved) onTap()
+                    break
+                }
+                if (pressed.any { (it.position - start).getDistance() > 18f }) moved = true
+            }
+        }
+    }
 }
 
 private class SbsVideoGlPlayerView(context: Context) :
