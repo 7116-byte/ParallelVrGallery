@@ -6898,7 +6898,11 @@ private fun ViewerScreen(
             .fillMaxSize()
             .background(androidx.compose.ui.graphics.Color.Black),
     ) {
-        HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize(),
+            beyondViewportPageCount = 2,
+        ) { page ->
             val (sourceIndex, photo) = viewerItems.getOrNull(page) ?: return@HorizontalPager
             if (photo.kind == MediaKind.VIDEO) {
                 val generated = state.videoEntries[photo.cacheKey]
@@ -6917,7 +6921,7 @@ private fun ViewerScreen(
                     )
                 }
                 if (generated != null) {
-                    key(generated.outputPath, activePage) { playerContent() }
+                    key(generated.outputPath) { playerContent() }
                 } else {
                     playerContent()
                 }
