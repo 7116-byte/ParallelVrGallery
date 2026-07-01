@@ -7416,6 +7416,7 @@ private class SbsVideoGlPlayerView(context: Context) :
 
     init {
         setEGLContextClientVersion(2)
+        preserveEGLContextOnPause = true
         setRenderer(this)
         renderMode = RENDERMODE_WHEN_DIRTY
     }
@@ -7430,6 +7431,14 @@ private class SbsVideoGlPlayerView(context: Context) :
     fun setVideoSize(width: Int, height: Int) {
         videoWidth = width
         videoHeight = height
+        queueEvent {
+            runCatching { surfaceTexture?.setDefaultBufferSize(width, height) }
+            requestRender()
+        }
+    }
+
+    fun setActive(isActive: Boolean) {
+        renderMode = if (isActive) RENDERMODE_CONTINUOUSLY else RENDERMODE_WHEN_DIRTY
         requestRender()
     }
 
@@ -7444,6 +7453,10 @@ private class SbsVideoGlPlayerView(context: Context) :
     }
 
     override fun onSurfaceCreated(gl: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
+        runCatching { surface?.release() }
+        runCatching { surfaceTexture?.release() }
+        surface = null
+        surfaceTexture = null
         program = createExternalTextureProgram()
         positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
@@ -7523,7 +7536,7 @@ private class SbsVideoGlPlayerView(context: Context) :
         val s1 = if (left) 0.5f else 1f
         drawTexturedQuad(
             floatArrayOf(l, b, r, b, l, t, r, t),
-            floatArrayOf(s0, 1f, s1, 1f, s0, 0f, s1, 0f),
+            floatArrayOf(s0, 0f, s1, 0f, s0, 1f, s1, 1f),
         )
     }
 
@@ -7537,6 +7550,11 @@ private class SbsVideoGlPlayerView(context: Context) :
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisableVertexAttribArray(positionHandle)
         GLES20.glDisableVertexAttribArray(texCoordHandle)
+    }
+
+    override fun onDetachedFromWindow() {
+        release()
+        super.onDetachedFromWindow()
     }
 }
 
@@ -7763,7 +7781,16 @@ private fun VideoPlayer(
     LaunchedEffect(active, mediaPlayer, sbsMode) {
         if (sbsMode) {
             val player = mediaPlayer ?: return@LaunchedEffect
-            if (active) runCatching { if (!player.isPlaying) player.start() } else runCatching { if (player.isPlaying) player.pause() }
+            sbsGlView?.setActive(active)
+            if (active) {
+                runCatching {
+                    val position = player.currentPosition
+                    player.seekTo(position)
+                    if (!player.isPlaying) player.start()
+                }
+            } else {
+                runCatching { if (player.isPlaying) player.pause() }
+            }
         }
     }
 
@@ -7790,6 +7817,7 @@ private fun VideoPlayer(
                 },
                 update = { view ->
                     view.setSurfaceCallback { surface -> sbsSurface = surface }
+                    view.setActive(active)
                     view.setZoom(scale, offset)
                     sbsGlView = view
                 },
