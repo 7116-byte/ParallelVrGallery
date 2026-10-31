@@ -27,7 +27,7 @@
 - 持续按住跨 Pager 临界点的顿挫，以及快速切视频黑屏，必须结合真实图片/视频、日志和帧数据验证。共享位图绘制和 settledPage 播放归属改进不能代替用户最终验收。
 - jobAllowedInCurrentContext 在生成页按 GENERATED 匹配，与恢复 ALL/ALBUM 来源暂停任务的需求仍可能有差异；没有在 UI 改版中修改该规则。
 - 3.0.08 的音轨 WrongConstant 已由显式 extractor→muxer 标志映射修复，配有回归测试。当前 Lint 错误白名单为空。
-- 现有 Compose/TFLite 原生库仍有 16 KB ELF 对齐限制。当前设备出现系统兼容提示；4 KB 真机运行不代表 16 KB 设备兼容。不要为隐藏提示而压制检查或伪称修复。
+- 16 KB 复查见 docs/NATIVE_ALIGNMENT.md：TFLite 2.16.1 的 CPU/GPU so 确认 LOAD 仅 4096；graphics-path 1.0.1 的 LOAD 为 16384，系统列为“未知错误”，不能混同为 LOAD 不合格。APK ZIP 检查通过。4 KB 调试真机可提前显示预警，不代表已做 16 KB 内核运行验收。不要隐藏提示或伪称修复。
 - Qualcomm 实验模型无本地权重，历史下载源返回 404；Video Depth Anything 只有转换资料。稳定模型已保留，不得将原始 pth 冒充移动端模型。
 
 UI-only navigation_v1 保存来源页、相册、生成版本、列数和滚动位置；冷启动不恢复 selectedIndex/vrMode，不因恢复界面自动开始生成。原 settings、queue_index、vr_cache、video_vr_cache 及缓存版本保持原规则。

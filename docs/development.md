@@ -57,3 +57,5 @@ mode=held-drag 检查持续按住并跨 Pager 临界点后返回；sbs 检查双
 mode=video-playback 仅打开专用相册已有生成的 04-ui-sample.mp4，检查明确暂停、回桌面/返回、旋转及图片/视频往返后的两眼画面；没有完成缓存时失败，不代为启动生成。运行完应恢复测试设备旋转状态。
 
 UI规范见 UI_SPEC.md，源码导航和未定案问题见 AI_HANDOFF.md。本机恢复记录 docs/RESTORATION_ACCEPTANCE.md、verification/restoration-summary.json 以及原始备份证据为本地资料，故意不提交；私密归档与 Pro 资料仍不可随意清理。
+
+16 KB 专项复查见 NATIVE_ALIGNMENT.md。运行 scripts/Check-NativeAlignment.ps1 可独立检查 APK ZIP 与原生库 ELF LOAD 对齐；当前 3.1.00 的 TFLite 库会使它返回 2（不合格）。该项尚未并入默认恢复验收，也不替代 RELRO 与 16 KB 运行时测试。

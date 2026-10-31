@@ -36,7 +36,7 @@ navigation_v1 保存来源页、当前相册、生成版本、列数和滚动位
 
 持续按住跨 Pager 临界点、快切图片/视频、旋转、回桌面、杀进程与冷启动都需要真机证据。共享位图、前后台播放和状态恢复改善不代表所有设备的历史顿挫/黑屏已经解决。新的问题先抓 UI thread、Compose、队列和 IO 时间线，区分原图/SBS、来源和现有缓存，避免凭经验反复修改手势阈值。
 
-现有 TFLite/Compose 原生库仍未全部满足 16 KB ELF 对齐。当前设备系统显示兼容提示；4 KB 页大小的运行验证不能代表 16 KB 兼容。本次不升级整套依赖或隐藏该限制。
+16 KB 提示已单独复查，见 NATIVE_ALIGNMENT.md：TFLite CPU/GPU 2.16.1 的 LOAD 为 4096，确实不合格；graphics-path 1.0.1 的 LOAD 已为 16384，但系统显示“未知错误”，其完整兼容性仍待验证。APK ZIP 对齐通过。手机实际为 4 KB，当前是调试应用提前预警。scripts/Check-NativeAlignment.ps1 可重复检查 ZIP/LOAD，但不认证 RELRO 或 16 KB 运行时兼容性。本次没有升级依赖或隐藏提示。
 
 稳定模型 SHA-256 为 B407F34F61750F31441E6F858A4BC48D8572F9EE5399FFD015CEE5FA1767083F。Qualcomm 实验权重不存在且历史 URL 返回 404；Video Depth Anything 仍待移动端转换。不要把旧 pth 路径视为依赖。
 
