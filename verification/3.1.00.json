@@ -22,17 +22,30 @@
   "coreMethodsUnchanged": 27,
   "sourceBaseline": "4d90096cfcb57f841767a7c185aeefa47fdd13ac",
   "privateEvidence": ".local/iterations/3.1.00/",
-  "publicDownloadVerified": false,
+  "publicDownloadVerified": true,
   "remaining": [
     "Historical drag hitch and intermittent video black screen need broader device/user validation",
     "16 KB native library alignment",
     "GENERATED vs ALL/ALBUM source-pause rule unchanged",
-    "GPU combinations not exhaustively tested"
+    "GPU combinations not exhaustively tested",
+    "Phone in-App download aborted; full download-to-installer flow needs a connected-network retest"
   ],
   "deviceChecks": [
     "Phone/tablet complex cached SBS pinch/drag/reset/both-eye PASS",
     "Phone QA SBS video pause/Home/rotation/page roundtrips PASS",
     "Cold-start album/grid restoration without Viewer PASS",
     "System dark/light, phone/tablet, landscape, 320dp/1.8x font inspected"
-  ]
+  ],
+  "releaseUrl": "https://github.com/7116-byte/ParallelVrGallery/releases/tag/v3.1.00",
+  "releaseCommit": "67bd963",
+  "publicLatestRedirect": "https://github.com/7116-byte/ParallelVrGallery/releases/tag/v3.1.00",
+  "updateChecks": {
+    "oldAppFindsNewRelease": "PASS",
+    "publicDownloadPackageVersionCertificate": "PASS",
+    "publicApkCoverUpgrade": "PASS",
+    "settingsSHA256Unchanged": "PASS",
+    "newAppReportsLatest": "PASS",
+    "inAppDownloadAndInstaller": "NOT_PASSED_NETWORK_ABORT_AND_PROXY_DNS",
+    "devicesRestoredAndLocked": true
+  }
 }
