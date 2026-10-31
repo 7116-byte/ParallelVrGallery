@@ -29,6 +29,10 @@ Android Studio 打开本根目录，JDK、SDK 和 Gradle user home 使用上表�
 
 APK 输出 app/build/outputs/apk/debug/app-debug.apk，并复制到 .local/artifacts/app-debug.apk。每次日志、aapt、apksigner 和 JSON 保存到 .local/verification/ 下独立时间目录；latest-build、latest-lint、latest-acceptance.json 是最新索引，失败也会更新状态。
 
+非调试正式构建使用 `Build.ps1 -Variant Release -Verify`，输出 app/build/outputs/apk/release/app-release.apk 和 .local/artifacts/app-release.apk；再执行 `scripts/Check-Lint.ps1 -Variant Release -Strict`。脚本会验证原证书、包名、版本与 debuggable=false。release 继续使用原历史证书，禁用调试、保留不混淆配置，不升级应用依赖。默认 Build/Verify 仍为 debug 流程，正式部署须明确指定 Release。
+
+当前 3.1.00 的两台设备正式构建安装记录见 PRODUCTION_DEVICE_INSTALL.md。版本号不因构建类型改变。未来向 GitHub 发布新版本时，即使内容来自 release，也要保留更新器所需的公开资产名 app-debug.apk，并递增版本；不得直接替换既有版本的已验证资产。
+
 ## 签名与发布
 
 app/build.gradle.kts 显式使用 .local/signing/debug.keystore，缺少原密钥应失败，不能生成替代密钥。原证书 SHA-256：
@@ -55,6 +59,8 @@ adb -s DEVICE_SERIAL shell am instrument -w -e mode sbs com.local.parallelvrgall
 mode=held-drag 检查持续按住并跨 Pager 临界点后返回；sbs 检查双指放大、放大后单指拖动、双击复位及左右眼画面。测试结果、UI截图和 gfxinfo/logcat 各自保留，不能用测试命令退出码代替读取 result=PASS/FAIL。复杂真实图片优先复用已有缓存进行只读验收。
 
 mode=video-playback 仅打开专用相册已有生成的 04-ui-sample.mp4，检查明确暂停、回桌面/返回、旋转及图片/视频往返后的两眼画面；没有完成缓存时失败，不代为启动生成。运行完应恢复测试设备旋转状态。
+
+mode=data-snapshot 只记录设置 SHA-256 与既有缓存/模型文件路径及长度清单的摘要，不启动 Activity 或生成；mode=release-smoke 另要求目标为非调试包，检查启动及调试兼容弹窗。通过同证书测试 APK 可核对正式包私有设置，避免把正式包不允许 run-as 误判为数据丢失。原始摘要和设备记录只存 .local/。
 
 UI规范见 UI_SPEC.md，源码导航和未定案问题见 AI_HANDOFF.md。本机恢复记录 docs/RESTORATION_ACCEPTANCE.md、verification/restoration-summary.json 以及原始备份证据为本地资料，故意不提交；私密归档与 Pro 资料仍不可随意清理。
 

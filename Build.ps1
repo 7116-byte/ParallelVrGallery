@@ -2,11 +2,14 @@
 param(
     [switch]$Online,
     [switch]$Verify,
+    [ValidateSet('Debug','Release')]
+    [string]$Variant = 'Debug',
     [ValidatePattern('^[A-Za-z][A-Za-z0-9:]*$')]
     [string[]]$Tasks = @('assembleDebug')
 )
 $ErrorActionPreference = 'Stop'
-if ($Verify) { $Tasks = @('clean','testDebugUnitTest','assembleDebug') }
+if ($Verify) { $Tasks = @('clean',"test${Variant}UnitTest","assemble$Variant") }
+elseif ($Variant -eq 'Release' -and !$PSBoundParameters.ContainsKey('Tasks')) { $Tasks = @('assembleRelease') }
 $root = $PSScriptRoot
 $names = @('JAVA_HOME','ANDROID_HOME','ANDROID_SDK_ROOT','GRADLE_USER_HOME','ANDROID_USER_HOME','ANDROID_EMULATOR_HOME','GRADLE_RO_DEP_CACHE','GRADLE_OPTS','JAVA_OPTS','JAVA_TOOL_OPTIONS','JDK_JAVA_OPTIONS','_JAVA_OPTIONS','TEMP','TMP','PATH')
 $saved = @{}
@@ -32,12 +35,16 @@ try {
         $gradleExit = $LASTEXITCODE
         if ($gradleExit -ne 0) { throw "Gradle failed ($gradleExit). See $evidence/build.log" }
     } finally { Pop-Location }
-    $apk = Join-Path $root 'app/build/outputs/apk/debug/app-debug.apk'
-    if (!(Test-Path $apk)) { throw 'No debug APK was produced. Tasks must include assembleDebug.' }
+    $variantLower = $Variant.ToLowerInvariant()
+    $apkRelative = "app/build/outputs/apk/$variantLower/app-$variantLower.apk"
+    $apk = Join-Path $root $apkRelative
+    if (!(Test-Path $apk)) { throw "No $Variant APK was produced. Tasks must include assemble$Variant." }
     $tools = Join-Path $env:ANDROID_HOME 'build-tools/35.0.0'
     $badging = & (Join-Path $tools 'aapt.exe') dump badging $apk
     if ($LASTEXITCODE -ne 0) { throw 'aapt failed' }
     $badging | Set-Content (Join-Path $evidence 'apk-badging.txt') -Encoding UTF8
+    $debuggable = [bool]@($badging | Where-Object { $_ -eq 'application-debuggable' }).Count
+    if ($debuggable -ne ($Variant -eq 'Debug')) { throw 'APK debuggable flag differs from requested variant' }
     $cert = & (Join-Path $tools 'apksigner.bat') verify --verbose --print-certs $apk
     if ($LASTEXITCODE -ne 0) { throw 'apksigner failed' }
     $cert | Set-Content (Join-Path $evidence 'apk-signature.txt') -Encoding UTF8
@@ -50,8 +57,8 @@ try {
     if ($gradleText -notmatch "versionCode\s*=\s*$versionCode\b" -or $gradleText -notmatch ('versionName\s*=\s*"' + [regex]::Escape($versionName) + '"')) { throw 'APK version differs from source' }
     $artifacts = Join-Path $root '.local/artifacts'
     [IO.Directory]::CreateDirectory($artifacts) | Out-Null
-    Copy-Item -LiteralPath $apk -Destination (Join-Path $artifacts 'app-debug.apk') -Force
-    $result = [ordered]@{ passed=$true; checkedAt=[DateTimeOffset]::Now.ToString('o'); offline=(!$Online); tasks=$Tasks; package='com.local.parallelvrgallery'; versionName=$versionName; versionCode=$versionCode; certificateSHA256=$expectedCert; apkSHA256=(Get-FileHash $apk).Hash; apk='app/build/outputs/apk/debug/app-debug.apk'; evidence=$evidence.Substring($root.Length+1) }
+    Copy-Item -LiteralPath $apk -Destination (Join-Path $artifacts "app-$variantLower.apk") -Force
+    $result = [ordered]@{ passed=$true; checkedAt=[DateTimeOffset]::Now.ToString('o'); offline=(!$Online); variant=$Variant; debuggable=$debuggable; tasks=$Tasks; package='com.local.parallelvrgallery'; versionName=$versionName; versionCode=$versionCode; certificateSHA256=$expectedCert; apkSHA256=(Get-FileHash $apk).Hash; apk=$apkRelative; evidence=$evidence.Substring($root.Length+1) }
     $result | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $evidence 'result.json') -Encoding UTF8
     $result | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $root '.local/verification/latest-build.json') -Encoding UTF8
     Write-Output ($result | ConvertTo-Json -Compress)

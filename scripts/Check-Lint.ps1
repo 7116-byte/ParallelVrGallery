@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$Strict)
+param([switch]$Strict,[ValidateSet('Debug','Release')][string]$Variant='Debug')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $names = @('JAVA_HOME','ANDROID_HOME','ANDROID_SDK_ROOT','GRADLE_USER_HOME','ANDROID_USER_HOME','ANDROID_EMULATOR_HOME','GRADLE_RO_DEP_CACHE','GRADLE_OPTS','JAVA_OPTS','JAVA_TOOL_OPTIONS','JDK_JAVA_OPTIONS','_JAVA_OPTIONS','TEMP','TMP','PATH')
@@ -12,16 +12,17 @@ try {
     Set-Content -LiteralPath (Join-Path $root 'local.properties') -Value ('sdk.dir=' + $env:ANDROID_HOME.Replace('\','/')) -Encoding ASCII
     Push-Location $root
     try {
-        $command = '""{0}" lintDebug --offline --no-daemon --console=plain --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process 2>&1"' -f (Join-Path $root 'gradlew.bat')
+        $command = '""{0}" lint{1} --offline --no-daemon --console=plain --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process 2>&1"' -f (Join-Path $root 'gradlew.bat'),$Variant
         & $env:ComSpec /d /s /c $command | Tee-Object -FilePath (Join-Path $evidence 'lint.log')
         $gradleExit = $LASTEXITCODE
     } finally { Pop-Location }
-    $xmlPath = Join-Path $root 'app/build/reports/lint-results-debug.xml'
+    $variantLower=$Variant.ToLowerInvariant()
+    $xmlPath = Join-Path $root "app/build/reports/lint-results-$variantLower.xml"
     $logText = Get-Content (Join-Path $evidence 'lint.log') -Raw
-    if ($gradleExit -ne 0 -and ($logText -notmatch ':app:lintDebug FAILED' -or $logText -notmatch 'Lint found')) { throw 'Lint execution failed before a usable report was produced' }
+    if ($gradleExit -ne 0 -and ($logText -notmatch ":app:lint$Variant FAILED" -or $logText -notmatch 'Lint found')) { throw 'Lint execution failed before a usable report was produced' }
     [xml]$report = Get-Content $xmlPath -Raw
     foreach ($extension in @('xml','html','txt')) {
-        $p = Join-Path $root "app/build/reports/lint-results-debug.$extension"
+        $p = Join-Path $root "app/build/reports/lint-results-$variantLower.$extension"
         if (Test-Path $p) { Copy-Item $p $evidence }
     }
     $issues = @($report.issues.issue)

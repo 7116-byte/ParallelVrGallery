@@ -5,6 +5,7 @@
 先读 docs/development.md、docs/UI_SPEC.md、docs/AI_HANDOFF.md、当前版本验收和 .codex/AGENTS.md；本机若存在 docs/RESTORATION_ACCEPTANCE.md，也应读取。然后检查实际 Git 状态、源码及远端发布，保留原有修改。不要凭截图、旧发布文案或构建成功认定真机问题已修复。
 
 - 默认离线构建：powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1。
+- 非调试正式包使用 Build.ps1 -Variant Release -Verify，再运行 scripts/Check-Lint.ps1 -Variant Release -Strict。debug/release 共用项目内原历史证书，release 的 debuggable 必须为 false；当前两台设备已覆盖安装 3.1.00 正式构建，见 docs/PRODUCTION_DEVICE_INSTALL.md。
 - 一键验收：同样运行 Verify.ps1 -StrictLint。JUnit 结果必须读取实际 XML，不能把 NO-SOURCE 算通过；Pro 的历史测试不属于普通版。
 - 工具、模型、离线依赖、原签名、原恢复记录和私人测试截图都在被 Git 忽略的 .local/。不上传这些资料，不读取或打印 Token。恢复记录及账号/磁盘证据仅留在本机。
 - Gradle debug 签名显式绑定 .local/signing/debug.keystore。历史发布使用 debug APK，必须保留原证书，不能使用新系统随机生成的 key 或覆盖全局密钥。

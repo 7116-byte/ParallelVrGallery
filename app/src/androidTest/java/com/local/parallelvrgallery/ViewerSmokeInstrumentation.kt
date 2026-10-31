@@ -42,6 +42,30 @@ class ViewerSmokeInstrumentation : Instrumentation() {
     override fun onStart() {
         val result = Bundle()
         try {
+            if (mode == "data-snapshot" || mode == "release-smoke") {
+                fun digest(bytes: ByteArray) = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it.toInt() and 255) }
+                val settings = File(targetContext.applicationInfo.dataDir, "shared_prefs/settings.xml")
+                result.putString("settingsSHA256", digest(settings.readBytes()))
+                val external = requireNotNull(targetContext.getExternalFilesDir(null))
+                val inventory = listOf("vr_cache", "video_vr_cache", "models").flatMap { folder ->
+                    File(external, folder).walkTopDown().filter { it.isFile }.map { "${it.relativeTo(external).invariantSeparatorsPath}\t${it.length()}" }.toList()
+                }.sorted()
+                result.putString("cacheInventorySHA256", digest(inventory.joinToString("\n").toByteArray(Charsets.UTF_8)))
+                result.putInt("cacheFileCount", inventory.size)
+                val debuggable = targetContext.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+                result.putString("debuggable", debuggable.toString())
+                if (mode == "release-smoke") {
+                    require(!debuggable) { "Production APK is still debuggable" }
+                    ParcelFileDescriptor.AutoCloseInputStream(uiAutomation.executeShellCommand("am start -W -n com.local.parallelvrgallery/.MainActivity")).bufferedReader().use { it.readText() }
+                    SystemClock.sleep(1000)
+                    require(findLabel("Android 应用兼容性") == null) { "System compatibility dialog is still present" }
+                    require(uiAutomation.rootInActiveWindow?.packageName == targetContext.packageName) { "Production app is not foreground" }
+                    result.putString("stream", "PASS: non-debuggable signed app launched without the debug compatibility dialog.\n")
+                }
+                result.putString("result", "PASS")
+                if (finished.compareAndSet(false, true)) finish(Activity.RESULT_OK, result)
+                return
+            }
             // Instrumentation restarts the target process. Reopen only the explicitly named QA album/sample.
             val intent = targetContext.packageManager.getLaunchIntentForPackage(targetContext.packageName) ?: error("No launch intent")
             stage("activity launch")

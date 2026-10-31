@@ -25,6 +25,13 @@ android {
         keyPassword = "android"
     }
 
+    buildTypes.getByName("release") {
+        isDebuggable = false
+        isMinifyEnabled = false
+        // Build type and certificate are independent: preserve upgrade compatibility.
+        signingConfig = signingConfigs.getByName("debug")
+    }
+
     buildFeatures {
         compose = true
         buildConfig = true
