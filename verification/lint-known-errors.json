@@ -1,0 +1,4 @@
+{
+  "basis": "3.1.00 fixes the inherited WrongConstant by explicitly mapping extractor sync flags to muxer key-frame flags. No Android Lint errors are allowlisted.",
+  "errors": []
+}

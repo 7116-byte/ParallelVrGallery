@@ -9,3 +9,11 @@ app/src/main/assets/models/*.tflite
 upload-apk.log
 upload-model.log
 release-notes-*.md
+_workspace_artifacts/
+
+# Private recovery assets, credentials, tools and local output.
+/.local/
+/.codex-remote-attachments/
+# Local restore/account/drive evidence remains available on this workstation.
+/docs/RESTORATION_ACCEPTANCE.md
+/verification/restoration-summary.json

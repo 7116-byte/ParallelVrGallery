@@ -1,0 +1,38 @@
+{
+  "versionName": "3.1.00",
+  "versionCode": 30100,
+  "package": "com.local.parallelvrgallery",
+  "apkAsset": "app-debug.apk",
+  "apkSHA256": "cd7f816384633bfdb842390f5ff2a57abc37ee21db7c8031a17c06bc62c1599d",
+  "certificateSHA256": "c51c08290903e65d2e99fe35ceffd44b637f04cc5bbdd5ea9ecb8847d4ea7359",
+  "offlineCleanBuild": "PASS",
+  "unitTests": {
+    "skipped": 0,
+    "errors": 0,
+    "tests": 28,
+    "failures": 0
+  },
+  "lint": {
+    "status": "PASS",
+    "errors": 0,
+    "warnings": 11,
+    "information": 16,
+    "strict": true
+  },
+  "coreMethodsUnchanged": 27,
+  "sourceBaseline": "4d90096cfcb57f841767a7c185aeefa47fdd13ac",
+  "privateEvidence": ".local/iterations/3.1.00/",
+  "publicDownloadVerified": false,
+  "remaining": [
+    "Historical drag hitch and intermittent video black screen need broader device/user validation",
+    "16 KB native library alignment",
+    "GENERATED vs ALL/ALBUM source-pause rule unchanged",
+    "GPU combinations not exhaustively tested"
+  ],
+  "deviceChecks": [
+    "Phone/tablet complex cached SBS pinch/drag/reset/both-eye PASS",
+    "Phone QA SBS video pause/Home/rotation/page roundtrips PASS",
+    "Cold-start album/grid restoration without Viewer PASS",
+    "System dark/light, phone/tablet, landscape, 320dp/1.8x font inspected"
+  ]
+}

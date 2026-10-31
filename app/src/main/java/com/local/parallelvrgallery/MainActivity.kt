@@ -1,4 +1,4 @@
-﻿package com.local.parallelvrgallery
+package com.local.parallelvrgallery
 
 import android.Manifest
 import android.app.NotificationChannel
@@ -57,6 +57,20 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.core.view.WindowCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
@@ -118,6 +132,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -145,8 +160,15 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalAccessibilityManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -166,6 +188,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -200,8 +225,9 @@ import kotlin.math.sqrt
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
-            MaterialTheme {
+            StudioTheme {
                 Surface(Modifier.fillMaxSize()) {
                     GalleryApp()
                 }
@@ -658,6 +684,7 @@ private data class VideoQueueTag(
     val updatedAt: Long,
 )
 
+@OptIn(kotlinx.coroutines.FlowPreview::class)
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application
     private val repository = PhotoRepository(app)
@@ -669,6 +696,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val generator = VrGenerator(app, cache, modelManager)
     private val videoGenerator = VideoVrGenerator(app, videoCache, generator)
     private val settingsStore = SettingsStore(app)
+    private val navigation = NavigationStore(app)
+    private val restoredNavigation = navigation.load()
     private val queueTags = QueueTagStore(app)
     private val videoQueueTags = VideoQueueTagStore(app)
     private val pending = PriorityQueue<QueuedJob>(compareBy<QueuedJob> { it.priority }.thenBy { it.sequence })
@@ -695,6 +724,22 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             hasVideoPermission = hasVideoPermission(app),
             hasNotificationPermission = hasNotificationPermission(app),
             settings = settingsStore.load(),
+            homeTab = restoredNavigation.tab,
+            generatedTab = restoredNavigation.generatedTab,
+            selectedAlbumId = restoredNavigation.album,
+            selectedGeneratedVersion = restoredNavigation.version,
+            galleryScrollIndex = restoredNavigation.index,
+            galleryScrollOffset = restoredNavigation.offset,
+            generatedImageScrollIndex = restoredNavigation.generatedIndex,
+            generatedImageScrollOffset = restoredNavigation.generatedOffset,
+            generatedVideoScrollIndex = restoredNavigation.videoIndex,
+            generatedVideoScrollOffset = restoredNavigation.videoOffset,
+            generatedVersionScrollIndexes = restoredNavigation.version?.let { mapOf(it to restoredNavigation.versionIndex) } ?: emptyMap(),
+            generatedVersionScrollOffsets = restoredNavigation.version?.let { mapOf(it to restoredNavigation.versionOffset) } ?: emptyMap(),
+            allColumns = restoredNavigation.allColumns,
+            albumListColumns = restoredNavigation.albumColumns,
+            albumDetailColumns = restoredNavigation.detailColumns,
+            generatedColumns = restoredNavigation.generatedColumns,
         ),
     )
     val uiState: StateFlow<UiState> = _uiState
@@ -703,11 +748,43 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (_uiState.value.hasPermission) {
             loadPhotos()
         }
+        viewModelScope.launch {
+            uiState.map { current ->
+                UiNavigation(current.homeTab, current.generatedTab, current.selectedAlbumId, current.selectedGeneratedVersion,
+                    current.galleryScrollIndex, current.galleryScrollOffset, current.generatedImageScrollIndex, current.generatedImageScrollOffset,
+                    current.generatedVideoScrollIndex, current.generatedVideoScrollOffset,
+                    current.generatedVersionScrollIndexes[current.selectedGeneratedVersion] ?: 0, current.generatedVersionScrollOffsets[current.selectedGeneratedVersion] ?: 0,
+                    current.allColumns, current.albumListColumns, current.albumDetailColumns, current.generatedColumns)
+            }.distinctUntilChanged().debounce(250).collect { navigation.save(it) }
+        }
+    }
+
+    fun rememberLibraryPosition(index: Int, offset: Int) {
+        _uiState.update { it.copy(galleryScrollIndex = index.coerceAtLeast(0), galleryScrollOffset = offset.coerceAtLeast(0)) }
+    }
+
+    fun imagePauseReason(key: String): String = synchronized(paused) {
+        when {
+            key in sourcePausedKeys -> "source"
+            key in autoPausedKeys -> "window"
+            key in paused -> "manual_or_restored"
+            else -> "unknown"
+        }
     }
 
     override fun onCleared() {
         generator.close()
         super.onCleared()
+    }
+
+    fun refreshPermissions() {
+        val state = _uiState.value
+        val images = hasImagePermission(app)
+        val videos = hasVideoPermission(app)
+        val notifications = hasNotificationPermission(app)
+        if (images != state.hasPermission || videos != state.hasVideoPermission || notifications != state.hasNotificationPermission) {
+            onPermissionChanged(images, videos, notifications)
+        }
     }
 
     fun onPermissionChanged(imageGranted: Boolean, videoGranted: Boolean, notificationGranted: Boolean) {
@@ -778,6 +855,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
             viewModelScope.launch {
+                _uiState.value.selectedAlbumId?.let { loadAlbumPage(it, reset = true) }
                 val fullAlbums = withContext(Dispatchers.IO) { repository.loadAlbums() }
                 _uiState.update { it.copy(albums = fullAlbums) }
             }
@@ -1213,7 +1291,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun downloadFileWithProgress(urls: List<String>, output: File, lang: AppLanguage) {
         val errors = mutableListOf<String>()
-        urls.forEachIndexed { sourceIndex, sourceUrl ->
+        urls.forEach { sourceUrl ->
             if (output.exists()) output.delete()
             runCatching {
                 val connection = (URL(sourceUrl).openConnection() as HttpURLConnection).apply {
@@ -1237,9 +1315,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                             if (read <= 0) break
                             fileOut.write(buffer, 0, read)
                             readTotal += read
-                            val sourceBase = sourceIndex.toFloat() / urls.size.toFloat()
-                            val sourceSpan = 1f / urls.size.toFloat()
-                            val progress = (sourceBase + (readTotal.toFloat() / total.toFloat()) * sourceSpan).coerceIn(0f, 1f)
+                            val progress = (readTotal.toFloat() / total.toFloat()).coerceIn(0f, 1f)
                             _uiState.update {
                                 it.copy(
                                     updateDownloadProgress = progress,
@@ -1261,11 +1337,22 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         error(errors.joinToString(" | ").ifBlank { "all update download sources failed" })
     }
 
+    @Suppress("DEPRECATION")
     private fun downloadedApkVersion(file: File): Pair<String, Long> {
-        val info = app.packageManager.getPackageArchiveInfo(file.absolutePath, 0)
+        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+        val info = app.packageManager.getPackageArchiveInfo(file.absolutePath, flags)
             ?: error("无法读取安装包版本 / Cannot read APK version")
         if (info.packageName != app.packageName) {
             error("安装包应用 ID 不匹配：${info.packageName} / APK package mismatch")
+        }
+        fun digests(pkg: android.content.pm.PackageInfo): Set<String> {
+            val signatures = if (Build.VERSION.SDK_INT >= 28) pkg.signingInfo?.apkContentsSigners else pkg.signatures
+            return signatures.orEmpty().map { signature ->
+                MessageDigest.getInstance("SHA-256").digest(signature.toByteArray()).joinToString("") { "%02x".format(it) }
+            }.toSet()
+        }
+        if (!sameSigningDigests(digests(app.packageManager.getPackageInfo(app.packageName, flags)), digests(info))) {
+            error("更新包签名与当前应用不一致 / Update signing certificate mismatch")
         }
         val versionName = info.versionName?.takeIf { it.isNotBlank() }
             ?: error("安装包缺少版本号 / APK versionName missing")
@@ -1280,7 +1367,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun validateDownloadedUpdate(file: File, expectedTag: String?, lang: AppLanguage) {
         val (downloadedTag, downloadedCode) = downloadedApkVersion(file)
-        if (compareVersionTags(downloadedTag, CURRENT_VERSION_TAG) <= 0 || downloadedCode <= CURRENT_VERSION_CODE) {
+        if (!isNewerApkVersion(downloadedTag, downloadedCode, CURRENT_VERSION_TAG, CURRENT_VERSION_CODE)) {
             error(
                 lang.t(
                     "下载到旧版安装包：$downloadedTag($downloadedCode)，当前：$CURRENT_VERSION_TAG($CURRENT_VERSION_CODE)，请重新检查更新。",
@@ -2596,9 +2683,9 @@ private data class VideoQueuedJob(val item: GalleryItem, val params: VideoGenera
 private class VideoPausedException : RuntimeException("Video generation paused")
 private class VideoStaleException : RuntimeException("Video generation superseded")
 
-private fun AppLanguage.t(zh: String, en: String): String = if (this == AppLanguage.ZH) zh else en
+internal fun AppLanguage.t(zh: String, en: String): String = if (this == AppLanguage.ZH) zh else en
 
-private fun AppLanguage.pickMixed(text: String): String {
+internal fun AppLanguage.pickMixed(text: String): String {
     val marker = " / "
     if (!text.contains(marker)) return text
     val parts = text.split(marker, limit = 2)
@@ -2626,7 +2713,7 @@ private fun queuedVideoItemFromKey(videoKey: String): GalleryItem {
     )
 }
 
-private fun VrState.label(lang: AppLanguage): String = when (this) {
+internal fun VrState.label(lang: AppLanguage): String = when (this) {
     VrState.NORMAL -> lang.t("原图", "Normal")
     VrState.PAUSED -> lang.t("暂停", "Paused")
     VrState.QUEUED -> lang.t("队列中", "Queued")
@@ -2635,7 +2722,7 @@ private fun VrState.label(lang: AppLanguage): String = when (this) {
     VrState.FAILED -> lang.t("失败", "Failed")
 }
 
-private fun VideoVrState.label(lang: AppLanguage): String = when (this) {
+internal fun VideoVrState.label(lang: AppLanguage): String = when (this) {
     VideoVrState.NORMAL -> lang.t("未生成", "Normal")
     VideoVrState.QUEUED -> lang.t("队列中", "Queued")
     VideoVrState.GENERATING -> lang.t("生成中", "Generating")
@@ -4944,7 +5031,7 @@ private class VideoVrGenerator(
         while (true) {
             val size = extractor.readSampleData(buffer, 0)
             if (size < 0) break
-            info.set(0, size, extractor.sampleTime.coerceAtLeast(0L), extractor.sampleFlags)
+            info.set(0, size, extractor.sampleTime.coerceAtLeast(0L), muxerSampleFlags(extractor.sampleFlags))
             muxer.writeSampleData(track, buffer, info)
             extractor.advance()
         }
@@ -5173,6 +5260,27 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     var pendingReplaceIndexes by remember { mutableStateOf<List<Int>>(emptyList()) }
+    var pendingAction by remember { mutableStateOf<PendingUiAction?>(null) }
+    fun confirmAction(title: String, detail: String, action: () -> Unit) { pendingAction = PendingUiAction(title, detail, action) }
+    var tasksOpen by rememberSaveable { mutableStateOf(false) }
+    var galleryDockHeightPx by remember { mutableStateOf(0) }
+    val galleryNoticePadding = with(LocalDensity.current) { galleryDockHeightPx.toDp() } + 8.dp
+    val guidePrefs = remember { context.getSharedPreferences("ui_guide", Context.MODE_PRIVATE) }
+    var guideOpen by rememberSaveable { mutableStateOf(!guidePrefs.getBoolean("seen_v1", false)) }
+    val snackbar = remember { SnackbarHostState() }
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshPermissions()
+        }
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(state.message) {
+        state.message?.let {
+            if (snackbar.showSnackbar(state.settings.language.pickMixed(it), actionLabel = state.settings.language.t("查看", "Details"), withDismissAction = true, duration = SnackbarDuration.Short) == SnackbarResult.ActionPerformed) tasksOpen = true
+        }
+    }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
         viewModel.onPermissionChanged(
             imageGranted = grants[imagePermission()] == true || hasImagePermission(context),
@@ -5187,18 +5295,11 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
         pendingReplaceIndexes = emptyList()
     }
 
-    LaunchedEffect(state.hasPermission, state.hasVideoPermission, state.hasNotificationPermission) {
-        if (!state.hasPermission) {
-            launcher.launch(mediaPermissions())
-        } else if (!state.hasVideoPermission && Build.VERSION.SDK_INT >= 33) {
-            launcher.launch(arrayOf(Manifest.permission.READ_MEDIA_VIDEO))
-        } else if (!state.hasNotificationPermission && Build.VERSION.SDK_INT >= 33) {
-            launcher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
-        }
-    }
 
     if (!state.hasPermission) {
-        PermissionScreen(state.settings.language) { launcher.launch(mediaPermissions()) }
+        Box(Modifier.fillMaxSize().windowInsetsPadding(androidx.compose.foundation.layout.WindowInsets.safeDrawing)) {
+            PermissionScreen(state.settings.language) { launcher.launch(mediaPermissions()) }
+        }
         return
     }
 
@@ -5235,10 +5336,22 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
         viewModel.closeAlbum()
     }
 
+    pendingAction?.let { action ->
+        AlertDialog(onDismissRequest = { pendingAction = null }, title = { Text(action.title) },
+            text = { Text(action.detail) },
+            confirmButton = { Button(onClick = { pendingAction = null; action.run() }) { Text(state.settings.language.t("确认操作", "Confirm")) } },
+            dismissButton = { TextButton(onClick = { pendingAction = null }) { Text(state.settings.language.t("取消", "Cancel")) } })
+    }
+    if (guideOpen) StudioGuide(state.settings.language) {
+        guidePrefs.edit().putBoolean("seen_v1", true).apply()
+        guideOpen = false
+    }
+    if (tasksOpen) StudioTasks(state, viewModel::imagePauseReason) { tasksOpen = false }
+    Box(Modifier.fillMaxSize().then(if (screen is AppScreen.Viewer) Modifier else Modifier.windowInsetsPadding(androidx.compose.foundation.layout.WindowInsets.safeDrawing))) {
     AnimatedContent(
         targetState = screen,
         transitionSpec = {
-            (fadeIn() + scaleIn(initialScale = 0.96f)) togetherWith (fadeOut() + scaleOut(targetScale = 0.96f))
+            fadeIn() togetherWith fadeOut()
         },
         label = "screenTransition",
     ) { target ->
@@ -5254,17 +5367,17 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onSetGeneratedColumns = { viewModel.setPageColumns("generated", it) },
                 onGeneratedScroll = viewModel::setGeneratedScroll,
                 onGeneratedVersionScroll = viewModel::setGeneratedVersionScroll,
-                onDeleteVersion = viewModel::deleteCacheVersion,
+                onDeleteVersion = { version -> confirmAction(state.settings.language.t("删除这个生成版本？", "Delete this generated version?"), version + "\n" + state.settings.language.t("将删除此版本的生成缓存，原媒体保留。", "This removes generated cache for this version. Original media is kept.")) { viewModel.deleteCacheVersion(version) } },
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
                 onSaveVideo = { viewModel.saveGeneratedVideo(context, it) },
-                onDeleteVideo = viewModel::deleteGeneratedVideo,
+                onDeleteVideo = { index -> confirmAction(state.settings.language.t("删除视频缓存？", "Delete video cache?"), state.settings.language.t("仅移除此项目的生成缓存，原视频保留。", "Remove this item's generated cache. Keep the original video.")) { viewModel.deleteGeneratedVideo(index) } },
                 onSaveVideos = { viewModel.saveGeneratedVideos(context, it) },
-                onDeleteVideos = viewModel::deleteGeneratedVideos,
-                onRegenerateVideos = viewModel::regenerateVideos,
+                onDeleteVideos = { indexes -> confirmAction(state.settings.language.t("删除 ${indexes.size} 项视频缓存？", "Delete ${indexes.size} video caches?"), state.settings.language.t("原视频保留。此操作会移除相关生成结果与任务。", "Original videos are kept. Related generated results and tasks are removed.")) { viewModel.deleteGeneratedVideos(indexes) } },
+                onRegenerateVideos = { indexes -> confirmAction(state.settings.language.t("重新生成 ${indexes.size} 个视频？", "Regenerate ${indexes.size} videos?"), state.settings.language.t("将替换相关生成缓存并按当前设置重新排队；原视频保留。", "Replace related generated cache and queue again with current settings. Keep original videos.")) { viewModel.regenerateVideos(indexes) } },
                 onSaveImages = { viewModel.saveGeneratedCopies(context, it) },
-                onDeleteImages = viewModel::deleteGeneratedImageEntries,
-                onRegenerateImages = viewModel::regenerateImages,
+                onDeleteImages = { entries -> confirmAction(state.settings.language.t("删除 ${entries.size} 项图片缓存？", "Delete ${entries.size} image caches?"), state.settings.language.t("移除所选项目相关的生成缓存，原媒体保留。请先导出需要保留的结果。", "Remove generated caches associated with these items. Original media is kept. Export any results you need first.")) { viewModel.deleteGeneratedImageEntries(entries) } },
+                onRegenerateImages = { indexes -> confirmAction(state.settings.language.t("重新生成 ${indexes.size} 张图片？", "Regenerate ${indexes.size} images?"), state.settings.language.t("普通版会清理这些原图的已有生成缓存，再按当前设置生成；原媒体保留。", "This edition clears these originals' existing generated caches before regenerating with current settings. Original media is kept.")) { viewModel.regenerateImages(indexes) } },
             )
             AppScreen.Settings -> SettingsScreen(
                 settings = state.settings,
@@ -5275,6 +5388,8 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 updateDownloadProgress = state.updateDownloadProgress,
                 updateApkPath = state.updateApkPath,
                 onBack = viewModel::closeSettings,
+                onGuide = { guideOpen = true },
+                onPermissions = { launcher.launch(mediaPermissions()) },
                 onChange = viewModel::updateSettings,
                 onCheckUpdate = viewModel::checkForUpdates,
                 onDownloadUpdate = viewModel::downloadUpdateApk,
@@ -5286,7 +5401,8 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onBack = viewModel::closeDebug,
                 onShare = { viewModel.exportDebug(context, state.debugIndex ?: state.galleryAnchorIndex) },
             )
-            AppScreen.Viewer -> ViewerScreen(
+            AppScreen.Viewer -> MaterialTheme(colorScheme = StudioDarkColors) {
+                CompositionLocalProvider(LocalContentColor provides StudioDarkColors.onSurface) { ViewerScreen(
                 state = state,
                 startIndex = state.selectedIndex ?: state.galleryAnchorIndex,
                 onClose = viewModel::closeViewer,
@@ -5294,13 +5410,16 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onVr = viewModel::requestVr,
                 onRetry = viewModel::retry,
                 onOpenDebug = viewModel::openDebug,
-            )
+            ) } }
             AppScreen.Gallery -> GalleryScreen(
                 state = state,
                 onRefresh = viewModel::loadPhotos,
                 onOpen = viewModel::openPhoto,
                 onOpenScoped = viewModel::openScopedPhoto,
                 onSettings = viewModel::openSettings,
+                onTasks = { tasksOpen = true },
+                onDockHeight = { galleryDockHeightPx = it },
+                onLibraryScroll = viewModel::rememberLibraryPosition,
                 onSetTab = viewModel::setHomeTab,
                 onSetGeneratedTab = viewModel::setGeneratedTab,
                 onSetPageColumns = viewModel::setPageColumns,
@@ -5315,6 +5434,7 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                 onLoadMoreAlbum = viewModel::loadMoreSelectedAlbum,
                 onSaveGenerated = { viewModel.saveGeneratedCopies(context, it) },
                 onReplaceOriginal = { indexes ->
+                    confirmAction(state.settings.language.t("替换 ${indexes.size} 项原媒体？", "Replace ${indexes.size} originals?"), state.settings.language.t("这会写入原媒体位置，不能通过删除生成缓存撤销。请先保留原始文件备份。", "This writes to the original media location and cannot be undone by deleting generated cache. Back up originals first.")) {
                     if (Build.VERSION.SDK_INT >= 30) {
                         val uris = indexes.mapNotNull { state.photos.getOrNull(it)?.uri }
                         if (uris.isNotEmpty()) {
@@ -5325,37 +5445,52 @@ fun GalleryApp(viewModel: GalleryViewModel = viewModel()) {
                     } else {
                         viewModel.replaceOriginalsWithGenerated(context, indexes)
                     }
+                    }
                 },
-                onDeleteVersion = viewModel::deleteCacheVersion,
+                onDeleteVersion = { version -> confirmAction(state.settings.language.t("删除这个生成版本？", "Delete this generated version?"), version + "\n" + state.settings.language.t("将删除此版本的生成缓存，原媒体保留。", "This removes generated cache for this version. Original media is kept.")) { viewModel.deleteCacheVersion(version) } },
                 onOpenGenerated = viewModel::openGeneratedPhoto,
                 onOpenGeneratedVideo = viewModel::openGeneratedVideo,
                 onSaveVideo = { viewModel.saveGeneratedVideo(context, it) },
-                onDeleteVideo = viewModel::deleteGeneratedVideo,
+                onDeleteVideo = { index -> confirmAction(state.settings.language.t("删除视频缓存？", "Delete video cache?"), state.settings.language.t("仅移除此项目的生成缓存，原视频保留。", "Remove this item's generated cache. Keep the original video.")) { viewModel.deleteGeneratedVideo(index) } },
                 onSaveVideos = { viewModel.saveGeneratedVideos(context, it) },
-                onDeleteVideos = viewModel::deleteGeneratedVideos,
-                onRegenerateVideos = viewModel::regenerateVideos,
+                onDeleteVideos = { indexes -> confirmAction(state.settings.language.t("删除 ${indexes.size} 项视频缓存？", "Delete ${indexes.size} video caches?"), state.settings.language.t("原视频保留。此操作会移除相关生成结果与任务。", "Original videos are kept. Related generated results and tasks are removed.")) { viewModel.deleteGeneratedVideos(indexes) } },
+                onRegenerateVideos = { indexes -> confirmAction(state.settings.language.t("重新生成 ${indexes.size} 个视频？", "Regenerate ${indexes.size} videos?"), state.settings.language.t("将替换相关生成缓存并按当前设置重新排队；原视频保留。", "Replace related generated cache and queue again with current settings. Keep original videos.")) { viewModel.regenerateVideos(indexes) } },
                 onSaveImages = { viewModel.saveGeneratedCopies(context, it) },
-                onDeleteImages = viewModel::deleteGeneratedImageEntries,
-                onRegenerateImages = viewModel::regenerateImages,
+                onDeleteImages = { entries -> confirmAction(state.settings.language.t("删除 ${entries.size} 项图片缓存？", "Delete ${entries.size} image caches?"), state.settings.language.t("移除所选项目相关的生成缓存，原媒体保留。请先导出需要保留的结果。", "Remove generated caches associated with these items. Original media is kept. Export any results you need first.")) { viewModel.deleteGeneratedImageEntries(entries) } },
+                onRegenerateImages = { indexes -> confirmAction(state.settings.language.t("重新生成 ${indexes.size} 张图片？", "Regenerate ${indexes.size} images?"), state.settings.language.t("普通版会清理这些原图的已有生成缓存，再按当前设置生成；原媒体保留。", "This edition clears these originals' existing generated caches before regenerating with current settings. Original media is kept.")) { viewModel.regenerateImages(indexes) } },
             )
         }
+    }
+    SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter)
+        .then(if (screen is AppScreen.Viewer) Modifier.navigationBarsPadding() else Modifier)
+        .padding(horizontal = 16.dp).padding(bottom = if (screen is AppScreen.Gallery) galleryNoticePadding else 12.dp))
     }
 }
 
 @Composable
 private fun PermissionScreen(lang: AppLanguage, onGrant: () -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(12.dp))
-        Text(lang.t("授权读取图片和视频后，可以浏览系统相册，并在本地生成平行眼 SBS VR 缓存。", "Allow image and video access to browse your gallery and build local parallel-eye VR cache."))
+    val context = LocalContext.current
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp)) {
         Spacer(Modifier.height(20.dp))
-        Button(onClick = onGrant) { Text(lang.t("授权图片和视频访问", "Grant access")) }
+        Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(28.dp)) {
+            Icon(Icons.Default.AutoAwesome, null, Modifier.padding(24.dp).size(40.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
+        }
+        Text(lang.t("让图库，多一个维度。", "A new dimension for your gallery."), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+        Text(lang.t("平行眼 VR 图库", "Parallel VR Gallery"), color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleMedium)
+        Text(lang.t("浏览系统媒体 → 选择图片或视频 → 在设备上生成双眼 SBS。原媒体不会因浏览或生成而被替换。", "Browse your media → choose an image or video → create stereo SBS on your device. Browsing and generation do not replace originals."))
+        HorizontalDivider()
+        Text(lang.t("先选择可访问的媒体", "Choose accessible media"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        Text(lang.t("图片权限用于浏览图片；视频权限用于浏览和播放视频。支持的系统可只授权选定媒体，稍后可在设置中调整。通知只用于显示后台视频任务状态，可选择不开启。", "Image and video access lets you browse and play local media. Supported systems can grant selected media only. You can change access later. Notifications are optional and show background video progress."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Button(onClick = onGrant, modifier = Modifier.fillMaxWidth()) { Text(lang.t("选择媒体并开始", "Choose media & begin")) }
+        OutlinedButton(onClick = {
+            context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+        }, modifier = Modifier.fillMaxWidth()) { Text(lang.t("已拒绝授权？打开系统设置", "Access denied? Open system settings")) }
+        Text(lang.t("模型在首次生成前下载。生成需要计算时间；强制 GPU 是可选设置，不会悄悄改用 CPU。", "The model downloads before first generation. Processing takes time. Forced GPU is optional and never silently falls back to CPU."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
+
+private data class PendingUiAction(val title: String, val detail: String, val run: () -> Unit)
 
 private data class GeneratedSelectionActionsState(
     val count: Int,
@@ -5365,7 +5500,7 @@ private data class GeneratedSelectionActionsState(
     val onDelete: () -> Unit,
 )
 
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, kotlinx.coroutines.FlowPreview::class)
 @Composable
 private fun GalleryScreen(
     state: UiState,
@@ -5373,6 +5508,9 @@ private fun GalleryScreen(
     onOpen: (Int, Int, Int) -> Unit,
     onOpenScoped: (Int, List<String>, Int, Int) -> Unit,
     onSettings: () -> Unit,
+    onTasks: () -> Unit,
+    onDockHeight: (Int) -> Unit,
+    onLibraryScroll: (Int, Int) -> Unit,
     onSetTab: (String) -> Unit,
     onSetGeneratedTab: (String) -> Unit,
     onSetPageColumns: (String, Int) -> Unit,
@@ -5401,37 +5539,11 @@ private fun GalleryScreen(
 ) {
     val lang = state.settings.language
     val density = LocalDensity.current
-    val view = LocalView.current
-    DisposableEffect(Unit) {
-        val window = (view.context as? Activity)?.window
-        val oldStatusBarColor = window?.statusBarColor
-        val oldSystemUiVisibility = window?.decorView?.systemUiVisibility
-        if (Build.VERSION.SDK_INT >= 21) {
-            window?.statusBarColor = Color.TRANSPARENT
-        }
-        if (Build.VERSION.SDK_INT >= 23) {
-            window?.decorView?.systemUiVisibility =
-                (oldSystemUiVisibility ?: 0) or
-                    android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                    android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-                    android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-        }
-        onDispose {
-            if (Build.VERSION.SDK_INT >= 21 && oldStatusBarColor != null) {
-                window?.statusBarColor = oldStatusBarColor
-            }
-            if (Build.VERSION.SDK_INT >= 23 && oldSystemUiVisibility != null) {
-                window?.decorView?.systemUiVisibility = oldSystemUiVisibility
-            }
-        }
-    }
     var lastPinchAt by remember { mutableStateOf(0L) }
     var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     var generatedSelectionActions by remember { mutableStateOf<GeneratedSelectionActionsState?>(null) }
     val systemItems = remember(state.photos) { state.photos.filterNot { it.generatedVirtual } }
-    val albumItems = remember(systemItems, state.selectedAlbumId) {
-        state.selectedAlbumId?.let { bucketId -> systemItems.filter { it.bucketId == bucketId } } ?: emptyList()
-    }
+    val albumItems = remember(systemItems, state.selectedAlbumId) { state.selectedAlbumId?.let { id -> systemItems.filter { it.bucketId == id } } ?: emptyList() }
     val visibleItems = remember(systemItems, albumItems, state.homeTab, state.selectedAlbumId) {
         if (state.homeTab == "albums" && state.selectedAlbumId != null) albumItems else systemItems
     }
@@ -5439,265 +5551,124 @@ private fun GalleryScreen(
     val visibleScopeKeys = remember(visibleItems, state.homeTab, state.selectedAlbumId) {
         if (state.homeTab == "generated") emptyList() else visibleItems.map { it.cacheKey }
     }
-    val selectedIndexes = remember(selectedKeys, photoIndexByKey) {
-        if (selectedKeys.isEmpty()) emptyList() else selectedKeys.mapNotNull { photoIndexByKey[it] }
-    }
-    val allGridState = rememberLazyGridState(
-        initialFirstVisibleItemIndex = state.galleryScrollIndex.coerceAtLeast(0),
-        initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
-    )
+    val selectedIndexes = remember(selectedKeys, photoIndexByKey) { selectedKeys.mapNotNull { photoIndexByKey[it] } }
+    val allGridState = rememberLazyGridState(state.galleryScrollIndex.coerceAtLeast(0), state.galleryScrollOffset.coerceAtLeast(0))
     val albumListGridState = rememberLazyGridState()
-    val albumDetailGridState = rememberLazyGridState(
-        initialFirstVisibleItemIndex = state.galleryScrollIndex.coerceAtLeast(0),
-        initialFirstVisibleItemScrollOffset = state.galleryScrollOffset.coerceAtLeast(0),
-    )
+    val albumDetailGridState = rememberLazyGridState(state.galleryScrollIndex.coerceAtLeast(0), state.galleryScrollOffset.coerceAtLeast(0))
     val gridState = if (state.homeTab == "albums" && state.selectedAlbumId != null) albumDetailGridState else allGridState
-    val timelineColumns = if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns
-    var topBarHeightPx by remember { mutableStateOf(0) }
-    val topContentPadding = with(density) { topBarHeightPx.toDp() }
-    val topBarStatusText = if (state.homeTab == "generated" && state.selectedGeneratedVersion != null) {
-        state.selectedGeneratedVersion
-    } else {
-        state.message?.let { lang.pickMixed(it) }
+    LaunchedEffect(gridState, state.homeTab, state.selectedAlbumId) {
+        snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
+            .debounce(180).collect { (index, offset) -> if (state.homeTab != "generated" && !(state.homeTab == "albums" && state.selectedAlbumId == null)) onLibraryScroll(index, offset) }
     }
-    val minTopListPadding = if (topBarStatusText != null) 128.dp else 104.dp
-    val topListPadding = if (topContentPadding < minTopListPadding) minTopListPadding else topContentPadding
-    val topBarScrollOffset = when {
-        state.homeTab == "generated" && state.generatedTab == "videos" -> state.generatedVideoScrollIndex * 240 + state.generatedVideoScrollOffset
-        state.homeTab == "generated" && state.selectedGeneratedVersion != null -> {
-            val version = state.selectedGeneratedVersion
-            (state.generatedVersionScrollIndexes[version] ?: 0) * 240 + (state.generatedVersionScrollOffsets[version] ?: 0)
-        }
-        state.homeTab == "generated" -> state.generatedImageScrollIndex * 240 + state.generatedImageScrollOffset
-        state.homeTab == "albums" && state.selectedAlbumId == null -> albumListGridState.firstVisibleItemIndex * 240 + albumListGridState.firstVisibleItemScrollOffset
-        else -> gridState.firstVisibleItemIndex * 240 + gridState.firstVisibleItemScrollOffset
-    }
-    val topBarOverlap = topBarScrollOffset.coerceAtLeast(0).toFloat()
-    val topBarAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
-        1f
-    } else {
-        (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.58f).coerceIn(0.42f, 1f)
-    }
-    val topBarControlsAlpha = if (topBarOverlap <= 0f || topBarHeightPx <= 0) {
-        1f
-    } else {
-        (1f - (topBarOverlap / topBarHeightPx.toFloat()).coerceIn(0f, 1f) * 0.42f).coerceIn(0.58f, 1f)
-    }
-    LaunchedEffect(state.homeTab) {
-        if (state.homeTab != "generated") generatedSelectionActions = null
-    }
-
-    Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xfff7f8f9))) {
-        Scaffold(
-            containerColor = androidx.compose.ui.graphics.Color.Transparent,
-            contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
-        ) { padding ->
-            if (state.loading) {
-                Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
-                }
-            } else if (state.homeTab == "generated") {
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .padding(padding),
-                ) {
-                    ManageScreen(
-                        state = state,
-                        embedded = true,
-                        onBack = {},
-                        selectedTab = state.generatedTab,
-                        onTabChange = onSetGeneratedTab,
-                        onToggleVersion = onToggleGeneratedVersion,
-                        onOpenVersion = onOpenGeneratedVersion,
-                        onCloseVersion = onCloseGeneratedVersion,
-                        contentTopPadding = topListPadding + 8.dp,
-                        onSetGeneratedColumns = { onSetPageColumns("generated", it) },
-                        onGeneratedScroll = onGeneratedScroll,
-                        onGeneratedVersionScroll = onGeneratedVersionScroll,
-                        onDeleteVersion = onDeleteVersion,
-                        onOpenGenerated = onOpenGenerated,
-                        onOpenGeneratedVideo = onOpenGeneratedVideo,
-                        onSaveVideo = onSaveVideo,
-                        onDeleteVideo = onDeleteVideo,
-                        onSaveVideos = onSaveVideos,
-                        onDeleteVideos = onDeleteVideos,
-                        onRegenerateVideos = onRegenerateVideos,
-                        onSaveImages = onSaveImages,
-                        onDeleteImages = onDeleteImages,
-                        onRegenerateImages = onRegenerateImages,
-                        onGeneratedSelectionChange = { generatedSelectionActions = it },
-                    )
-                }
-            } else if (state.homeTab == "albums" && state.selectedAlbumId == null) {
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .padding(padding),
-                ) {
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(state.albumListColumns),
-                        state = albumListGridState,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .discreteColumnPinch(
-                                columns = state.albumListColumns,
-                                onColumns = { onSetPageColumns("albumList", it) },
-                                onPinchActivity = { lastPinchAt = System.currentTimeMillis() },
-                            ),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, top = topListPadding + 14.dp, end = 14.dp, bottom = 14.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp),
-                        horizontalArrangement = Arrangement.spacedBy(14.dp),
-                    ) {
-                        items(state.albums, key = { it.bucketId }) { album ->
-                            AlbumTile(album = album, lang = lang, columns = state.albumListColumns, onClick = { onOpenAlbum(album.bucketId) })
-                        }
-                    }
-                    GridScrollbar(albumListGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                    GridToTopButton(albumListGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
-                }
-            } else {
-                TimelineGrid(
-                    items = visibleItems,
-                    state = state,
-                    lang = lang,
-                    gridState = gridState,
-                    columns = timelineColumns,
-                    selectedKeys = selectedKeys,
-                    onColumns = { nextColumns ->
-                        lastPinchAt = System.currentTimeMillis()
-                        onSetPageColumns(if (state.homeTab == "albums") "albumDetail" else "all", nextColumns)
-                    },
-                    onItemClick = { photo ->
-                        if (selectedKeys.isNotEmpty()) {
-                            selectedKeys = if (photo.cacheKey in selectedKeys) selectedKeys - photo.cacheKey else selectedKeys + photo.cacheKey
-                        } else {
-                            val index = state.photos.indexOfFirst { it.cacheKey == photo.cacheKey }
-                            if (index >= 0) {
-                                if (state.homeTab == "albums" || state.homeTab == "all") {
-                                    onOpenScoped(index, visibleScopeKeys, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
-                                } else {
-                                    onOpen(index, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
-                                }
-                            }
-                        }
-                    },
-                    onItemLongClick = { photo ->
-                        if (System.currentTimeMillis() - lastPinchAt > 700L) {
-                            selectedKeys = selectedKeys + photo.cacheKey
-                        }
-                    },
-                    onNearEnd = {
-                        when {
-                            state.homeTab == "albums" && state.selectedAlbumId != null -> onLoadMoreAlbum()
-                            state.homeTab == "all" -> onLoadMoreAll()
-                        }
-                    },
-                    footerText = if (state.homeTab == "albums" && state.selectedAlbumId != null) {
-                        val total = state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.count ?: visibleItems.size
-                        val loaded = visibleItems.size
-                        when {
-                            state.albumLoading -> lang.t("正在加载更多...", "Loading more...")
-                            loaded < total -> lang.t("已加载 $loaded/$total，继续下滑加载更多", "Loaded $loaded/$total; scroll for more")
-                            else -> lang.t("已加载全部 $loaded 项", "Loaded all $loaded items")
-                        }
-                    } else if (state.homeTab == "all") {
-                        when {
-                            state.allLoading -> lang.t("正在预取更多...", "Prefetching more...")
-                            !state.allExhausted -> lang.t("已加载 ${visibleItems.size} 项，继续下滑加载更多", "Loaded ${visibleItems.size} items; scroll for more")
-                            else -> lang.t("已加载全部 ${visibleItems.size} 项", "Loaded all ${visibleItems.size} items")
-                        }
-                    } else {
-                        null
-                    },
-                    contentTopPadding = topListPadding + 8.dp,
-                    modifier = Modifier.fillMaxSize().padding(padding),
-                )
+    val timelineColumns = studioColumns(if (state.homeTab == "albums" && state.selectedAlbumId != null) state.albumDetailColumns else state.allColumns)
+    val albumColumns = studioColumns(state.albumListColumns, cards = true)
+    var headerHeight by remember { mutableStateOf(0) }
+    var dockHeight by remember { mutableStateOf(0) }
+    val topPadding = with(density) { headerHeight.toDp() } + 8.dp
+    val bottomPadding = with(density) { dockHeight.toDp() } + 16.dp
+    val latestState by rememberUpdatedState(state)
+    val scrolled by remember(gridState, state.homeTab, state.selectedAlbumId, state.generatedTab, state.selectedGeneratedVersion) {
+        derivedStateOf {
+            when {
+                latestState.homeTab == "generated" && latestState.generatedTab == "videos" -> latestState.generatedVideoScrollIndex > 0 || latestState.generatedVideoScrollOffset > 0
+                latestState.homeTab == "generated" && latestState.selectedGeneratedVersion != null -> (latestState.generatedVersionScrollIndexes[latestState.selectedGeneratedVersion] ?: 0) > 0 || (latestState.generatedVersionScrollOffsets[latestState.selectedGeneratedVersion] ?: 0) > 0
+                latestState.homeTab == "generated" -> latestState.generatedImageScrollIndex > 0 || latestState.generatedImageScrollOffset > 0
+                state.homeTab == "albums" && state.selectedAlbumId == null -> albumListGridState.firstVisibleItemIndex > 0 || albumListGridState.firstVisibleItemScrollOffset > 0
+                else -> gridState.firstVisibleItemIndex > 0 || gridState.firstVisibleItemScrollOffset > 0
             }
         }
-        Column(
-            Modifier
-                .align(Alignment.TopCenter)
-                .fillMaxWidth()
-                .background(androidx.compose.ui.graphics.Color.White.copy(alpha = topBarAlpha))
-                .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-                .onSizeChanged { topBarHeightPx = it.height },
-        ) {
-                val generatedActions = generatedSelectionActions.takeIf { state.homeTab == "generated" }
-                if (selectedKeys.isEmpty() && generatedActions != null) {
-                    ManageSelectionActions(
-                        count = generatedActions.count,
-                        lang = lang,
-                        onClear = generatedActions.onClear,
-                        onSave = generatedActions.onSave,
-                        onRegenerate = generatedActions.onRegenerate,
-                        onDelete = generatedActions.onDelete,
-                    )
-                } else {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.graphicsLayer(alpha = topBarControlsAlpha),
-                    ) {
-                        if (selectedKeys.isEmpty()) {
-                            val title = when {
-                                state.homeTab == "albums" && state.selectedAlbumId != null -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Album")
-                                state.homeTab == "albums" -> lang.t("相册", "Albums")
-                                else -> lang.t("全部", "All")
-                            }
-                            if (state.homeTab == "albums" && state.selectedAlbumId != null) {
-                                OutlinedButton(onClick = onCloseAlbum) { Text(lang.t("返回", "Back")) }
-                                Spacer(Modifier.width(8.dp))
-                            }
-                            if (state.homeTab == "generated") {
-                                RoundedPillTabs(
-                                    options = listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")),
-                                    selected = state.generatedTab,
-                                    onSelect = onSetGeneratedTab,
-                                )
-                                Spacer(Modifier.weight(1f))
-                            } else {
-                                Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                            }
-                            OutlinedButton(onClick = onSettings) { Text(lang.t("设置", "Settings")) }
-                            Spacer(Modifier.width(8.dp))
-                            OutlinedButton(onClick = onRefresh) { Text(lang.t("刷新", "Refresh")) }
-                        } else {
-                            Text(lang.t("已选择 ${selectedKeys.size} 项", "${selectedKeys.size} selected"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                            OutlinedButton(onClick = { selectedKeys = emptySet() }) { Text(lang.t("取消", "Cancel")) }
-                            Spacer(Modifier.width(8.dp))
-                            Button(onClick = {
-                                onSaveGenerated(selectedIndexes)
-                                selectedKeys = emptySet()
-                            }) { Text(lang.t("保存", "Save")) }
-                            Spacer(Modifier.width(8.dp))
-                            Button(onClick = {
-                                onReplaceOriginal(selectedIndexes)
-                                selectedKeys = emptySet()
-                            }) { Text(lang.t("替换", "Replace")) }
+    }
+    LaunchedEffect(state.homeTab, state.selectedAlbumId) { selectedKeys = emptySet(); generatedSelectionActions = null }
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        when {
+            state.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    CircularProgressIndicator(); Text(lang.t("正在读取媒体与已有结果…", "Loading media and existing results…"))
+                }
+            }
+            state.homeTab == "generated" -> ManageScreen(
+                state = state, embedded = true, onBack = {}, selectedTab = state.generatedTab, onTabChange = onSetGeneratedTab,
+                onToggleVersion = onToggleGeneratedVersion, onOpenVersion = onOpenGeneratedVersion, onCloseVersion = onCloseGeneratedVersion,
+                contentTopPadding = topPadding, contentBottomPadding = bottomPadding,
+                onSetGeneratedColumns = { onSetPageColumns("generated", it) }, onGeneratedScroll = onGeneratedScroll,
+                onGeneratedVersionScroll = onGeneratedVersionScroll, onDeleteVersion = onDeleteVersion,
+                onOpenGenerated = onOpenGenerated, onOpenGeneratedVideo = onOpenGeneratedVideo,
+                onSaveVideo = onSaveVideo, onDeleteVideo = onDeleteVideo, onSaveVideos = onSaveVideos, onDeleteVideos = onDeleteVideos,
+                onRegenerateVideos = onRegenerateVideos, onSaveImages = onSaveImages, onDeleteImages = onDeleteImages,
+                onRegenerateImages = onRegenerateImages, onGeneratedSelectionChange = { generatedSelectionActions = it },
+            )
+            state.homeTab == "albums" && state.selectedAlbumId == null -> {
+                if (state.albums.isEmpty()) StudioEmptyState(lang.t("相册还没有内容", "No albums yet"), lang.t("添加可访问的媒体，或在系统设置中检查图片和视频权限。", "Add accessible media or review image and video permissions in system settings."), Modifier.padding(top = topPadding).verticalScroll(rememberScrollState()))
+                LazyVerticalGrid(columns = GridCells.Fixed(albumColumns), state = albumListGridState,
+                    modifier = Modifier.fillMaxSize().discreteColumnPinch(albumColumns, { onSetPageColumns("albumList", it) }, { lastPinchAt = System.currentTimeMillis() }),
+                    contentPadding = PaddingValues(start = 16.dp, top = topPadding, end = 16.dp, bottom = bottomPadding),
+                    verticalArrangement = Arrangement.spacedBy(20.dp), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                    items(state.albums, key = { it.bucketId }) { album -> AlbumTile(album, lang, albumColumns) { onOpenAlbum(album.bucketId) } }
+                }
+                GridToTopButton(albumListGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = bottomPadding))
+            }
+            visibleItems.isEmpty() -> StudioEmptyState(lang.t("还没有可显示的媒体", "Nothing to show yet"),
+                lang.t("可以只授权选定媒体。添加图片或视频后刷新；授权范围可在系统设置中修改。", "Selected-media access is supported. Add an image or video and refresh, or change access in system settings."),
+                Modifier.padding(top = topPadding, bottom = bottomPadding).verticalScroll(rememberScrollState())) {
+                    OutlinedButton(onClick = onRefresh) { Text(lang.t("重新读取", "Refresh media")) }
+                }
+            else -> TimelineGrid(
+                items = visibleItems, state = state, lang = lang, gridState = gridState, columns = timelineColumns, selectedKeys = selectedKeys,
+                onColumns = { lastPinchAt = System.currentTimeMillis(); onSetPageColumns(if (state.homeTab == "albums") "albumDetail" else "all", it) },
+                onItemClick = { photo ->
+                    if (selectedKeys.isNotEmpty()) selectedKeys = if (photo.cacheKey in selectedKeys) selectedKeys - photo.cacheKey else selectedKeys + photo.cacheKey
+                    else {
+                        val index = photoIndexByKey[photo.cacheKey] ?: -1
+                        if (index >= 0) onOpenScoped(index, visibleScopeKeys, gridState.firstVisibleItemIndex, gridState.firstVisibleItemScrollOffset)
+                    }
+                },
+                onItemLongClick = { if (System.currentTimeMillis() - lastPinchAt > 700L) selectedKeys = selectedKeys + it.cacheKey },
+                onNearEnd = { if (state.homeTab == "albums" && state.selectedAlbumId != null) onLoadMoreAlbum() else if (state.homeTab == "all") onLoadMoreAll() },
+                footerText = when {
+                    (state.homeTab == "albums" && state.albumLoading) || (state.homeTab == "all" && state.allLoading) -> lang.t("正在加载更多…", "Loading more…")
+                    else -> lang.t("已显示 ${visibleItems.size} 项 · 继续滑动浏览", "${visibleItems.size} items · keep scrolling")
+                },
+                contentTopPadding = topPadding, contentBottomPadding = bottomPadding,
+            )
+        }
+        Surface(Modifier.align(Alignment.TopCenter).fillMaxWidth().onSizeChanged { headerHeight = it.height },
+            color = MaterialTheme.colorScheme.surface.copy(alpha = if (scrolled) 0.90f else 1f), tonalElevation = if (scrolled) 3.dp else 0.dp) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+                val actions = generatedSelectionActions.takeIf { state.homeTab == "generated" }
+                when {
+                    actions != null -> ManageSelectionActions(actions.count, lang, actions.onClear, actions.onSave, actions.onRegenerate, actions.onDelete)
+                    selectedKeys.isNotEmpty() -> {
+                        StudioTopBar(lang.t("已选 ${selectedKeys.size} 项", "${selectedKeys.size} selected"), { selectedKeys = emptySet() }) {
+                            StudioIcon(Icons.Default.SaveAlt, lang.t("保存", "Save"), { onSaveGenerated(selectedIndexes); selectedKeys = emptySet() })
+                            StudioIcon(Icons.Default.FindReplace, lang.t("替换原图", "Replace originals"), { onReplaceOriginal(selectedIndexes); selectedKeys = emptySet() })
+                        }
+                    }
+                    else -> {
+                        val title = when (state.homeTab) {
+                            "albums" -> state.albums.firstOrNull { it.bucketId == state.selectedAlbumId }?.name ?: lang.t("相册", "Albums")
+                            "generated" -> lang.t("生成", "Generated")
+                            else -> lang.t("图库", "Library")
+                        }
+                        val back: (() -> Unit)? = when {
+                            state.homeTab == "albums" && state.selectedAlbumId != null -> onCloseAlbum
+                            state.homeTab == "generated" && state.selectedGeneratedVersion != null -> onCloseGeneratedVersion
+                            else -> null
+                        }
+                        StudioTopBar(title, back) {
+                            StudioIcon(Icons.Default.Tune, lang.t("任务与状态", "Tasks & status"), onTasks)
+                            StudioIcon(Icons.Default.Refresh, lang.t("刷新", "Refresh"), onRefresh)
+                            StudioIcon(Icons.Default.Settings, lang.t("设置", "Settings"), onSettings)
+                        }
+                        if (state.homeTab == "generated") {
+                            RoundedPillTabs(listOf("images" to lang.t("图片", "Images"), "videos" to lang.t("视频", "Videos")), state.generatedTab, onSetGeneratedTab)
+                            state.selectedGeneratedVersion?.let { Text(it, Modifier.padding(8.dp), style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis) }
                         }
                     }
                 }
-                topBarStatusText?.let {
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = it,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.graphicsLayer(alpha = topBarControlsAlpha),
-                    )
-                }
             }
-        HomeBottomNav(
-            current = state.homeTab,
-            lang = lang,
-            onSelect = {
-                selectedKeys = emptySet()
-                onSetTab(it)
-            },
-            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
-        )
+        }
+        HomeBottomNav(state.homeTab, lang, { selectedKeys = emptySet(); onSetTab(it) },
+            Modifier.align(Alignment.BottomCenter).onSizeChanged { dockHeight = it.height; onDockHeight(it.height) }.padding(12.dp))
     }
 }
 
@@ -5716,6 +5687,7 @@ private fun TimelineGrid(
     onNearEnd: () -> Unit,
     footerText: String?,
     contentTopPadding: androidx.compose.ui.unit.Dp = 8.dp,
+    contentBottomPadding: androidx.compose.ui.unit.Dp = 96.dp,
     modifier: Modifier = Modifier,
 ) {
     val restoreRenderLimit = min(items.size, max(1200, gridState.firstVisibleItemIndex + 400))
@@ -5759,7 +5731,7 @@ private fun TimelineGrid(
             modifier = Modifier
                 .fillMaxSize()
                 .discreteColumnPinch(columns = columns, onColumns = onColumns),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 8.dp, top = contentTopPadding, end = 8.dp, bottom = 8.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 8.dp, top = contentTopPadding, end = 8.dp, bottom = contentBottomPadding),
             verticalArrangement = Arrangement.spacedBy(3.dp),
             horizontalArrangement = Arrangement.spacedBy(3.dp),
         ) {
@@ -5803,14 +5775,14 @@ private fun TimelineGrid(
                     is TimelineCell.Footer -> Text(
                         text = cell.text ?: lang.t("已显示 ${cell.loaded}/${cell.total}，继续下滑自动加载更多", "Showing ${cell.loaded}/${cell.total}; keep scrolling to load more"),
                         style = MaterialTheme.typography.bodySmall,
-                        color = androidx.compose.ui.graphics.Color(0xff777777),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.fillMaxWidth().padding(14.dp),
                     )
                 }
             }
         }
         GridScrollbar(gridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-        GridToTopButton(gridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+        GridToTopButton(gridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
     }
 }
 
@@ -5820,7 +5792,8 @@ private fun GridToTopButton(
     lang: AppLanguage,
     modifier: Modifier = Modifier,
 ) {
-    if (gridState.firstVisibleItemIndex <= 18) return
+    val show by remember(gridState) { derivedStateOf { gridState.firstVisibleItemIndex > 18 } }
+    if (!show) return
     val scope = rememberCoroutineScope()
     Button(
         onClick = { scope.launch { gridState.animateScrollToItem(0) } },
@@ -5841,13 +5814,13 @@ private fun AlbumTile(album: AlbumItem, lang: AppLanguage, columns: Int, onClick
             Modifier
                 .fillMaxWidth()
                 .aspectRatio(1.25f)
-                .background(androidx.compose.ui.graphics.Color(0xffe8eaed), RoundedCornerShape(18.dp)),
+                .clip(RoundedCornerShape(20.dp)).background(MaterialTheme.colorScheme.surfaceVariant),
         ) {
             AsyncMediaThumbnail(album.coverKind, album.coverUri, 420, ContentScale.Crop, Modifier.fillMaxSize())
         }
         Spacer(Modifier.height(textGap))
         Text(album.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold, fontSize = titleSize)
-        Text(lang.t("${album.count} 项", "${album.count} items"), color = androidx.compose.ui.graphics.Color(0xff777777), fontSize = countSize, maxLines = 1)
+        Text(lang.t("${album.count} 项", "${album.count} items"), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = countSize, maxLines = 1)
     }
 }
 
@@ -5907,32 +5880,21 @@ private fun GridScrollbar(
 
 @Composable
 private fun HomeBottomNav(current: String, lang: AppLanguage, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
-    Row(
-        modifier = modifier
-            .background(androidx.compose.ui.graphics.Color(0xccffffff), RoundedCornerShape(34.dp))
-            .padding(6.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        listOf(
-            "all" to lang.t("全部", "All"),
-            "albums" to lang.t("相册", "Albums"),
-            "generated" to lang.t("生成", "Generated"),
-        ).forEach { (key, label) ->
-            val selected = key == current
-            Surface(
-                color = if (selected) androidx.compose.ui.graphics.Color(0xcc6650a4) else androidx.compose.ui.graphics.Color.Transparent,
-                shape = RoundedCornerShape(28.dp),
-                modifier = Modifier
-                    .clip(RoundedCornerShape(28.dp))
-                    .clickable { onSelect(key) },
-            ) {
-                Text(
-                    text = label,
-                    color = if (selected) androidx.compose.ui.graphics.Color.White else androidx.compose.ui.graphics.Color(0xff333333),
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
-                )
+    Surface(modifier.widthIn(max = 560.dp).fillMaxWidth(), shape = RoundedCornerShape(28.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh, tonalElevation = 6.dp, shadowElevation = 8.dp) {
+        Row(Modifier.padding(6.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            listOf(Triple("all", lang.t("全部", "All"), Icons.Default.PhotoLibrary),
+                Triple("albums", lang.t("相册", "Albums"), Icons.Default.FolderOpen),
+                Triple("generated", lang.t("生成", "Generated"), Icons.Default.AutoAwesome)).forEach { (key, label, icon) ->
+                val active = key == current
+                Surface(onClick = { onSelect(key) }, modifier = Modifier.weight(1f).semantics { selected = active; role = Role.Tab }, shape = RoundedCornerShape(22.dp),
+                    color = if (active) MaterialTheme.colorScheme.primaryContainer else androidx.compose.ui.graphics.Color.Transparent,
+                    contentColor = if (active) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant) {
+                    Column(Modifier.padding(horizontal = 6.dp, vertical = 10.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Icon(icon, null, Modifier.size(22.dp))
+                        Text(label, style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal)
+                    }
+                }
             }
         }
     }
@@ -5945,31 +5907,7 @@ private fun RoundedPillTabs(
     onSelect: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Row(
-        modifier = modifier
-            .background(androidx.compose.ui.graphics.Color(0xccffffff), RoundedCornerShape(28.dp))
-            .padding(3.dp),
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        options.forEach { (key, label) ->
-            val active = key == selected
-            Surface(
-                color = if (active) androidx.compose.ui.graphics.Color(0x99e9ddff) else androidx.compose.ui.graphics.Color.Transparent,
-                shape = RoundedCornerShape(24.dp),
-                modifier = Modifier
-                    .clip(RoundedCornerShape(24.dp))
-                    .clickable { onSelect(key) },
-            ) {
-                Text(
-                    text = label,
-                    color = if (active) androidx.compose.ui.graphics.Color(0xff3f2a78) else androidx.compose.ui.graphics.Color(0xff333333),
-                    fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp),
-                )
-            }
-        }
-    }
+    StudioOptions(options, selected, onSelect, modifier)
 }
 
 private fun Modifier.discreteColumnPinch(
@@ -6024,7 +5962,7 @@ private fun PhotoTile(
     onLongClick: () -> Unit,
 ) {
     val compact = columns >= 7
-    val labelSize = (14 - columnFontReduction(columns)).coerceAtLeast(8).sp
+    val labelSize = 12.sp
     val playSize = (20 - columnFontReduction(columns)).coerceAtLeast(10).sp
     val labelPaddingH = if (compact) 3.dp else 5.dp
     val labelPaddingV = if (compact) 1.dp else 2.dp
@@ -6032,7 +5970,8 @@ private fun PhotoTile(
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(1f)
-            .background(androidx.compose.ui.graphics.Color(0xff16191c))
+            .semantics { contentDescription = photo.displayName }
+            .clip(RoundedCornerShape(16.dp)).background(androidx.compose.ui.graphics.Color(0xff16191c))
             .combinedClickable(
                 onClick = onClick,
                 onLongClick = onLongClick,
@@ -6086,6 +6025,7 @@ private fun StatusBadge(
         maxLines = maxLines,
         overflow = TextOverflow.Ellipsis,
         modifier = modifier
+            .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.64f), RoundedCornerShape(8.dp))
             .padding(horizontal = horizontalPadding, vertical = verticalPadding),
     )
 }
@@ -6102,6 +6042,7 @@ private fun ManageScreen(
     onOpenVersion: (String) -> Unit,
     onCloseVersion: () -> Unit,
     contentTopPadding: androidx.compose.ui.unit.Dp = 0.dp,
+    contentBottomPadding: androidx.compose.ui.unit.Dp = 96.dp,
     onSetGeneratedColumns: (Int) -> Unit,
     onGeneratedScroll: (String, Int, Int) -> Unit,
     onGeneratedVersionScroll: (String, Int, Int) -> Unit,
@@ -6132,7 +6073,7 @@ private fun ManageScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
+            .background(MaterialTheme.colorScheme.background)
             .then(if (embedded) Modifier else Modifier.statusBarsPadding())
             .padding(
                 if (embedded) {
@@ -6201,24 +6142,23 @@ private fun ManageScreen(
                 Spacer(Modifier.height(8.dp))
             }
             if (videos.isEmpty()) {
-                Text(
-                    text = lang.t("暂无生成中或已生成的视频", "No generating or generated videos"),
-                    modifier = Modifier.padding(top = if (embedded) contentTopPadding else 0.dp),
-                )
+                StudioEmptyState(lang.t("视频创作，从一段素材开始", "Start with a video"),
+                    lang.t("在所属相册打开视频，手动加入独立 VR 队列；完成、暂停和失败的任务都会在这里显示。", "Open a video in its album and explicitly add it to the VR queue. Completed, paused and failed tasks appear here."),
+                    Modifier.padding(top = if (embedded) contentTopPadding else 0.dp, bottom = contentBottomPadding).verticalScroll(rememberScrollState()))
             } else {
                 Box(Modifier.fillMaxSize()) {
                     LazyVerticalGrid(
-                        columns = GridCells.Fixed(state.generatedColumns),
+                        columns = GridCells.Fixed(studioColumns(state.generatedColumns)),
                         state = videoGridState,
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(androidx.compose.ui.graphics.Color.White)
-                            .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns),
+                            .background(MaterialTheme.colorScheme.background)
+                            .discreteColumnPinch(columns = studioColumns(state.generatedColumns), onColumns = onSetGeneratedColumns),
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(
                             start = 8.dp,
                             top = if (embedded) contentTopPadding else 8.dp,
                             end = 8.dp,
-                            bottom = 8.dp,
+                            bottom = contentBottomPadding,
                         ),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -6230,7 +6170,7 @@ private fun ManageScreen(
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .background(androidx.compose.ui.graphics.Color(0xff16191c)),
+                                    .clip(RoundedCornerShape(16.dp)).background(androidx.compose.ui.graphics.Color(0xff16191c)),
                             ) {
                                 Box(
                                     modifier = Modifier
@@ -6251,8 +6191,12 @@ private fun ManageScreen(
                                     AsyncMediaThumbnail(MediaKind.VIDEO, state.videoEntries[item.cacheKey]?.let { Uri.fromFile(File(it.outputPath)) } ?: item.uri, 420, ContentScale.Crop, Modifier.fillMaxSize())
                                     if (item.cacheKey in selectedVideoKeys) SelectionBadge()
                                     StatusBadge(
-                                        text = "${videoState.shortLabel(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}% 当前${job?.currentFrameMs ?: 0}ms 均${job?.avgFrameMs ?: 0}ms",
-                                        fontSize = (10 - columnFontReduction(state.generatedColumns)).coerceAtLeast(7).sp,
+                                        text = when (videoState) {
+                                            VideoVrState.READY, VideoVrState.FAILED -> videoState.shortLabel(lang)
+                                            else -> "${videoState.shortLabel(lang)} ${(job?.progress?.times(100f) ?: 0f).roundToInt()}%" +
+                                                if (videoState == VideoVrState.GENERATING) " · frame ${job?.currentFrameMs ?: 0}ms · avg ${job?.avgFrameMs ?: 0}ms" else ""
+                                        },
+                                        fontSize = 12.sp,
                                         modifier = Modifier.align(Alignment.BottomStart),
                                         horizontalPadding = 2.dp,
                                         verticalPadding = 1.dp,
@@ -6262,7 +6206,7 @@ private fun ManageScreen(
                         }
                     }
                     GridScrollbar(videoGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                    GridToTopButton(videoGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+                    GridToTopButton(videoGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
                 }
             }
         } else {
@@ -6270,10 +6214,9 @@ private fun ManageScreen(
                 LaunchedEffect(embedded) {
                     if (embedded) onGeneratedSelectionChange(null)
                 }
-                Text(
-                    text = lang.t("暂无已生成图片", "No generated images yet"),
-                    modifier = Modifier.padding(top = if (embedded) contentTopPadding else 0.dp),
-                )
+                StudioEmptyState(lang.t("第一张立体作品，等你开始", "Your first stereo creation awaits"),
+                    lang.t("从全部或相册打开图片开始 VR。已有结果会按参数版本保留在这里；本页不会自动新增图片任务。", "Open an image from All or an album to start VR. Existing results are grouped here by parameter version. This page never automatically adds image jobs."),
+                    Modifier.padding(top = if (embedded) contentTopPadding else 0.dp, bottom = contentBottomPadding).verticalScroll(rememberScrollState()))
             } else {
                 val selectedVersion = state.selectedGeneratedVersion
                 if (selectedVersion == null) {
@@ -6290,17 +6233,17 @@ private fun ManageScreen(
                     }
                     Box(Modifier.fillMaxSize()) {
                         LazyVerticalGrid(
-                            columns = GridCells.Fixed(state.generatedColumns.coerceIn(2, 6)),
+                            columns = GridCells.Fixed(studioColumns(state.generatedColumns, cards = true)),
                             state = versionGridState,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .background(androidx.compose.ui.graphics.Color.White)
-                                .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns),
+                                .background(MaterialTheme.colorScheme.background)
+                                .discreteColumnPinch(columns = studioColumns(state.generatedColumns), onColumns = onSetGeneratedColumns),
                             contentPadding = androidx.compose.foundation.layout.PaddingValues(
                                 start = 10.dp,
                                 top = if (embedded) contentTopPadding else 10.dp,
                                 end = 10.dp,
-                                bottom = 10.dp,
+                                bottom = contentBottomPadding,
                             ),
                             verticalArrangement = Arrangement.spacedBy(14.dp),
                             horizontalArrangement = Arrangement.spacedBy(14.dp),
@@ -6318,7 +6261,7 @@ private fun ManageScreen(
                             }
                         }
                         GridScrollbar(versionGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                        GridToTopButton(versionGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+                        GridToTopButton(versionGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
                     }
                 } else {
                     val itemsInVersion = state.managedCacheItems.filter { it.entry.version == selectedVersion }
@@ -6378,17 +6321,17 @@ private fun ManageScreen(
                         }
                         Box(Modifier.fillMaxSize()) {
                             LazyVerticalGrid(
-                                columns = GridCells.Fixed(state.generatedColumns),
+                                columns = GridCells.Fixed(studioColumns(state.generatedColumns)),
                                 state = imageGridState,
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .background(androidx.compose.ui.graphics.Color.White)
-                                    .discreteColumnPinch(columns = state.generatedColumns, onColumns = onSetGeneratedColumns),
+                                    .background(MaterialTheme.colorScheme.background)
+                                    .discreteColumnPinch(columns = studioColumns(state.generatedColumns), onColumns = onSetGeneratedColumns),
                                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
                                     start = 8.dp,
                                     top = if (embedded) contentTopPadding else 8.dp,
                                     end = 8.dp,
-                                    bottom = 8.dp,
+                                    bottom = contentBottomPadding,
                                 ),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -6400,7 +6343,8 @@ private fun ManageScreen(
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .aspectRatio(1f)
-                                            .background(androidx.compose.ui.graphics.Color(0xff16191c))
+                                            .semantics { contentDescription = item.photoItem.displayName }
+                                            .clip(RoundedCornerShape(16.dp)).background(androidx.compose.ui.graphics.Color(0xff16191c))
                                             .combinedClickable(
                                                 enabled = index >= 0,
                                                 onClick = {
@@ -6419,7 +6363,7 @@ private fun ManageScreen(
                                 }
                             }
                             GridScrollbar(imageGridState, Modifier.align(Alignment.CenterEnd).padding(end = 2.dp))
-                            GridToTopButton(imageGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = 18.dp))
+                            GridToTopButton(imageGridState, lang, Modifier.align(Alignment.BottomEnd).padding(end = 26.dp, bottom = contentBottomPadding))
                         }
                     }
                 }
@@ -6446,8 +6390,8 @@ private fun GeneratedVersionTile(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(1f)
-                .background(androidx.compose.ui.graphics.Color(0xff16191c), RoundedCornerShape(6.dp))
-                .clip(RoundedCornerShape(6.dp)),
+                .background(androidx.compose.ui.graphics.Color(0xff16191c), RoundedCornerShape(20.dp))
+                .clip(RoundedCornerShape(20.dp)),
         ) {
             if (cover != null) {
                 GeneratedSbsThumbnail(File(cover.entry.outputPath), 420, ContentScale.Crop, Modifier.fillMaxSize(), lang)
@@ -6470,7 +6414,7 @@ private fun GeneratedVersionTile(
         Spacer(Modifier.height(6.dp))
         Text(
             text = summary.version,
-            color = androidx.compose.ui.graphics.Color(0xff222222),
+            color = MaterialTheme.colorScheme.onSurface,
             fontWeight = FontWeight.Bold,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
@@ -6478,7 +6422,7 @@ private fun GeneratedVersionTile(
         Text(
             text = lang.t("${(summary.bytes / 1024f / 1024f).roundToInt()} MB，长按删除", "${(summary.bytes / 1024f / 1024f).roundToInt()} MB, long press delete"),
             style = MaterialTheme.typography.bodySmall,
-            color = androidx.compose.ui.graphics.Color(0xff666666),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -6516,16 +6460,10 @@ private fun ManageSelectionActions(
     onRegenerate: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth().background(androidx.compose.ui.graphics.Color.White).padding(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Text(lang.t("已选 $count", "$count selected"), modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold)
-        OutlinedButton(onClick = onClear) { Text(lang.t("取消", "Cancel")) }
-        OutlinedButton(onClick = onSave) { Text(lang.t("保存", "Save")) }
-        OutlinedButton(onClick = onRegenerate) { Text(lang.t("重新生成", "Regenerate")) }
-        Button(onClick = onDelete) { Text(lang.t("删除", "Delete")) }
+    StudioTopBar(lang.t("已选 $count", "$count selected"), onClear) {
+        StudioIcon(Icons.Default.SaveAlt, lang.t("保存", "Save"), onSave)
+        StudioIcon(Icons.Default.Refresh, lang.t("重新生成", "Regenerate"), onRegenerate)
+        StudioIcon(Icons.Default.DeleteOutline, lang.t("删除", "Delete"), onDelete)
     }
 }
 
@@ -6552,177 +6490,77 @@ private fun SettingsScreen(
     updateApkPath: String?,
     onBack: () -> Unit,
     onChange: (AppSettings) -> Unit,
+    onGuide: () -> Unit,
+    onPermissions: () -> Unit,
     onCheckUpdate: () -> Unit,
     onDownloadUpdate: () -> Unit,
     onInstallUpdate: () -> Unit,
 ) {
     val lang = settings.language
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(androidx.compose.ui.graphics.Color(0xfff5f6f7))
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text(lang.t("返回", "Back")) }
-            Spacer(Modifier.width(12.dp))
-            Text(lang.t("设置", "Settings"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        }
-        Spacer(Modifier.height(16.dp))
-
-        SettingsSectionTitle(lang.t("公共设置", "General"))
-        Text(lang.t("语言", "Language"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        SingleChoiceSegmentedButtonRow {
-            listOf(AppLanguage.ZH to "中文", AppLanguage.EN to "English").forEachIndexed { index, option ->
-                SegmentedButton(
-                    selected = settings.language == option.first,
-                    onClick = { onChange(settings.copy(language = option.first)) },
-                    shape = SegmentedButtonDefaults.itemShape(index, 2),
-                ) { Text(option.second) }
+    val context = LocalContext.current
+    Scaffold(containerColor = MaterialTheme.colorScheme.background, contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
+        topBar = { StudioTopBar(lang.t("设置", "Settings"), onBack) { StudioIcon(Icons.AutoMirrored.Filled.HelpOutline, lang.t("使用指南", "Getting started"), onGuide) } }) { padding ->
+        Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.TopCenter) {
+            Column(Modifier.widthIn(max = 840.dp).fillMaxHeight().verticalScroll(rememberScrollState()).imePadding().padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                StudioSection(lang.t("开始与访问", "Getting started & access")) {
+                    Text(lang.t("本地媒体，本地创作。普通图片开启 VR 后会预加载同一来源；视频始终独立排队。", "Local media, local creation. Image VR preloads within its source; videos always use a separate queue."), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    OutlinedButton(onClick = onGuide) { Text(lang.t("查看使用指南", "Open guide")) }
+                    val access = when {
+                        Build.VERSION.SDK_INT >= 34 && ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED && ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED -> lang.t("当前：选定媒体访问", "Current access: selected media")
+                        hasImagePermission(context) -> lang.t("当前：已获媒体访问权限", "Media access granted")
+                        else -> lang.t("当前：未获图片访问权限", "Image access not granted")
+                    }
+                    Text(access, style = MaterialTheme.typography.bodySmall)
+                    OutlinedButton(onClick = onPermissions) { Text(lang.t("调整媒体授权", "Manage media access")) }
+                    OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))) }) {
+                        Text(lang.t("系统权限与通知", "System permissions & notifications"))
+                    }
+                }
+                StudioSection(lang.t("应用与更新", "App & updates")) {
+                    StudioOptions(listOf("ZH" to "中文", "EN" to "English"), settings.language.name, { onChange(settings.copy(language = AppLanguage.valueOf(it))) })
+                    Text("$CURRENT_VERSION_TAG · $CURRENT_VERSION_CODE", style = MaterialTheme.typography.bodyMedium)
+                    OutlinedButton(onClick = onCheckUpdate, enabled = !updateDownloading) { Text(lang.t("检查更新", "Check for updates")) }
+                    updateStatus?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+                    if (updateDownloading) LinearProgressIndicator(progress = { updateDownloadProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                    if (updateAvailable && updateApkPath == null && !updateDownloading && updateUrl != null) Button(onClick = onDownloadUpdate) { Text(lang.t("下载更新", "Download update")) }
+                    if (updateApkPath != null && !updateDownloading) Button(onClick = onInstallUpdate) { Text(lang.t("安装更新", "Install update")) }
+                }
+                StudioSection(lang.t("立体效果", "Stereo look")) {
+                    SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) { onChange(settings.copy(depthScale = it)) }
+                    SettingInt(lang.t("深度平滑", "Depth smoothing"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) { onChange(settings.copy(blurRadius = it)) }
+                    SettingInt(lang.t("边缘填充", "Edge fill"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) { onChange(settings.copy(fillRadius = it)) }
+                    SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) { onChange(settings.copy(maxLongEdge = it)) }
+                    StudioToggle(lang.t("反转深度", "Invert depth"), settings.invertDepth) { onChange(settings.copy(invertDepth = it)) }
+                }
+                StudioSection(lang.t("图片生成", "Image generation")) {
+                    ModelPicker(lang.t("模型", "Model"), settings.imageModelId, lang, ImageModels) { onChange(settings.copy(imageModelId = it.id, depthResolution = it.inputSize)) }
+                    Text(lang.t("前后预加载窗口", "Neighbour prefetch window"), fontWeight = FontWeight.SemiBold)
+                    StudioOptions(listOf("auto" to lang.t("自动 2 → 4 → 8", "Auto 2 → 4 → 8"), "2" to "2", "4" to "4", "8" to "8"),
+                        if (settings.autoPrefetch) "auto" else settings.prefetchWindow.toString(), {
+                            if (it == "auto") onChange(settings.copy(autoPrefetch = true, prefetchWindow = 2))
+                            else onChange(settings.copy(autoPrefetch = false, prefetchWindow = it.toInt()))
+                        })
+                    SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) { onChange(settings.copy(generationWorkers = it)) }
+                    SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(modelThreads = it)) }
+                    StudioToggle(lang.t("强制 GPU 加速", "Force GPU acceleration"), settings.useGpu) { onChange(settings.copy(useGpu = it)) }
+                    GpuModePicker(settings.gpuTestMode, lang) { onChange(settings.copy(gpuTestMode = it)) }
+                    Text(lang.t("开启后强制使用所选 GPU 模式，失败不回退 CPU；关闭才使用 CPU。", "The selected GPU mode is forced. Failure does not fall back to CPU. Disable GPU to use CPU."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                StudioSection(lang.t("视频生成", "Video generation")) {
+                    ModelPicker(lang.t("模型", "Model"), settings.videoModelId, lang, VideoModels) { onChange(settings.copy(videoModelId = it.id)) }
+                    SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.videoModelThreads, listOf(1, 2, 4, 8)) { onChange(settings.copy(videoModelThreads = it)) }
+                    SettingInt(lang.t("深度 worker 数", "Depth workers"), settings.videoDepthWorkers, listOf(1, 2)) { onChange(settings.copy(videoDepthWorkers = it)) }
+                    StudioToggle(lang.t("视频强制 GPU 加速", "Force GPU for video"), settings.videoUseGpu) { onChange(settings.copy(videoUseGpu = it)) }
+                    Text(lang.t("视频设置独立。双 worker 使用更多内存与显存；视频需手动加入队列。", "Video settings are independent. Two workers use more memory; video generation must be explicitly queued."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                StudioSection(lang.t("模型说明", "About models")) {
+                    val image = modelSpec(settings.imageModelId); val video = modelSpec(settings.videoModelId)
+                    Text(lang.t("图片 ${image.inputSize} × ${image.inputSize}；视频 ${video.inputSize} × ${video.inputSize}。输入尺寸由模型固定。", "Image ${image.inputSize} × ${image.inputSize}; video ${video.inputSize} × ${video.inputSize}. Model inputs have fixed sizes."))
+                    Text(lang.t("Qualcomm 实验模型下载源曾返回 404；Video Depth Anything 尚无可运行移动端资产。稳定模型仍可使用。", "The experimental Qualcomm source previously returned 404. Video Depth Anything has no runnable mobile asset yet. The stable model remains available."), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(Modifier.height(8.dp))
             }
-        }
-        Spacer(Modifier.height(16.dp))
-
-        OutlinedButton(onClick = onCheckUpdate) {
-            Text(lang.t("检查更新", "Check for updates"))
-        }
-        Spacer(Modifier.height(6.dp))
-        Text(
-            text = lang.t(
-                "当前版本：$CURRENT_VERSION_TAG ($CURRENT_VERSION_CODE)",
-                "Current version: $CURRENT_VERSION_TAG ($CURRENT_VERSION_CODE)",
-            ),
-            style = MaterialTheme.typography.bodySmall,
-        )
-        updateStatus?.let {
-            Spacer(Modifier.height(6.dp))
-            Text(it, style = MaterialTheme.typography.bodySmall)
-        }
-        if (updateDownloading) {
-            Spacer(Modifier.height(6.dp))
-            LinearProgressIndicator(progress = { updateDownloadProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
-        }
-        if (updateAvailable && updateApkPath == null && !updateDownloading) updateUrl?.let {
-            Spacer(Modifier.height(6.dp))
-            Button(onClick = onDownloadUpdate) {
-                Text(lang.t("下载更新", "Download update"))
-            }
-        }
-        if (updateApkPath != null && !updateDownloading) {
-            Spacer(Modifier.height(6.dp))
-            Button(onClick = onInstallUpdate) {
-                Text(lang.t("安装更新", "Install update"))
-            }
-        }
-        Spacer(Modifier.height(16.dp))
-
-        SettingFloat(lang.t("深度强度", "Depth scale"), settings.depthScale, listOf(10f, 20f, 30f, 40f, 50f, 60f, 80f)) {
-            onChange(settings.copy(depthScale = it))
-        }
-        SettingInt(lang.t("深度平滑", "Blur radius"), settings.blurRadius, listOf(0, 1, 3, 5, 9, 15, 25)) {
-            onChange(settings.copy(blurRadius = it))
-        }
-        SettingInt(lang.t("边缘填充", "Fill radius"), settings.fillRadius, listOf(0, 3, 5, 10, 15, 20, 30)) {
-            onChange(settings.copy(fillRadius = it))
-        }
-        SettingInt(lang.t("输出最大长边", "Max output long edge"), settings.maxLongEdge, listOf(1280, 1920, 2048, 3072, 4096, 6000)) {
-            onChange(settings.copy(maxLongEdge = it))
-        }
-        Spacer(Modifier.height(12.dp))
-
-        SettingsSectionTitle(lang.t("图片生成设置", "Image generation"))
-        ModelPicker(
-            title = lang.t("图片模型选择", "Image model"),
-            selectedModelId = settings.imageModelId,
-            lang = lang,
-            models = ImageModels,
-            onSelect = { spec -> onChange(settings.copy(imageModelId = spec.id, depthResolution = spec.inputSize)) },
-        )
-        Text(lang.t("实验模型首次使用会单独下载；如果模型输入输出不兼容，会在日志里显示失败原因。", "Experimental models download separately on first use. Shape incompatibility is reported in logs."), style = MaterialTheme.typography.bodySmall)
-        Spacer(Modifier.height(16.dp))
-
-        Text(lang.t("预加载", "Prefetch"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        SingleChoiceSegmentedButtonRow {
-            val options = listOf("auto", "2", "4", "8")
-            options.forEachIndexed { index, option ->
-                val selected = if (option == "auto") settings.autoPrefetch else !settings.autoPrefetch && settings.prefetchWindow == option.toInt()
-                SegmentedButton(
-                    selected = selected,
-                    onClick = {
-                        if (option == "auto") onChange(settings.copy(autoPrefetch = true, prefetchWindow = 2))
-                        else onChange(settings.copy(autoPrefetch = false, prefetchWindow = option.toInt()))
-                    },
-                    shape = SegmentedButtonDefaults.itemShape(index, options.size),
-                ) { Text(if (option == "auto") lang.t("自动", "Auto") else option) }
-            }
-        }
-        Spacer(Modifier.height(14.dp))
-        SettingInt(lang.t("后台 worker 数", "Background workers"), settings.generationWorkers, listOf(1, 2, 3)) {
-            onChange(settings.copy(generationWorkers = it))
-        }
-        SettingInt(lang.t("模型 CPU 线程", "Model CPU threads"), settings.modelThreads, listOf(1, 2, 4, 8)) {
-            onChange(settings.copy(modelThreads = it))
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.useGpu,
-                onCheckedChange = { onChange(settings.copy(useGpu = it)) },
-            )
-            Text(lang.t("尝试 GPU 加速", "Try GPU acceleration"))
-        }
-        Text(lang.t("GPU 加速模式选择", "GPU acceleration mode"), fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        GpuModePicker(settings.gpuTestMode, lang) {
-            onChange(settings.copy(gpuTestMode = it))
-        }
-        Spacer(Modifier.height(6.dp))
-        Text(
-            lang.t(
-                "开启 GPU 后会强制使用所选 GPU 模式；失败或输出异常不会偷偷切 CPU。关闭 GPU 才会恢复 CPU。",
-                "When GPU is enabled, the selected GPU mode is forced. Failures or bad output will not silently fall back to CPU. Disable GPU to use CPU.",
-            ),
-            style = MaterialTheme.typography.bodySmall,
-        )
-        Spacer(Modifier.height(12.dp))
-
-        SettingsSectionTitle(lang.t("视频生成设置", "Video generation"))
-        ModelPicker(
-            title = lang.t("视频模型选择", "Video model"),
-            selectedModelId = settings.videoModelId,
-            lang = lang,
-            models = VideoModels,
-            onSelect = { spec -> onChange(settings.copy(videoModelId = spec.id)) },
-        )
-        SettingInt(lang.t("视频模型 CPU 线程", "Video model CPU threads"), settings.videoModelThreads, listOf(1, 2, 4, 8)) {
-            onChange(settings.copy(videoModelThreads = it))
-        }
-        SettingInt(lang.t("视频深度 worker 数", "Video depth workers"), settings.videoDepthWorkers, listOf(1, 2)) {
-            onChange(settings.copy(videoDepthWorkers = it))
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.videoUseGpu,
-                onCheckedChange = { onChange(settings.copy(videoUseGpu = it)) },
-            )
-            Text(lang.t("视频生成尝试 GPU 加速", "Try GPU for video generation"))
-        }
-        Text(lang.t("视频深度 worker 是独立模型会话数量；2 个 worker 可能更快，也会更占显存/内存。视频设置只影响视频 VR 生成。", "Video depth workers are independent model sessions. 2 workers may be faster but use more GPU memory/RAM. Video settings only affect video VR generation."), style = MaterialTheme.typography.bodySmall)
-
-        Spacer(Modifier.height(12.dp))
-        Text(lang.t("深度图分辨率", "Depth resolution"), fontWeight = FontWeight.Bold)
-        val imageSpec = modelSpec(settings.imageModelId)
-        val videoSpec = modelSpec(settings.videoModelId)
-        Text(lang.t("图片 ${imageSpec.inputSize} x ${imageSpec.inputSize}；视频 ${videoSpec.inputSize} x ${videoSpec.inputSize}（由所选模型固定）", "Image ${imageSpec.inputSize} x ${imageSpec.inputSize}; video ${videoSpec.inputSize} x ${videoSpec.inputSize}. Fixed by selected models."), style = MaterialTheme.typography.bodySmall)
-        Spacer(Modifier.height(12.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.invertDepth,
-                onCheckedChange = { onChange(settings.copy(invertDepth = it)) },
-            )
-            Text(lang.t("反转深度", "Invert depth"))
         }
     }
 }
@@ -6736,27 +6574,10 @@ private fun SettingsSectionTitle(title: String) {
 
 @Composable
 private fun GpuModePicker(selected: GpuTestMode, lang: AppLanguage, onSelect: (GpuTestMode) -> Unit) {
-    val options = listOf(
-        GpuTestMode.AUTO to lang.t("自动尝试全部", "Auto try all"),
-        GpuTestMode.ACCURATE_UNSET to lang.t("精确模式", "Accurate"),
-        GpuTestMode.ACCURATE_OPENGL to lang.t("强制 OpenGL", "Force OpenGL"),
-        GpuTestMode.ACCURATE_OPENCL to lang.t("强制 OpenCL", "Force OpenCL"),
-        GpuTestMode.BEST_COMPAT to lang.t("系统推荐", "System best"),
-    )
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        options.forEach { (mode, label) ->
-            val modifier = Modifier.fillMaxWidth()
-            if (selected == mode) {
-                Button(onClick = { onSelect(mode) }, modifier = modifier) {
-                    Text(label)
-                }
-            } else {
-                OutlinedButton(onClick = { onSelect(mode) }, modifier = modifier) {
-                    Text(label)
-                }
-            }
-        }
-    }
+    StudioOptions(listOf(
+        "AUTO" to lang.t("自动尝试全部", "Auto try all"), "ACCURATE_UNSET" to lang.t("精确模式", "Accurate"),
+        "ACCURATE_OPENGL" to "OpenGL", "ACCURATE_OPENCL" to "OpenCL", "BEST_COMPAT" to lang.t("系统推荐", "System best")),
+        selected.name, { onSelect(GpuTestMode.valueOf(it)) })
 }
 
 @Composable
@@ -6800,36 +6621,17 @@ private fun ModelPicker(
 
 @Composable
 private fun SettingInt(title: String, value: Int, options: List<Int>, onChange: (Int) -> Unit) {
-    Text(title, fontWeight = FontWeight.Bold)
-    Spacer(Modifier.height(6.dp))
-    SingleChoiceSegmentedButtonRow {
-        options.forEachIndexed { index, option ->
-            SegmentedButton(
-                selected = value == option,
-                onClick = { onChange(option) },
-                shape = SegmentedButtonDefaults.itemShape(index, options.size),
-            ) { Text(option.toString()) }
-        }
-    }
-    Spacer(Modifier.height(14.dp))
+    Text(title, fontWeight = FontWeight.Medium)
+    StudioOptions(options.map { it.toString() to it.toString() }, value.toString(), { onChange(it.toInt()) })
 }
 
 @Composable
 private fun SettingFloat(title: String, value: Float, options: List<Float>, onChange: (Float) -> Unit) {
-    Text(title, fontWeight = FontWeight.Bold)
-    Spacer(Modifier.height(6.dp))
-    SingleChoiceSegmentedButtonRow {
-        options.forEachIndexed { index, option ->
-            SegmentedButton(
-                selected = abs(value - option) < 0.01f,
-                onClick = { onChange(option) },
-                shape = SegmentedButtonDefaults.itemShape(index, options.size),
-            ) { Text(option.roundToInt().toString()) }
-        }
-    }
-    Spacer(Modifier.height(14.dp))
+    Text(title, fontWeight = FontWeight.Medium)
+    StudioOptions(options.map { it.toString() to it.roundToInt().toString() }, value.toString(), { onChange(it.toFloat()) })
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ViewerScreen(
     state: UiState,
@@ -6844,6 +6646,8 @@ private fun ViewerScreen(
     val generatedViewer = state.viewerOrigin != ViewerOrigin.NORMAL
     val view = LocalView.current
     val context = view.context
+    var viewerDockHeight by remember { mutableStateOf(0) }
+    val viewerDockPadding = with(LocalDensity.current) { viewerDockHeight.toDp() } + 24.dp
     DisposableEffect(Unit) {
         val window = (view.context as? ComponentActivity)?.window
         if (Build.VERSION.SDK_INT >= 30) {
@@ -6935,12 +6739,16 @@ private fun ViewerScreen(
         }
     }
     LaunchedEffect(pagerState.settledPage) {
+        android.util.Log.d("PVG_UI", "viewer settled=${pagerState.settledPage} origin=${state.viewerOrigin} scope=${viewerItems.size}")
         viewerItems.getOrNull(pagerState.settledPage)?.first?.let(onIndexChanged)
     }
     var controlsVisible by remember { mutableStateOf(true) }
-    LaunchedEffect(controlsVisible, state.vrMode, pagerState.currentPage) {
+    val controlsTimeout = LocalAccessibilityManager.current?.calculateRecommendedTimeoutMillis(
+        originalTimeoutMillis = 6000L, containsIcons = true, containsText = true, containsControls = true,
+    ) ?: 6000L
+    LaunchedEffect(controlsVisible, state.vrMode, pagerState.currentPage, controlsTimeout) {
         if (state.vrMode && controlsVisible) {
-            delay(3000)
+            delay(controlsTimeout)
             controlsVisible = false
         }
     }
@@ -6961,7 +6769,7 @@ private fun ViewerScreen(
                 val generated = state.videoEntries[photo.cacheKey]
                 val job = state.videoJobs.firstOrNull { it.item.cacheKey == photo.cacheKey }
                 val videoState = state.videoStates[photo.cacheKey] ?: VideoVrState.NORMAL
-                val activePage = page == pagerState.currentPage
+                val activePage = page == pagerState.settledPage
                 val playerContent: @Composable () -> Unit = {
                     VideoPlayer(
                         uri = generated?.let { Uri.fromFile(File(it.outputPath)) } ?: photo.uri,
@@ -6971,6 +6779,7 @@ private fun ViewerScreen(
                         controlsVisible = controlsVisible,
                         stateLine = "${videoState.label(lang)}  ${job?.currentFrame ?: 0}/${job?.totalFrames ?: 0}",
                         metricsLine = "frame ${job?.currentFrameMs ?: 0}ms · avg ${job?.avgFrameMs ?: 0}ms",
+                        controlsBottomPadding = viewerDockPadding,
                         onSingleTap = { controlsVisible = !controlsVisible },
                     )
                 }
@@ -7003,81 +6812,45 @@ private fun ViewerScreen(
             }
         }
         if (controlsVisible || !state.vrMode) {
-            Row(
-                modifier = Modifier.align(Alignment.TopStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OutlinedButton(onClick = onClose) { Text(lang.t("返回", "Back")) }
-                Spacer(Modifier.width(8.dp))
-                val currentPair = viewerItems.getOrNull(pagerState.currentPage)
-                val currentIndex = currentPair?.first ?: startIndex
-                val currentItem = currentPair?.second
-                Text(
-                    text = currentItem?.displayName.orEmpty(),
-                    color = androidx.compose.ui.graphics.Color.White,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                val currentVideoState = currentItem?.takeIf { it.kind == MediaKind.VIDEO }?.let { state.videoStates[it.cacheKey] ?: VideoVrState.NORMAL }
-                val vrButtonEnabled = if (currentVideoState != null) {
-                    !generatedViewer || currentVideoState != VideoVrState.READY
-                } else {
-                    !generatedViewer
+            val pair = viewerItems.getOrNull(pagerState.currentPage)
+            val currentIndex = pair?.first ?: startIndex
+            val current = pair?.second
+            Surface(Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(12.dp).widthIn(max = 900.dp).fillMaxWidth(),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f), shape = RoundedCornerShape(24.dp)) {
+                StudioTopBar(current?.displayName.orEmpty(), onClose) {
+                    Text("${pagerState.currentPage + 1} / ${viewerItems.size}", Modifier.padding(end = 16.dp), style = MaterialTheme.typography.labelMedium)
                 }
-                Button(onClick = { onVr(currentIndex) }, enabled = vrButtonEnabled) {
-                    Text(
-                        if (currentItem?.kind == MediaKind.VIDEO) {
-                            when (currentVideoState ?: VideoVrState.NORMAL) {
-                                VideoVrState.NORMAL -> lang.t("加入 VR 队列", "Add to VR queue")
-                                VideoVrState.QUEUED -> lang.t("暂停生成", "Pause")
-                                VideoVrState.GENERATING -> lang.t("暂停生成", "Pause")
-                                VideoVrState.PAUSED -> lang.t("继续生成", "Resume")
-                                VideoVrState.READY -> lang.t("已生成", "Ready")
-                                VideoVrState.FAILED -> lang.t("重试视频 VR", "Retry video VR")
-                            }
-                        } else if (generatedViewer) {
-                            lang.t("已生成", "Ready")
-                        } else if (state.vrMode) {
-                            lang.t("关闭 VR", "VR Off")
-                        } else {
-                            lang.t("开启 VR", "VR On")
-                        },
-                    )
-                }
-                Spacer(Modifier.width(8.dp))
-                OutlinedButton(onClick = { onOpenDebug(currentIndex) }) { Text(lang.t("调试", "Debug")) }
             }
-            val current = viewerItems.getOrNull(pagerState.currentPage)?.second
-            if (!generatedViewer && state.vrMode && current?.kind != MediaKind.VIDEO) Column(
-                modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(androidx.compose.ui.graphics.Color(0x99000000)).padding(10.dp),
-            ) {
-                if (current != null) {
-                    Text(
-                        text = imageLoadedLine(state, viewerItems.getOrNull(pagerState.currentPage)?.first ?: startIndex, lang),
-                        color = androidx.compose.ui.graphics.Color.White,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    Text(
-                        text = imageQueueLine(state, viewerItems.getOrNull(pagerState.currentPage)?.first ?: startIndex, lang),
-                        color = androidx.compose.ui.graphics.Color.White,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    val recentLines = imageRecentGenerationLines(state, lang)
-                    repeat(3) { lineIndex ->
-                        Text(
-                            text = recentLines.getOrNull(lineIndex).orEmpty(),
-                            color = androidx.compose.ui.graphics.Color.White,
-                            style = MaterialTheme.typography.labelSmall,
-                            maxLines = 1,
-                        )
+            Surface(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(12.dp)
+                .widthIn(max = 840.dp).fillMaxWidth().heightIn(max = 240.dp).onSizeChanged { viewerDockHeight = it.height },
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f), shape = RoundedCornerShape(24.dp)) {
+                Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    val videoState = current?.takeIf { it.kind == MediaKind.VIDEO }?.let { state.videoStates[it.cacheKey] ?: VideoVrState.NORMAL }
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Button(onClick = { onVr(currentIndex) }, enabled = if (videoState != null) !generatedViewer || videoState != VideoVrState.READY else !generatedViewer) {
+                            Text(when {
+                                videoState == VideoVrState.QUEUED || videoState == VideoVrState.GENERATING -> lang.t("暂停视频任务", "Pause video task")
+                                videoState == VideoVrState.PAUSED -> lang.t("继续视频任务", "Resume video task")
+                                videoState == VideoVrState.FAILED -> lang.t("重试视频 VR", "Retry video VR")
+                                videoState == VideoVrState.READY || generatedViewer -> lang.t("已生成", "Ready")
+                                videoState != null -> lang.t("加入视频 VR 队列", "Queue video VR")
+                                state.vrMode -> lang.t("关闭 VR", "VR Off")
+                                else -> lang.t("开启 VR", "VR On")
+                            })
+                        }
+                        OutlinedButton(onClick = { onOpenDebug(currentIndex) }) { Text(lang.t("诊断", "Diagnostics")) }
                     }
+                    if (!generatedViewer && state.vrMode && current?.kind == MediaKind.IMAGE) {
+                        Text(imageLoadedLine(state, currentIndex, lang), style = MaterialTheme.typography.labelMedium)
+                        Text(imageQueueLine(state, currentIndex, lang), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        imageRecentGenerationLines(state, lang).firstOrNull()?.let { Text(it, style = MaterialTheme.typography.labelSmall, maxLines = 2) }
+                    }
+                    if (current?.kind == MediaKind.IMAGE) Text(lang.t("双指缩放 · 放大后拖动 · 双击复位", "Pinch to zoom · drag when enlarged · double tap to reset"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
     }
 }
-
 @Composable
 private fun StatusOverlay(state: VrState, lang: AppLanguage, onRetry: () -> Unit) {
     Column(
@@ -7089,10 +6862,14 @@ private fun StatusOverlay(state: VrState, lang: AppLanguage, onRetry: () -> Unit
             CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
             Spacer(Modifier.height(12.dp))
             Text(state.label(lang), color = androidx.compose.ui.graphics.Color.White)
-        } else if (state == VrState.FAILED) {
-            Text(lang.t("生成失败", "Generation failed"), color = androidx.compose.ui.graphics.Color.White)
+        } else if (state == VrState.FAILED || state == VrState.PAUSED || state == VrState.NORMAL) {
+            Text(when (state) {
+                VrState.FAILED -> lang.t("生成失败 · 在诊断中查看原因", "Generation failed · see Diagnostics")
+                VrState.PAUSED -> lang.t("生成已暂停", "Generation paused")
+                else -> lang.t("当前图片尚未生成", "This image has not been generated")
+            }, color = androidx.compose.ui.graphics.Color.White)
             Spacer(Modifier.height(12.dp))
-            Button(onClick = onRetry) { Text(lang.t("重试", "Retry")) }
+            Button(onClick = onRetry) { Text(if (state == VrState.PAUSED) lang.t("继续当前图片", "Resume this image") else lang.t("生成当前图片", "Generate this image")) }
         }
     }
 }
@@ -7120,8 +6897,8 @@ private fun DebugScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(androidx.compose.ui.graphics.Color(0xff111315))
-            .statusBarsPadding()
+            .background(MaterialTheme.colorScheme.background)
+            .navigationBarsPadding()
             .padding(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -7129,7 +6906,7 @@ private fun DebugScreen(
             Spacer(Modifier.width(8.dp))
             Text(
                 text = lang.t("调试", "Debug"),
-                color = androidx.compose.ui.graphics.Color.White,
+                color = MaterialTheme.colorScheme.onSurface,
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.weight(1f),
@@ -7139,7 +6916,7 @@ private fun DebugScreen(
         Spacer(Modifier.height(8.dp))
         Text(
             text = "${photo?.displayName.orEmpty()}  ${lang.t("状态", "State")}: ${if (isVideo) photo?.let { state.videoStates[it.cacheKey] } ?: VideoVrState.NORMAL else vrState}",
-            color = androidx.compose.ui.graphics.Color.White,
+            color = MaterialTheme.colorScheme.onSurface,
             style = MaterialTheme.typography.bodyMedium,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -7210,7 +6987,7 @@ private fun DebugScreen(
                     DebugLine(lang.t("写文件", "Write"), imageTimings?.writeMs?.let { "${it}ms" } ?: "-")
                     DebugLine(lang.t("总耗时", "Total"), imageTimings?.totalMs?.let { "${it}ms" } ?: "-")
                 }
-                Row(Modifier.fillMaxWidth().height(260.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth().heightIn(min = 160.dp, max = 260.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     DebugImagePanel(lang.t("原图", "Source"), photo?.uri, Modifier.weight(1f), lang)
                     DebugImagePanel(lang.t("深度图", "Depth"), entry?.let { Uri.fromFile(File(it.depthPath)) }, Modifier.weight(1f), lang)
                     DebugImagePanel("VR SBS", entry?.let { Uri.fromFile(File(it.outputPath)) }, Modifier.weight(1f), lang)
@@ -7245,10 +7022,10 @@ private fun DebugSection(title: String, content: @Composable ColumnScope.() -> U
         modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = 8.dp)
-            .background(androidx.compose.ui.graphics.Color(0xff202326))
+            .clip(RoundedCornerShape(20.dp)).background(MaterialTheme.colorScheme.surfaceContainer)
             .padding(10.dp),
     ) {
-        Text(title, color = androidx.compose.ui.graphics.Color.White, fontWeight = FontWeight.Bold)
+        Text(title, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(4.dp))
         content()
     }
@@ -7257,8 +7034,8 @@ private fun DebugSection(title: String, content: @Composable ColumnScope.() -> U
 @Composable
 private fun DebugLine(label: String, value: String) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(label, color = androidx.compose.ui.graphics.Color(0xffc8cdd2), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(96.dp))
-        Text(value, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(96.dp))
+        Text(value, color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.labelMedium, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
     }
 }
 
@@ -7266,7 +7043,7 @@ private fun DebugLine(label: String, value: String) {
 private fun DebugMonoLine(value: String) {
     Text(
         value,
-        color = androidx.compose.ui.graphics.Color.White,
+        color = MaterialTheme.colorScheme.onSurface,
         style = MaterialTheme.typography.labelSmall,
         maxLines = 2,
         overflow = TextOverflow.Ellipsis,
@@ -7298,14 +7075,14 @@ private fun readImageTimings(file: File): GenerationTimings? {
 @Composable
 private fun DebugImagePanel(title: String, uri: Uri?, modifier: Modifier = Modifier, lang: AppLanguage = AppLanguage.ZH) {
     Column(modifier) {
-        Text(title, color = androidx.compose.ui.graphics.Color.White, style = MaterialTheme.typography.labelMedium)
+        Text(title, color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.labelMedium)
         Spacer(Modifier.height(4.dp))
         if (uri == null) {
             Box(
-                modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color(0xff202326)),
+                modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainer),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(lang.t("暂无", "None"), color = androidx.compose.ui.graphics.Color.White)
+                Text(lang.t("暂无", "None"), color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
             AsyncBitmapImage(
@@ -7347,9 +7124,7 @@ private fun SyncSbsZoomImage(
     }
 
     val source = bitmap!!
-    val halfWidth = (source.width / 2).coerceAtLeast(1)
-    val left = remember(source) { Bitmap.createBitmap(source, 0, 0, halfWidth, source.height).asImageBitmap() }
-    val right = remember(source) { Bitmap.createBitmap(source, halfWidth, 0, source.width - halfWidth, source.height).asImageBitmap() }
+    val sharedImage = remember(source) { source.asImageBitmap() }
     val imageModifier = Modifier
         .fillMaxSize()
         .graphicsLayer {
@@ -7363,11 +7138,13 @@ private fun SyncSbsZoomImage(
         modifier = modifier
             .background(androidx.compose.ui.graphics.Color.Black)
             .onSizeChanged { viewportSize = it }
+            .semantics { stateDescription = "SBS ${scale.format3()}x x=${offset.x.roundToInt()} y=${offset.y.roundToInt()}" }
             .pointerInput(uri) {
                 awaitPointerEventScope {
                     while (true) {
                         val firstEvent = awaitPointerEvent(PointerEventPass.Initial)
                         if (firstEvent.changes.none { it.pressed }) continue
+                        if (BuildConfig.DEBUG) android.util.Log.d("PVG_UI", "sbs gesture begin viewport=${viewportSize.width}x${viewportSize.height}")
                         var multiTouch = false
                         var moved = false
                         var firstPosition: Offset? = null
@@ -7378,6 +7155,7 @@ private fun SyncSbsZoomImage(
                             val pressed = event.changes.filter { it.pressed }
                             if (firstPosition == null) firstPosition = pressed.firstOrNull()?.position
                             if (pressed.isEmpty()) {
+                                if (BuildConfig.DEBUG && multiTouch) android.util.Log.d("PVG_UI", "sbs multi end scale=$scale offset=$offset")
                                 if (!multiTouch && !moved) {
                                     val now = System.currentTimeMillis()
                                     if (now - lastTapAt < 280L) {
@@ -7392,6 +7170,7 @@ private fun SyncSbsZoomImage(
                                 break
                             }
                             if (pressed.size >= 2) {
+                                if (BuildConfig.DEBUG && !multiTouch) android.util.Log.d("PVG_UI", "sbs multi begin pointers=${pressed.size}")
                                 multiTouch = true
                                 val halfViewportWidth = viewportSize.width / 2f
                                 val useSbsLocalGesture = halfViewportWidth > 0f
@@ -7445,10 +7224,10 @@ private fun SyncSbsZoomImage(
     ) {
         Row(Modifier.fillMaxSize()) {
             Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.CenterEnd) {
-                Image(left, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
+                SbsEye(sharedImage, right = false, modifier = imageModifier)
             }
             Box(Modifier.weight(1f).fillMaxSize().clipToBounds().background(androidx.compose.ui.graphics.Color.Black), contentAlignment = Alignment.CenterStart) {
-                Image(right, contentDescription = null, modifier = imageModifier, contentScale = ContentScale.Fit)
+                SbsEye(sharedImage, right = true, modifier = imageModifier)
             }
         }
         Box(Modifier.align(Alignment.Center).width(1.dp).fillMaxSize().background(androidx.compose.ui.graphics.Color(0x99ffffff)))
@@ -7789,14 +7568,17 @@ private fun AsyncBitmapImage(
     val context = LocalContext.current
     val cacheKey = bitmapCacheKey(uri, maxSide)
     var bitmap by remember(uri, maxSide) { mutableStateOf(bitmapCache?.get(cacheKey)) }
+    var failed by remember(uri, maxSide) { mutableStateOf(false) }
     LaunchedEffect(uri, maxSide) {
         bitmap = bitmapCache?.get(cacheKey) ?: withContext(Dispatchers.IO) {
             runCatching { decodeScaledBitmap(context, uri, maxSide) }.getOrNull()
         }?.also { decoded -> bitmapCache?.put(cacheKey, decoded) }
+        failed = bitmap == null
     }
     if (bitmap == null) {
         Box(modifier.background(androidx.compose.ui.graphics.Color(0xff202326)), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(Modifier.size(26.dp))
+            if (failed) Text("无法读取图片 / Unable to read image", color = androidx.compose.ui.graphics.Color.White, modifier = Modifier.padding(24.dp))
+            else CircularProgressIndicator(Modifier.size(26.dp))
         }
     } else {
         Image(bitmap!!.asImageBitmap(), contentDescription = null, modifier = modifier, contentScale = contentScale)
@@ -7849,9 +7631,13 @@ private fun VideoPlayer(
     controlsVisible: Boolean,
     stateLine: String,
     metricsLine: String,
+    controlsBottomPadding: androidx.compose.ui.unit.Dp,
     onSingleTap: () -> Unit,
 ) {
-    val activeState = rememberUpdatedState(active)
+    val foreground = foregroundPlayback(active)
+    var userPaused by rememberSaveable(uri.toString()) { mutableStateOf(false) }
+    val playbackActive = foreground && !userPaused
+    val activeState = rememberUpdatedState(playbackActive)
     val context = LocalContext.current
     var normalVideoView by remember { mutableStateOf<VideoView?>(null) }
     var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
@@ -7867,9 +7653,13 @@ private fun VideoPlayer(
     var sbsPrepared by remember(uri) { mutableStateOf(false) }
     var sbsRetryToken by remember(uri) { mutableStateOf(0) }
     var sbsActiveRetries by remember(uri) { mutableStateOf(0) }
+    var playbackError by remember(uri) { mutableStateOf<String?>(null) }
+    var normalPrepared by remember(uri) { mutableStateOf(false) }
+    var normalRetryToken by remember(uri) { mutableStateOf(0) }
     var scale by remember(uri) { mutableStateOf(1f) }
     var offset by remember(uri) { mutableStateOf(Offset.Zero) }
-    LaunchedEffect(uri, mediaPlayer, sbsMode, active) {
+    LaunchedEffect(uri, mediaPlayer, sbsMode, playbackActive) {
+        if (!playbackActive) return@LaunchedEffect
         while (true) {
             val player = mediaPlayer
             val duration = runCatching { player?.duration?.takeIf { it > 0 } ?: 0 }.getOrDefault(0)
@@ -7907,13 +7697,15 @@ private fun VideoPlayer(
                     sbsGlView?.setVideoSize(width, height)
                 }
                 player.setOnPreparedListener {
+                    playbackError = null
                     sbsPrepared = true
                     sbsActiveRetries = 0
                     sbsGlView?.setVideoSize(it.videoWidth, it.videoHeight)
                     if (Build.VERSION.SDK_INT >= 23) runCatching { it.playbackParams = it.playbackParams.setSpeed(playbackSpeed) }
                     if (activeState.value) runCatching { it.start() } else runCatching { it.pause() }
                 }
-                player.setOnErrorListener { _, _, _ ->
+                player.setOnErrorListener { _, what, extra ->
+                    playbackError = "播放失败 / Playback failed ($what/$extra)"
                     if (!released) {
                         released = true
                         runCatching { player.release() }
@@ -7927,7 +7719,8 @@ private fun VideoPlayer(
                     true
                 }
                 player.prepareAsync()
-            }.onFailure {
+            }.onFailure { error ->
+                playbackError = error.shortMessage()
                 released = true
                 runCatching { player.release() }
                 if (mediaPlayer === player) mediaPlayer = null
@@ -7947,8 +7740,8 @@ private fun VideoPlayer(
         }
     }
 
-    LaunchedEffect(active, sbsMode, sbsPrepared, mediaPlayer) {
-        if (sbsMode && active && !sbsPrepared && sbsActiveRetries < 3) {
+    LaunchedEffect(playbackActive, sbsMode, sbsPrepared, mediaPlayer) {
+        if (sbsMode && playbackActive && !sbsPrepared && sbsActiveRetries < 3) {
             delay(900)
             if (activeState.value && !sbsPrepared) {
                 sbsActiveRetries += 1
@@ -7957,11 +7750,12 @@ private fun VideoPlayer(
         }
     }
 
-    LaunchedEffect(active, mediaPlayer, sbsMode, sbsPrepared) {
+    LaunchedEffect(playbackActive, mediaPlayer, sbsMode, sbsPrepared) {
+        android.util.Log.d("PVG_UI", "video active=$playbackActive sbs=$sbsMode prepared=$sbsPrepared")
         if (sbsMode) {
             val player = mediaPlayer ?: return@LaunchedEffect
-            sbsGlView?.setActive(active)
-            if (active && sbsPrepared) {
+            sbsGlView?.setActive(playbackActive)
+            if (playbackActive && sbsPrepared) {
                 runCatching {
                     val position = player.currentPosition
                     player.seekTo(position)
@@ -7983,7 +7777,8 @@ private fun VideoPlayer(
     Box(
         modifier
             .background(androidx.compose.ui.graphics.Color.Black)
-            .onSizeChanged { videoSize = it },
+            .onSizeChanged { videoSize = it }
+            .semantics { stateDescription = "${if (sbsMode) "SBS" else "Video"} ${scale.format3()}x x=${offset.x.roundToInt()} y=${offset.y.roundToInt()}" },
     ) {
         if (sbsMode) {
             AndroidView(
@@ -7996,7 +7791,7 @@ private fun VideoPlayer(
                 },
                 update = { view ->
                     view.setSurfaceCallback { surface -> sbsSurface = surface }
-                    view.setActive(active)
+                    view.setActive(playbackActive)
                     view.setZoom(scale, offset)
                     sbsGlView = view
                 },
@@ -8007,23 +7802,32 @@ private fun VideoPlayer(
             AndroidView(
                 factory = {
                     VideoView(it).apply {
-                        tag = uri
+                        tag = uri to normalRetryToken
                         setVideoURI(uri)
                         setOnPreparedListener { player ->
                             mediaPlayer = player
+                            normalPrepared = true
+                            playbackError = null
                             player.isLooping = true
                             if (Build.VERSION.SDK_INT >= 23) runCatching { player.playbackParams = player.playbackParams.setSpeed(playbackSpeed) }
                             if (activeState.value) start() else pause()
+                        }
+                        setOnErrorListener { _, what, extra ->
+                            normalPrepared = false
+                            playbackError = "播放失败 / Playback failed ($what/$extra)"
+                            true
                         }
                         normalVideoView = this
                     }
                 },
                 update = { view ->
-                    if (view.tag != uri) {
-                        view.tag = uri
+                    if (view.tag != (uri to normalRetryToken)) {
+                        view.tag = uri to normalRetryToken
+                        normalPrepared = false
+                        playbackError = null
                         view.setVideoURI(uri)
                     }
-                    if (active) {
+                    if (playbackActive) {
                         if (!view.isPlaying) view.start()
                     } else if (view.isPlaying) {
                         view.pause()
@@ -8136,10 +7940,24 @@ private fun VideoPlayer(
                     .padding(horizontal = 18.dp, vertical = 10.dp),
             )
         }
+        if (playbackActive && playbackError == null && !(if (sbsMode) sbsPrepared else normalPrepared)) {
+            Column(Modifier.align(Alignment.Center).background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.7f), RoundedCornerShape(20.dp)).padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                CircularProgressIndicator(Modifier.size(28.dp))
+                Text("正在载入视频 / Loading video", color = androidx.compose.ui.graphics.Color.White)
+            }
+        }
+        if (playbackError != null && (!sbsMode || sbsActiveRetries >= 3)) {
+            Column(Modifier.align(Alignment.Center).background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.8f), RoundedCornerShape(20.dp)).padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(playbackError.orEmpty(), color = androidx.compose.ui.graphics.Color.White)
+                Button(onClick = { playbackError = null; sbsActiveRetries = 0; sbsRetryToken++; normalRetryToken++ }) { Text("重新播放 / Retry playback") }
+            }
+        }
         if (controlsVisible) {
             Column(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
+                    .align(Alignment.BottomCenter).navigationBarsPadding().padding(start = 12.dp, end = 12.dp, bottom = controlsBottomPadding).clip(RoundedCornerShape(24.dp))
                     .fillMaxWidth()
                     .background(androidx.compose.ui.graphics.Color(0x99000000))
                     .padding(horizontal = 8.dp, vertical = 4.dp),
@@ -8152,12 +7970,14 @@ private fun VideoPlayer(
                             if (playing) {
                                 runCatching { player?.pause() }
                                 isPlaying = false
+                                userPaused = true
                             } else {
                                 runCatching { player?.start() }
                                 isPlaying = true
+                                userPaused = false
                             }
                         },
-                        modifier = Modifier.size(34.dp),
+                        modifier = Modifier.size(48.dp),
                     ) {
                         Icon(
                             imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
@@ -8182,7 +8002,7 @@ private fun VideoPlayer(
                             progress = if (duration > 0) (target.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else progress
                             positionText = "${formatDuration(target)} / ${formatDuration(duration)}"
                         },
-                        modifier = Modifier.size(34.dp),
+                        modifier = Modifier.size(48.dp),
                     ) {
                         Icon(
                             imageVector = Icons.Filled.FastForward,
@@ -8198,7 +8018,7 @@ private fun VideoPlayer(
                                 runCatching { mediaPlayer?.let { it.playbackParams = it.playbackParams.setSpeed(playbackSpeed) } }
                             }
                         },
-                        modifier = Modifier.size(34.dp),
+                        modifier = Modifier.size(48.dp),
                     ) {
                         Text(if (playbackSpeed >= 2f) "2x" else "1x", color = androidx.compose.ui.graphics.Color.White, fontSize = 12.sp)
                     }
@@ -8255,11 +8075,13 @@ private fun formatDuration(ms: Int): String {
 }
 
 private fun hasImagePermission(context: Context): Boolean {
-    return ContextCompat.checkSelfPermission(context, imagePermission()) == PackageManager.PERMISSION_GRANTED
+    return ContextCompat.checkSelfPermission(context, imagePermission()) == PackageManager.PERMISSION_GRANTED ||
+        (Build.VERSION.SDK_INT >= 34 && ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED)
 }
 
 private fun hasVideoPermission(context: Context): Boolean {
-    return ContextCompat.checkSelfPermission(context, videoPermission()) == PackageManager.PERMISSION_GRANTED
+    return ContextCompat.checkSelfPermission(context, videoPermission()) == PackageManager.PERMISSION_GRANTED ||
+        (Build.VERSION.SDK_INT >= 34 && ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED)
 }
 
 private fun hasNotificationPermission(context: Context): Boolean {
@@ -8280,8 +8102,10 @@ private fun notificationPermission(): String {
 }
 
 private fun mediaPermissions(): Array<String> {
-    return if (Build.VERSION.SDK_INT >= 33) {
-        arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.POST_NOTIFICATIONS)
+    return if (Build.VERSION.SDK_INT >= 34) {
+        arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+    } else if (Build.VERSION.SDK_INT >= 33) {
+        arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
     } else {
         arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
     }
@@ -8469,18 +8293,6 @@ private fun Throwable.shortMessage(): String {
 }
 
 private fun Float.format3(): String = "%.3f".format(Locale.US, this)
-
-private fun compareVersionTags(left: String, right: String): Int {
-    val a = left.trim().removePrefix("v").split('.').map { it.toIntOrNull() ?: 0 }
-    val b = right.trim().removePrefix("v").split('.').map { it.toIntOrNull() ?: 0 }
-    val size = max(a.size, b.size)
-    for (index in 0 until size) {
-        val av = a.getOrElse(index) { 0 }
-        val bv = b.getOrElse(index) { 0 }
-        if (av != bv) return av.compareTo(bv)
-    }
-    return 0
-}
 
 private fun File.sha256(): String {
     val digest = MessageDigest.getInstance("SHA-256")
